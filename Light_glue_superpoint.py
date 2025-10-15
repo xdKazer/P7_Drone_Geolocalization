@@ -1,37 +1,42 @@
-# run_match_and_viz.py
-import os
+# run_batch_match_top3_constmem.py
+import csv, math, gc
+from pathlib import Path
+from typing import Optional
+
 import numpy as np
 import torch
 import cv2
 import matplotlib
-matplotlib.use("Agg")  # headless render on the cluster
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.collections import LineCollection
 
-from lightglue import LightGlue, SuperPoint, DISK  # add others if you want
+from lightglue import LightGlue, SuperPoint, DISK, SIFT
 from lightglue.utils import load_image, rbd
 
-# --------------------
-# Config
-# --------------------
-# Choose: "superpoint" or "disk"
-FEATURES = "superpoint"   # change to "superpoint" if you want SP+LG
+# -------------------- Config --------------------
+FEATURES = "superpoint"       # "superpoint", "disk", or "sift"
+DISPLAY_LONG_SIDE = 1200      # only for visualization (not matching)
+MAX_KPTS = 2048               # reduce if RAM/CPU is tight (e.g., 1024)
 
-# Your image paths
-im0_path = "/ceph/home/student.aau.dk/zn23sc/P7_Drone_Geolocalization/UAV_VisLoc_dataset/03/drone/03_0010.JPG"
-im1_path = "/ceph/home/student.aau.dk/zn23sc/P7_Drone_Geolocalization/UAV_VisLoc_dataset/03/satellite_tiles/sat_tile_4_11.png"
+BASE = Path(__file__).parent.resolve()
+DRONE_IMG = BASE / "UAV_VisLoc_dataset" / "03" / "drone" / "03_0087.JPG"
+SAT_DIR   = BASE / "UAV_VisLoc_dataset" / "03" / "satellite_tiles"
+OUT_DIR   = BASE / "outputs_top3"
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+CSV_PATH  = OUT_DIR / "results.csv"
 
-# Optional: set a display long-side to keep images manageable for vis (LightGlue resizes internally for extraction)
-DISPLAY_LONG_SIDE = 1600  # only affects the rendered figure; matching uses original tensors
-
-out_png = "matches.png"
-
-# --------------------
-# Helpers
-# --------------------
+# -------------------- Helpers --------------------
 def to_numpy_image(t: torch.Tensor):
-    # t: (3,H,W) in [0,1] on GPU/CPU; return (H,W,3) float in [0,1]
     return t.detach().permute(1, 2, 0).clamp(0, 1).cpu().numpy()
+
+def resize_for_display(img_np, long_side=DISPLAY_LONG_SIDE):
+    h, w = img_np.shape[:2]
+    s = long_side / max(h, w)
+    if s >= 1.0: return img_np, 1.0
+    new_w, new_h = int(round(w * s)), int(round(h * s))
+    img_small = cv2.resize(img_np, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    return img_small, s
 
 def make_segments(p0, p1, x_offset):
     segs = np.zeros((len(p0), 2, 2), dtype=np.float32)
@@ -40,127 +45,176 @@ def make_segments(p0, p1, x_offset):
     segs[:, 1, 1] = p1[:, 1]
     return segs
 
-def resize_for_display(img_np, long_side=1600):
-    h, w = img_np.shape[:2]
-    s = long_side / max(h, w)
-    if s >= 1.0:
-        return img_np, 1.0
-    new_w, new_h = int(round(w * s)), int(round(h * s))
-    img_small = cv2.resize(img_np, (new_w, new_h), interpolation=cv2.INTER_AREA)
-    return img_small, s
+def visualize_inliers(drone_path: Path, tile_path: Path, pts0, pts1, inlier_mask, out_png):
+    # load images just for viz
+    I0 = to_numpy_image(load_image(str(drone_path)))
+    I1 = to_numpy_image(load_image(str(tile_path)))
+    I0d, s0 = resize_for_display(I0)
+    I1d, s1 = resize_for_display(I1)
+    p0d = pts0 * s0
+    p1d = pts1 * s1
 
-# --------------------
-# Device
-# --------------------
+    H0, W0 = I0d.shape[:2]
+    H1, W1 = I1d.shape[:2]
+    canvas = np.ones((max(H0, H1), W0 + W1, 3), dtype=I0d.dtype)
+    canvas[:H0, :W0] = I0d
+    canvas[:H1, W0:W0 + W1] = I1d
+
+    if inlier_mask is None or not inlier_mask.any():
+        plt.figure(figsize=(14, 7))
+        plt.imshow(canvas); plt.axis("off")
+        plt.title(f"{tile_path.name}: No inliers")
+        plt.tight_layout(); plt.savefig(out_png, dpi=150); plt.close()
+        return
+
+    idx = np.where(inlier_mask)[0]
+    segs = make_segments(p0d[idx], p1d[idx], x_offset=W0)
+
+    fig, ax = plt.subplots(figsize=(14, 7))
+    ax.imshow(canvas); ax.axis("off")
+    lc = LineCollection(segs, linewidths=0.9, alpha=0.95)
+    lc.set_colors(np.array([[0.0, 0.8, 0.0]] * len(segs)))
+    ax.add_collection(lc)
+    ax.scatter(p0d[idx, 0],         p0d[idx, 1],       s=2, c="yellow", alpha=0.7)
+    ax.scatter(p1d[idx, 0] + W0,    p1d[idx, 1],       s=2, c="cyan",   alpha=0.7)
+    ax.set_title(f"{tile_path.name} | inliers={len(idx)}")
+    plt.tight_layout(); plt.savefig(out_png, dpi=150); plt.close()
+
+# -------------------- Device & models --------------------
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"[info] device: {device}")
 
-# --------------------
-# Models
-# --------------------
-if FEATURES.lower() == "superpoint":
-    extractor = SuperPoint(max_num_keypoints=2048).eval().to(device)
-elif FEATURES.lower() == "disk":
-    extractor = DISK(max_num_keypoints=2048).eval().to(device)
+feat = FEATURES.lower()
+if feat == "superpoint":
+    extractor = SuperPoint(max_num_keypoints=MAX_KPTS).eval().to(device)
+elif feat == "disk":
+    extractor = DISK(max_num_keypoints=MAX_KPTS).eval().to(device)
+elif feat == "sift":
+    extractor = SIFT(max_num_keypoints=4000).eval().to("cpu")
 else:
-    raise ValueError("FEATURES must be 'superpoint' or 'disk'.")
+    raise ValueError("FEATURES must be 'superpoint', 'disk', or 'sift'.")
 
-matcher = LightGlue(features=FEATURES.lower()).eval().to(device)
+matcher = LightGlue(features=feat).eval().to(device)
 
-# --------------------
-# Load images as torch (3,H,W) in [0,1]
-# --------------------
-image0 = load_image(im0_path).to(device)
-image1 = load_image(im1_path).to(device)
+# -------------------- Load fixed drone features (batched for matcher) --------------------
+if not DRONE_IMG.exists():
+    raise FileNotFoundError(f"Missing drone image: {DRONE_IMG}")
 
-# --------------------
-# Extract + match
-# --------------------
 with torch.inference_mode():
-    feats0 = extractor.extract(image0)  # LightGlue utils handle resizing internally for features
-    feats1 = extractor.extract(image1)
-    matches01 = matcher({"image0": feats0, "image1": feats1})
+    img0_t = load_image(str(DRONE_IMG)).to(device if feat != "sift" else "cpu")
+    feats0_batched = extractor.extract(img0_t)  # KEEP batch (B=1)
 
-# Remove batch dimension
-feats0, feats1, matches01 = [rbd(x) for x in [feats0, feats1, matches01]]
-matches = matches01["matches"]  # (K,2) long indices
+# Also keep a non-batched view for keypoint indexing
+feats0_r = rbd(feats0_batched)
 
-# Gather matched keypoints
-if matches.numel() == 0:
-    print("[warn] No matches found.")
-    # still dump a side-by-side for debugging
-points0 = feats0["keypoints"][matches[..., 0]]  # (K,2)
-points1 = feats1["keypoints"][matches[..., 1]]  # (K,2)
+# -------------------- Pass 1: score all tiles (constant memory) --------------------
+tiles = [p for p in SAT_DIR.iterdir() if p.is_file() and p.suffix.lower() == ".png"]
+if not tiles:
+    raise FileNotFoundError(f"No PNG tiles in {SAT_DIR}")
 
-p0 = points0.detach().cpu().numpy()
-p1 = points1.detach().cpu().numpy()
+scores_small = []
 
-# Convert images to numpy for viz
-I0 = to_numpy_image(image0)
-I1 = to_numpy_image(image1)
+with torch.inference_mode():
+    for i, p in enumerate(tiles):
+        print(f"Scoring number {i} of {len(tiles)} ...")
 
-# Optionally shrink for display (does NOT change p0/p1 because those are in original coords)
-I0_disp, s0 = resize_for_display(I0, DISPLAY_LONG_SIDE)
-I1_disp, s1 = resize_for_display(I1, DISPLAY_LONG_SIDE)
+        # 1) load tile & extract (batched)
+        img1_t  = load_image(str(p)).to(device if feat != "sift" else "cpu")
+        feats1  = extractor.extract(img1_t)                  # B=1
 
-# Scale keypoints to display coords (so lines land in the right places)
-p0_disp = p0 * s0
-p1_disp = p1 * s1
+        # 2) match with batched feats
+        matches01 = matcher({"image0": feats0_batched, "image1": feats1})
 
-H0, W0 = I0_disp.shape[:2]
-H1, W1 = I1_disp.shape[:2]
+        # 3) drop batch dims for metrics
+        feats1_r    = rbd(feats1)
+        matches01_r = rbd(matches01)
 
-# --------------------
-# RANSAC (homography) to highlight inliers (planar-ish scenes)
-# --------------------
-inlier_mask = None
-if len(p0) >= 4:
-    Hmat, mask = cv2.findHomography(p0, p1, method=cv2.USAC_MAGSAC, ransacReprojThreshold=3.0, confidence=0.999)
-    if mask is not None:
-        inlier_mask = mask.ravel().astype(bool)
+        matches = matches01_r.get("matches", None)
+        K = int(matches.shape[0]) if (matches is not None and matches.numel() > 0) else 0
 
-# --------------------
-# Build side-by-side canvas
-# --------------------
-canvas = np.ones((max(H0, H1), W0 + W1, 3), dtype=I0_disp.dtype)
-canvas[:H0, :W0] = I0_disp
-canvas[:H1, W0:W0 + W1] = I1_disp
+        num_inliers = 0
+        avg_conf    = float("nan")
 
-segs = make_segments(p0_disp, p1_disp, x_offset=W0)
+        if K >= 4:
+            # gather matched keypoints
+            pts0_np = feats0_r["keypoints"][matches[:, 0]].detach().cpu().numpy()
+            pts1_np = feats1_r["keypoints"][matches[:, 1]].detach().cpu().numpy()
 
-# --- keep ONLY inliers (if any); else show "no matches" ---
-if inlier_mask is not None and inlier_mask.any():
-    in_idx = np.where(inlier_mask)[0]
-    segs_in = segs[in_idx]
-    p0_in   = p0_disp[in_idx]
-    p1_in   = p1_disp[in_idx]
-else:
-    # no inliers -> save the side-by-side only and exit
-    plt.figure(figsize=(14, 7))
-    plt.imshow(canvas); plt.axis("off")
-    plt.title("No inlier matches")
-    plt.tight_layout()
-    plt.savefig(out_png, dpi=150)
-    print(f"[info] saved {out_png} (no inliers)")
-    raise SystemExit(0)
+            # RANSAC
+            Hmat, mask = cv2.findHomography(
+                pts0_np, pts1_np, method=cv2.USAC_MAGSAC,
+                ransacReprojThreshold=3.0, confidence=0.999
+            )
+            if mask is not None:
+                inlier_mask = mask.ravel().astype(bool)
+                num_inliers = int(inlier_mask.sum())
 
-# --- plot only inliers ---
-fig, ax = plt.subplots(figsize=(14, 7))
-ax.imshow(canvas); ax.axis("off")
+                # LightGlue scores are optional
+                scores_t = matches01_r.get("scores", None)
+                if scores_t is not None and num_inliers > 0:
+                    scores_np = scores_t.detach().cpu().numpy()
+                    avg_conf = float(np.mean(scores_np[inlier_mask]))
 
-lc = LineCollection(segs_in, linewidths=0.9, alpha=0.95)
-lc.set_colors(np.array([[0.0, 0.8, 0.0]] * len(segs_in)))  # all green
-ax.add_collection(lc)
+        sort_avg = avg_conf if not math.isnan(avg_conf) else -1e9
+        scores_small.append({
+            "tile": p,
+            "inliers": num_inliers,
+            "avg_conf": avg_conf,
+            "sort_key": (num_inliers, sort_avg),
+        })
 
-# optional: scatter endpoints for inliers
-ax.scatter(p0_in[:, 0],        p0_in[:, 1],        s=2, c="yellow", alpha=0.7)
-ax.scatter(p1_in[:, 0] + W0,   p1_in[:, 1],        s=2, c="cyan",   alpha=0.7)
+        # free per-tile tensors
+        del img1_t, feats1, feats1_r, matches01, matches01_r
+        gc.collect()
+        if device == "cuda":
+            torch.cuda.empty_cache()
 
-title = f"{FEATURES.upper()} + LightGlue  |  inliers={len(segs_in)}"
-ax.set_title(title)
+# -------------------- Rank & write CSV --------------------
+scores_small.sort(key=lambda d: d["sort_key"], reverse=True)
+with open(CSV_PATH, "w", newline="") as f:
+    w = csv.writer(f)
+    w.writerow(["tile", "inliers", "avg_confidence"])
+    for r in scores_small:
+        w.writerow([r["tile"].name, r["inliers"],
+                    "" if math.isnan(r["avg_conf"]) else f"{r['avg_conf']:.4f}"])
+print(f"[info] wrote {CSV_PATH}")
 
-plt.tight_layout()
-plt.savefig(out_png, dpi=150)
-print(f"[info] saved {out_png}")
+top3 = scores_small[:3]
 
+# -------------------- Pass 2: reload and visualize only the top-5 --------------------
+for rank, r in enumerate(top3, 1):
+    p = r["tile"]
+    print(f"[info] visualizing top{rank}: {p.name} ...")
+    with torch.inference_mode():
+        img1_t = load_image(str(p)).to(device if feat != "sift" else "cpu")
+        feats1 = extractor.extract(img1_t)
+        matches01 = matcher({"image0": feats0_batched, "image1": feats1})
 
+    f0_r, f1_r, m_r = feats0_r, rbd(feats1), rbd(matches01)
+    matches = m_r.get("matches", None)
+    if matches is None or matches.numel() == 0:
+        inlier_mask = None
+        pts0_np = np.empty((0,2), np.float32)
+        pts1_np = np.empty((0,2), np.float32)
+    else:
+        pts0_np = f0_r["keypoints"][matches[:, 0]].detach().cpu().numpy()
+        pts1_np = f1_r["keypoints"][matches[:, 1]].detach().cpu().numpy()
+        inlier_mask = None
+        if len(pts0_np) >= 4:
+            Hmat, mask = cv2.findHomography(
+                pts0_np, pts1_np, method=cv2.USAC_MAGSAC,
+                ransacReprojThreshold=3.0, confidence=0.999
+            )
+            if mask is not None:
+                inlier_mask = mask.ravel().astype(bool)
+
+    out_png = OUT_DIR / f"top{rank:02d}_{p.stem}.png"
+    visualize_inliers(DRONE_IMG, p, pts0_np, pts1_np, inlier_mask, str(out_png))
+
+    # free per-tile stuff
+    del img1_t, feats1, matches01, f1_r, m_r
+    gc.collect()
+    if device == "cuda":
+        torch.cuda.empty_cache()
+
+print("[done] Top-5 visualizations saved; see CSV for ranking.")
