@@ -5,7 +5,7 @@ from lightglue import SuperPoint
 from lightglue.utils import load_image, rbd
 
 Base_dir = Path(__file__).parent.resolve() 
-SAT_DIR   = Base_dir / "UAV_VisLoc_dataset/03/satellite_tiles"
+SAT_DIR   = Base_dir / "UAV_VisLoc_dataset/03/sat_tiles_overlap"
 output_dir = Base_dir / "UAV_VisLoc_dataset/03/SuperPoint_features/03"
 
 
@@ -24,7 +24,7 @@ def save_feats(img_path: Path):
     # keep essential fields only
     keep = {k: v.cpu() for k, v in feats.items() if isinstance(v, torch.Tensor)}
     torch.save(keep, out)
-    print(f"[ok] saved {out}")
+    print(f"[ok] saved {out.name}")
 
 if __name__ == "__main__":
     output_dir.mkdir(parents=True, exist_ok=True)
