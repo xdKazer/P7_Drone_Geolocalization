@@ -17,12 +17,13 @@ from lightglue.utils import load_image, rbd
 # -------------------- Config --------------------
 FEATURES = "superpoint"       # "superpoint", "disk", or "sift"
 DISPLAY_LONG_SIDE = 1200      # only for visualization (not matching)
-MAX_KPTS = 2048               # reduce if RAM/CPU is tight (e.g., 1024)
+MAX_KPTS = 4048               # reduce if RAM/CPU is tight (e.g., 1024)
 
+drone_img = "03_0087.JPG"  # which drone image to use (in "03/drone")
 BASE = Path(__file__).parent.resolve()
-DRONE_IMG = BASE / "UAV_VisLoc_dataset" / "03" / "drone" / "03_0087.JPG"
+DRONE_IMG = BASE / "UAV_VisLoc_dataset" / "03" / "drone" / str(drone_img)
 SAT_DIR   = BASE / "UAV_VisLoc_dataset" / "03" / "satellite_tiles"
-OUT_DIR   = BASE / "outputs_top3"
+OUT_DIR   = BASE / "outputs" /"outputs_" / str(drone_img)
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 CSV_PATH  = OUT_DIR / "results.csv"
 
@@ -90,7 +91,7 @@ if feat == "superpoint":
 elif feat == "disk":
     extractor = DISK(max_num_keypoints=MAX_KPTS).eval().to(device)
 elif feat == "sift":
-    extractor = SIFT(max_num_keypoints=4000).eval().to("cpu")
+    extractor = SIFT(max_num_keypoints=MAX_KPTS).eval().to("cpu")
 else:
     raise ValueError("FEATURES must be 'superpoint', 'disk', or 'sift'.")
 
