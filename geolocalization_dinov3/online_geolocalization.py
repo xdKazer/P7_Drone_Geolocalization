@@ -150,7 +150,7 @@ def locate_drone_position(drone_features: torch.Tensor,
             kernel_features = F.normalize(kernel_features, dim=-1)
 
             similarity = torch.matmul(drone_features, kernel_features.T) # .T is transpose.
-            top_k = 1 # max(1, kernel_features.shape[0] // 20)  # Keep only feature_count * 0.05 (5%) of the top values for averaging - 7169385
+            top_k = max(1, kernel_features.shape[0] // 20)  # Keep only feature_count * 0.05 (5%) of the top values for averaging - 7169385
             topk_vals, _ = similarity.flatten().topk(top_k)  # take top k values across all drone and kernel features
             mean_topk = topk_vals.mean().item()
 
