@@ -137,8 +137,8 @@ if __name__ == "__main__":
 
     pca_folder = "pca_projected_images"
 
-    num_tiles_width = 18
-    num_tiles_height = 18
+    num_tiles_width = 4
+    num_tiles_height = 5
 
     # Tile size read from first pca_projected_0.png
     check_tile_path = os.path.join(pca_folder, "pca_projected_0.png")

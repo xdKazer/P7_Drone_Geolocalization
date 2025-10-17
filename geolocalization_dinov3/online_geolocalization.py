@@ -186,7 +186,7 @@ def locate_drone_position(drone_features: torch.Tensor,
 
         # Crop a patch of the same size as the kernel (kernel_size tiles)
         crop_top = center_y - (kernel_size * tile_height) // 2
-        crop_left = center_x - (kernel_size * tile_width) // 2
+        crop_left = center_x - (kernel_size * tile_width)  // 2
         crop_bottom = crop_top + kernel_size * tile_height
         crop_right = crop_left + kernel_size * tile_width
 
@@ -272,7 +272,7 @@ if __name__ == "__main__":
         #image = capture_image_from_drone()
 
         # For testing, load image from file (remove once drone image capture works)
-        drone_image_path = "geolocalization_dinov3/03_0565.JPG" # NOTE: Once we move to ROS2, find image without hardcoding path
+        drone_image_path = "geolocalization_dinov3/03_0747.JPG" # NOTE: Once we move to ROS2, find image without hardcoding path
         pil_image = Image.open(drone_image_path).convert("RGB")
 
         # Preprocess image
@@ -284,8 +284,8 @@ if __name__ == "__main__":
         patch, heatmap, patch_features = locate_drone_position(
         drone_features=features,
         sat_features_dir="dino_features",
-        num_tiles_rows=18,
-        num_tiles_cols=18,
+        num_tiles_rows=5,
+        num_tiles_cols=4,
         device=device,
         kernel_size=2,
         stride=1
