@@ -1,4 +1,5 @@
 UAV_VisLoc_dataset/
+outputs/
 .s-home/
 .venv/
 ## Ignore Visual Studio temporary files, build results, and
