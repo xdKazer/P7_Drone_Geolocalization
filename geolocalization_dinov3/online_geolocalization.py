@@ -12,7 +12,7 @@ import cv2
 # Math Stuff
 import numpy as np
 import matplotlib.pyplot as plt
-from skimage.feature import match_template
+import matplotlib.patches as patches
 
 # Debugging & Information
 import time
@@ -219,23 +219,26 @@ def locate_drone_position(drone_features: torch.Tensor,
         del kernel_features # Free up memory
 
     # Fine grained search on the three candidates:
-    for rank in range(1, 4): # Ranks 1, 2, 3
-        # Load image patch
+    score_for_each_candidate = []
+    for rank in range(1, 4):  # Ranks 1, 2, 3
+        # Load candidate patch
         patch_path = f"geolocalization_dinov3/fine_grained_candidates/candidate_{rank}_patch.png"
         patch_img = Image.open(patch_path).convert("RGB")
 
         # Load corresponding features
-        patch_features = torch.load(f"geolocalization_dinov3/fine_grained_candidates/candidate_{rank}_features.pt", weights_only=True).to(device)
+        patch_features = torch.load(
+            f"geolocalization_dinov3/fine_grained_candidates/candidate_{rank}_features.pt",
+            weights_only=True
+        ).to(device)
 
-        # Divide image and features into 16x16 patches (256 total)
         patch_width, patch_height = patch_img.size
 
-        # Compute the number of tiles along width and height, at least 1
-        num_tiles_width  = max(round(patch_width  / (patch_width  / PATCH_SIZE)), 1)
-        num_tiles_height = max(round(patch_height / (patch_height / PATCH_SIZE)), 1)
+        # Number of fine tiles along each axis
+        num_tiles_width = 16 # PATCH_SIZE
+        num_tiles_height = 20 # Keep aspect ratio similar to original tile grid
 
-        # Compute actual tile size so that tiles fit exactly
-        tile_width  = max(patch_width  // num_tiles_width, 1)
+        # Compute tile size
+        tile_width = max(patch_width // num_tiles_width, 1)
         tile_height = max(patch_height // num_tiles_height, 1)
 
         print(f"Adjusted tile size: {tile_width}x{tile_height}")
@@ -246,39 +249,101 @@ def locate_drone_position(drone_features: torch.Tensor,
         for i in range(num_tiles_height):
             for j in range(num_tiles_width):
                 left   = j * tile_width
-                right  = min(left + tile_width, img_width)
+                right  = min(left + tile_width, patch_width)
                 top    = i * tile_height
-                bottom = min(top + tile_height, img_height)
+                bottom = min(top + tile_height, patch_height)
+                patch_images.append(patch_img.crop((left, top, right, bottom)))
 
-                patch = patch_img.crop((left, top, right, bottom))
-                patch_images.append(patch)
+        # -------------------------------
+        # Robustly split features into fine 16x16 patches
+        # -------------------------------
+        num_coarse_tiles = kernel_size * kernel_size
+        features_per_tile = patch_features.shape[0] // num_coarse_tiles
 
-        # Extract features for each patch using the adjusted tile size
-        # Number of tiles in feature grid along each axis
-        num_feature_tiles = patch_features.shape[0]  # total tiles in kernel
-
-        # Compute approximate number of tiles per patch
-        tiles_per_patch_y = max(num_tiles_height, 1)
-        tiles_per_patch_x = max(num_tiles_width, 1)
-
-        # Determine how many tiles go into each patch along each axis
-        tiles_per_patch = num_feature_tiles // (tiles_per_patch_y * tiles_per_patch_x)
-
-        print(f"Tiles per patch: {tiles_per_patch} - Indicates how many feature tiles correspond to each image patch")
-
-        # Split features roughly evenly across patches
         patch_features_list = []
-        for patch_idx in range(len(patch_images)):
-            start_idx = patch_idx * tiles_per_patch
-            # Make sure we don't go out of bounds
-            end_idx = min(start_idx + tiles_per_patch, num_feature_tiles)
-            feature_patch = patch_features[start_idx:end_idx]
-            patch_features_list.append(feature_patch)
-        
 
-        
+        # Each coarse tile spans multiple fine patches
+        coarse_per_row = kernel_size       # e.g., 2
+        coarse_per_col = kernel_size       # e.g., 2
 
-    return patch, heatmap, best_kernel_features
+        fine_per_tile_row = num_tiles_height // coarse_per_row
+        fine_per_tile_col = num_tiles_width  // coarse_per_col
+
+        patch_features_list = []
+
+        for coarse_row in range(coarse_per_row):
+            for coarse_col in range(coarse_per_col):
+                tile_idx = coarse_row * coarse_per_col + coarse_col
+                start_idx = tile_idx * features_per_tile
+                end_idx = start_idx + features_per_tile
+                tile_features = patch_features[start_idx:end_idx]  # [features_per_tile, feature_dim]
+
+                # Split this coarse tile into fine patches
+                features_per_fine_patch = features_per_tile // (fine_per_tile_row * fine_per_tile_col)
+                for i in range(fine_per_tile_row):
+                    for j in range(fine_per_tile_col):
+                        f_start = (i * fine_per_tile_col + j) * features_per_fine_patch
+                        f_end   = f_start + features_per_fine_patch
+                        fine_patch_features = tile_features[f_start:f_end]
+                        patch_features_list.append(fine_patch_features)
+
+        # -------------------------------
+        # Fine-grained heatmap
+        # -------------------------------
+        fine_kernel = kernel_size * 4  # e.g., 2x2 kernel -> 4x4 fine kernel (4x4 -> 16x16 patches)
+        valid_rows = num_tiles_height - fine_kernel + 1
+        valid_cols = num_tiles_width - fine_kernel + 1
+        
+        heatmap_fine = np.full((valid_rows, valid_cols), -np.inf, dtype=float)
+        best_score = -float('inf')
+        best_kernel_features = None
+        best_pos = None
+
+        for row in range(valid_rows):
+            for col in range(valid_cols):
+                kernel_tiles = []
+                for r in range(row, row + fine_kernel):
+                    for c in range(col, col + fine_kernel):
+                        idx = r * num_tiles_width + c
+                        kernel_tiles.append(patch_features_list[idx])
+
+                kernel_features = torch.cat(kernel_tiles, dim=0).to(device)
+                kernel_features = F.normalize(kernel_features, dim=-1)
+
+                similarity = torch.matmul(drone_features, kernel_features.T)
+                top_k = max(1, kernel_features.shape[0] // 20)
+                topk_vals, _ = similarity.flatten().topk(top_k)
+                mean_topk = topk_vals.mean().item()
+
+                heatmap_fine[row, col] = mean_topk
+
+                if mean_topk > best_score:
+                    best_score = mean_topk
+                    best_kernel_features = kernel_features.clone()
+                    best_pos = (row, col)
+
+                del kernel_features, similarity
+                torch.cuda.empty_cache()
+        
+        # Crop the patch corresponding to the top-1 similarity
+        row, col = best_pos
+        center_y = row * tile_height + (fine_kernel * tile_height) // 2
+        center_x = col * tile_width  + (fine_kernel * tile_width)  // 2
+
+        crop_top = max(0, center_y - (fine_kernel * tile_height) // 2)
+        crop_left = max(0, center_x - (fine_kernel * tile_width) // 2)
+        crop_bottom = min(patch_img.height, crop_top + fine_kernel * tile_height)
+        crop_right = min(patch_img.width,  crop_left + fine_kernel * tile_width)
+
+        best_patch = patch_img.crop((crop_left, crop_top, crop_right, crop_bottom))
+        score_for_each_candidate.append([rank, best_score, best_patch, heatmap_fine])
+        
+    # Check which candidate had highest score
+    score_for_each_candidate.sort(key=lambda x: -x[1])  # Sort by score descending
+    rank, best_score, best_patch, best_heatmap = score_for_each_candidate[0]
+    print(f"Best candidate is Rank {rank} with score {best_score:.4f}")
+
+    return best_patch, best_heatmap
 
 # --- This is currently trash, as the satellite patch is too zoomed out to find good keypoints, do fine grained first ---
 def drone_position_homography(sat_patch: Image.Image, drone_img: Image.Image):
@@ -308,7 +373,7 @@ if __name__ == "__main__":
         features = process_image_with_dino(image_tensor, model, device)
 
         # Locate drone tile position in satellite tiles
-        patch, heatmap, patch_features = locate_drone_position(
+        patch, heatmap = locate_drone_position(
         drone_features=features,            # Features from drone image
         sat_features_dir="dino_features",   # Point to folder with satellite tile features - Generated from offline_geolocalization.py
         num_tiles_rows=5,                   # Number of rows in satellite feature grid - Read from satellite_image_processing.py
@@ -340,8 +405,9 @@ if __name__ == "__main__":
 
         # PCA project to RGB for visualization
         projected_image = pca_project_rgb(features, image_resized)
+        projected_image_np = projected_image.permute(1, 2, 0).cpu().numpy()
         plt.figure(figsize=(8, 8))
-        plt.imshow(projected_image)
+        plt.imshow(projected_image_np)
         plt.axis("off")
         plt.title("PCA Projected Drone Image")
         plt.show()
