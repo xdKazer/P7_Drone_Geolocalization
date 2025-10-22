@@ -422,3 +422,7 @@ FodyWeavers.xsd
 /geolocalization_dinov3/testingstuff.py
 /geolocalization_dinov3/satellite03.tif
 /dino_features/*
+/geolocalization_dinov3/fine_grained_candidates/*
+
+# Just some stuff from debugging that I don't want to push, remove later
+/geolocalization_dinov3/curious
