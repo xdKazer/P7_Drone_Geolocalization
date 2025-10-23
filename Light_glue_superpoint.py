@@ -33,7 +33,8 @@ DRONE_IMG = DATASET_DIR / sat_number / "drone" / str(drone_img)
 SAT_DIR   = DATASET_DIR / sat_number / "test_signe"
 OUT_DIR   = BASE / "outputs" / sat_number / str(drone_img)
 OUT_DIR.mkdir(parents=True, exist_ok=True)
-CSV_PATH  = OUT_DIR / "results.csv"
+CSV_RESULT_PATH  = OUT_DIR / "results.csv"
+CSV_FINAL_RESULT_PATH = BASE / "outputs" / sat_number / f"results_{sat_number}.csv"
 TILE_PT_DIR = DATASET_DIR / sat_number / f"{FEATURES}_features" / sat_number
 SAT_DISPLAY_IMG  = DATASET_DIR / sat_number / "satellite03_small.png"
 SAT_DISPLAY_META = SAT_DISPLAY_IMG.with_suffix(SAT_DISPLAY_IMG.suffix + ".json")  # {"scale": s, "original_size_hw":[H,W],...}
@@ -392,6 +393,17 @@ def load_feats_pt_batched(pt_path: Path, device: str):
     feats_r = rbd(feats_b)
     return feats_b, feats_r
 
+def absolute_confidence(num_inliers, total_matches, median_err_px,
+                        s_inl=80.0, s_err=3.0, w=(0.6, 0.25, 0.15)):
+    if total_matches <= 0 or num_inliers <= 0 or not np.isfinite(median_err_px):
+        return 0.0
+    inlier_score = 1.0 - np.exp(-num_inliers / s_inl)
+    ratio_score  = np.clip(num_inliers / total_matches, 0.0, 1.0)
+    err_score    = np.exp(- (median_err_px / s_err)**2)
+    w_inl, w_ratio, w_err = w
+    return float(np.clip(w_inl*inlier_score + w_ratio*ratio_score + w_err*err_score, 0.0, 1.0))
+
+
 # -------------------- Device & models --------------------
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"[info] device: {device}")
@@ -489,10 +501,10 @@ with torch.inference_mode():
                 inlier_mask = mask.ravel().astype(bool)
                 num_inliers = int(inlier_mask.sum())
 
-                #scores_t = matches01_r.get("scores", None)
-                #if scores_t is not None and num_inliers > 0:
-                #    scores_np = scores_t.detach().cpu().numpy()
-                #    avg_conf = float(np.mean(scores_np[inlier_mask]))
+                scores_t = matches01_r.get("scores", None)
+                if scores_t is not None and num_inliers > 0:
+                    scores_np = scores_t.detach().cpu().numpy()
+                    avg_conf = float(np.mean(scores_np[inlier_mask]))
 
             if H is not None:
                 _, _, median_err = geometric_confidence(H, pts0_np, pts1_np, inlier_mask)
@@ -500,7 +512,8 @@ with torch.inference_mode():
         scores_small.append({
             "tile": p,
             "inliers": num_inliers,
-            #"avg_conf": avg_conf,
+            "total_matches": K,
+            "avg_conf": avg_conf,
             "median_err": median_err if 'median_err' in locals() else float("nan"),
             #"geom_conf": geom_conf if 'geom_conf' in locals() else 0.0,
             #"inlier_ratio": inlier_ratio if 'inlier_ratio' in locals() else 0.0,
@@ -516,15 +529,18 @@ with torch.inference_mode():
 
 # -------------------- Rank & write CSV --------------------
 scores_small.sort(key=lambda d: d["sort_key"], reverse=True)
-with open(CSV_PATH, "w", newline="") as f:
+with open(CSV_RESULT_PATH, "w", newline="") as f:
     w = csv.writer(f)
-    w.writerow(["tile", "inliers", "avg_confidence", "median_reproj_error", "geom_confidence", "inlier_ratio"])
+    w.writerow(["tile", "total_matches", "inliers", "avg_confidence", "median_reproj_error", #"geom_confidence", "inlier_ratio"
+                ])
     for r in scores_small:
         w.writerow([r["tile"].name, r["inliers"],
+                    r["total_matches"],
                     "" if math.isnan(r["avg_conf"]) else f"{r['avg_conf']:.4f}", 
                     "" if math.isnan(r["median_err"]) else f"{r['median_err']:.2f}",
-                    f"{r['geom_conf']:.4f}",
-                    f"{r['inlier_ratio']:.4f}"])
+                    #f"{r['geom_conf']:.4f}",
+                    #f"{r['inlier_ratio']:.4f}"
+                    ])
 print(f"[info] wrote CSV")
 
 top3 = scores_small[:3]
@@ -611,6 +627,25 @@ for rank, r in enumerate(top3, 1):
     center_disp  = center_global  * np.array([SX, SY], np.float32)
 
     if rank == 1:
+        # compute overall_confidence:
+        with open(CSV_RESULT_PATH, newline="") as f:
+            reader = csv.DictReader(f)
+            first_row = next(reader) 
+            num_inliers = int(first_row["inliers"])
+            total_matches = int(first_row["total_matches"])
+            median_err_px = float(first_row["median_reproj_error"])
+        overall_confidence = absolute_confidence(num_inliers,total_matches,median_err_px)
+        # add to the bottom of results_{sat_number}.csv file:
+        with open(CSV_FINAL_RESULT_PATH, "a", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["tile", "inliers", "avg_confidence", "median_reproj_error", "overall_confidence"])
+            w.writerow([first_row["tile"],
+                    num_inliers,
+                    first_row["avg_confidence"],
+                    median_err_px,
+                    f"{overall_confidence:.6f}",
+        ])
+
         # Single overlay
         sat_individual = sat_base.copy()
         draw_polygon(sat_individual, corners_disp, color=color, thickness=3)
