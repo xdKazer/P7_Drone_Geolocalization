@@ -9,7 +9,7 @@ SAT_DIR   = Base_dir / "UAV_VisLoc_dataset/03/sat_tiles_overlap"
 output_dir = Base_dir / "UAV_VisLoc_dataset/03/SuperPoint_features/03"
 
 
-MAX_KPTS = 4048
+MAX_KPTS = 8000
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 def save_feats(img_path: Path):
