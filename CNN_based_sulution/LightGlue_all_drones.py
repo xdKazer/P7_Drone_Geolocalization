@@ -423,7 +423,7 @@ matcher = LightGlue(features=feat).eval().to(device)
 
 with open(CSV_FINAL_RESULT_PATH, "a", newline="") as f:
                 w = csv.writer(f)
-                w.writerow(["drone_image", "tile", "inliers", "avg_confidence", "median_reproj_error", "overall_confidence"])
+                w.writerow(["drone_image", "tile", "inliers", "avg_confidence", "median_reproj_error", "error", "heading_diff" "overall_confidence"])
 
 # -------------------- Load drone features --------------------
 for img_path in sorted(DRONE_IMG_CLEAN.iterdir()):
@@ -655,6 +655,8 @@ for img_path in sorted(DRONE_IMG_CLEAN.iterdir()):
                             num_inliers,
                             first_row["avg_confidence"],
                             median_err_px,
+                            f"{error:.2f}",
+                            f"{dtheta_deg:.2f}",
                             f"{overall_confidence:.6f}",
             ])
 
