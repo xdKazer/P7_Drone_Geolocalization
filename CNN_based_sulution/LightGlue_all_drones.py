@@ -13,16 +13,18 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.collections import LineCollection
 
-from lightglue import LightGlue, SuperPoint, DISK, SIFT
+from lightglue import LightGlue, SuperPoint, DISK, SIFT, ALIKED
 from lightglue.utils import load_image, rbd
 
 # -------------------- Config --------------------
-FEATURES = "superpoint"       # 'superpoint' | 'disk' | 'sift'
+FEATURES = "superpoint"       # 'superpoint' | 'disk' | 'sift' | 'aliked'
 DISPLAY_LONG_SIDE = 1200      # only for visualization
 MAX_KPTS = 4048
 
 sat_number = "03"
 Heading_flip_180 = True  # flip GT heading by 180° if CSV stores view-direction (opposite of camera forward)
+starting_position_latlon = (32.30462673, 119.8968847)  # TODO for ROI tile selection
+confidence = 1.0  # initial confidence for ROI tile selection
 
 BASE = Path(__file__).parent.resolve()
 DATASET_DIR = BASE / "UAV_VisLoc_dataset"
@@ -109,50 +111,13 @@ def determine_pos_error(pose, DRONE_INFO_DIR, drone_img):
     total_error_m = np.sqrt(dx**2 + dy**2)
     return total_error_m, dx, dy
 
-def decide_90deg_steps(phi_deg: float) -> int:
-    """
-    Round φ (deg) to the nearest multiple of 90°, returning k so that we rotate CCW by k*90°.
-    We return the OPPOSITE direction (−k) so that the image becomes closer to North-up
-    without inventing pixels. Uses wrapped angle to avoid off-by-360 issues.
-    """
-    phi = ((float(phi_deg) + 180.0) % 360.0) - 180.0  # (-180, 180]
-    k = int(np.round(phi / 90.0))  # nearest multiple of 90
-    return -k
-
-def rotate_90_bgr(img_bgr: np.ndarray, k: int) -> np.ndarray:
-    """Rotate BGR by k*90 degrees CCW using cv2.rotate (lossless, no interpolation)."""
-    k_mod = k % 4
-    if k_mod == 0:
-        return img_bgr
-    elif k_mod == 1:
-        return cv2.rotate(img_bgr, cv2.ROTATE_90_COUNTERCLOCKWISE)  # +90 CCW
-    elif k_mod == 2:
-        return cv2.rotate(img_bgr, cv2.ROTATE_180)
-    else:
-        return cv2.rotate(img_bgr, cv2.ROTATE_90_CLOCKWISE)         # -90 (or +270)
-
-def R_k90(k: int, W: int, H: int) -> np.ndarray:
-    """
-    Exact homogeneous transform for the discrete pixel remap done by rotate_90_bgr.
-    Maps ORIGINAL → ROTATED for k*90° CCW.
-    """
-    k = ((k % 4) + 4) % 4
-    if k == 0:
-        return np.array([[1, 0,   0],
-                         [0, 1,   0],
-                         [0, 0,   1]], dtype=np.float64)
-    if k == 1:  # +90 CCW: (x', y') = ( y, W-1-x )
-        return np.array([[ 0,  1,    0],
-                         [-1,  0,  W-1],
-                         [ 0,  0,    1]], dtype=np.float64)
-    if k == 2:  # 180
-        return np.array([[-1,  0,  W-1],
-                         [ 0, -1,  H-1],
-                         [ 0,  0,    1]], dtype=np.float64)
-    # k == 3: 270 CCW (= -90)
-    return np.array([[ 0, -1,  H-1],
-                     [ 1,  0,    0],
-                     [ 0,  0,    1]], dtype=np.float64)
+def get_R_rotated_by_phi1(phi_rad: float, W_orig: int, H_orig: int) -> np.ndarray:
+    c, s = np.cos(phi_rad), np.sin(phi_rad)
+    cx, cy = (W_orig - 1) * 0.5, (H_orig - 1) * 0.5
+    T_to   = np.array([[1,0,-cx],[0,1,-cy],[0,0,1]], dtype=np.float64)
+    R      = np.array([[c,-s,0],[s,c,0],[0,0,1]], dtype=np.float64)
+    T_back = np.array([[1,0,cx],[0,1,cy],[0,0,1]], dtype=np.float64)
+    return T_back @ R @ T_to
 
 def get_phi_deg(DRONE_INFO_DIR, drone_img):
     """Read Φ heading (deg) for this frame. Returns float or raises."""
@@ -189,7 +154,7 @@ def draw_cropped_pred_vs_gt_on_tile(
     tile_path, Hmat, x_off, y_off,
     DRONE_INPUT_W, DRONE_INPUT_H,
     DRONE_INFO_DIR, drone_img,
-    SAT_LONG_LAT_INFO_DIR, sat_number, SAT_DISPLAY_META,
+    SAT_LONG_LAT_INFO_DIR, sat_number, SAT_DISPLAY_META, error, 
     crop_radius_px=450, out_path=None, heading_flip_180=False
 ):
     """
@@ -277,7 +242,7 @@ def draw_cropped_pred_vs_gt_on_tile(
     cv2.rectangle(crop, (10,10), (420,90), (255,255,255), -1)
     cv2.putText(crop, "Pred (tile H)", (20,40), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,180,0), 2)
     cv2.putText(crop, "GT (Phi, CCW+)", (20,65), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (170,0,170), 2)
-    cv2.putText(crop, f"angle={dtheta:.1f}, dot={dotp:.3f}", (20,85), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 2)
+    cv2.putText(crop, f"angle={dtheta:.1f}, dot={dotp:.3f}, error={error:.3f}m", (20,85), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 2)
 
     if out_path is not None:
         cv2.imwrite(str(out_path), crop)
@@ -404,11 +369,12 @@ def absolute_confidence(num_inliers, total_matches, median_err_px,
 
 # -------------------- Device & models --------------------
 device = "cuda" if torch.cuda.is_available() else "cpu"
-print(f"[info] device: {device}")
+print(f"[info] device: {device}. Extracting features using {FEATURES}.")
+
 
 feat = FEATURES.lower()
-if feat not in ("superpoint", "disk", "sift"):
-    raise ValueError("FEATURES must be 'superpoint', 'disk', or 'sift'.")
+if feat not in ("superpoint", "disk", "sift", "aliked"):
+    raise ValueError("FEATURES must be 'superpoint', 'disk', 'sift', or 'aliked'.")
 
 # Extractor as fallback when tile .pt is missing
 extractor = None
@@ -418,12 +384,14 @@ elif feat == "disk":
     extractor = DISK(max_num_keypoints=MAX_KPTS).eval().to(device)
 elif feat == "sift":
     extractor = SIFT(max_num_keypoints=MAX_KPTS).eval().to("cpu")
+elif feat == "aliked":
+    extractor = ALIKED(max_num_keypoints=MAX_KPTS).eval().to(device)
 
 matcher = LightGlue(features=feat).eval().to(device)
 
 with open(CSV_FINAL_RESULT_PATH, "a", newline="") as f:
                 w = csv.writer(f)
-                w.writerow(["drone_image", "tile", "inliers", "avg_confidence", "median_reproj_error", "error", "heading_diff" "overall_confidence"])
+                w.writerow(["drone_image", "tile", "inliers", "avg_confidence", "median_reproj_error", "error", "heading_diff", "overall_confidence"])
 
 # -------------------- Load drone features --------------------
 for img_path in sorted(DRONE_IMG_CLEAN.iterdir()):
@@ -431,6 +399,7 @@ for img_path in sorted(DRONE_IMG_CLEAN.iterdir()):
         continue
     print("---")
     drone_img = img_path.name
+    print(f"[info] Processing drone image: {drone_img}")
     DRONE_IMG = DRONE_IMG_CLEAN / str(drone_img)
     OUT_DIR = OUT_DIR_CLEAN / str(drone_img)
     OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -439,6 +408,7 @@ for img_path in sorted(DRONE_IMG_CLEAN.iterdir()):
         raise FileNotFoundError(f"Missing drone image: {DRONE_IMG}")
 
     if feat == "sift":
+        R_orig2rot = np.eye(3, dtype=np.float64)
         with torch.inference_mode():
             img0_t = load_image(str(DRONE_IMG)).to("cpu")
             extractor = SIFT(max_num_keypoints=MAX_KPTS).eval().to("cpu")
@@ -447,29 +417,50 @@ for img_path in sorted(DRONE_IMG_CLEAN.iterdir()):
         _bgr = cv2.imread(str(DRONE_IMG), cv2.IMREAD_COLOR)
         drone_rot_size = (_bgr.shape[1], _bgr.shape[0])  # (W,H)
         DRONE_IMG_FOR_VIZ = DRONE_IMG
-        k90 = 0  # no rotation
     else:
         # SuperPoint / DISK: rotate by k*90° based on heading 
         phi_deg = get_phi_deg(DRONE_INFO_DIR, drone_img)
-        k90 = decide_90deg_steps(phi_deg)
-        print(f"[info] Rotating drone image by {k90*90:+d}°")
+           
+        # Arbitrary-angle rotation with padding; save the exact affine
+        img = cv2.imread(str(DRONE_IMG), cv2.IMREAD_COLOR)
+        H, W = img.shape[:2]
+        a = -phi_deg                        
+        r = math.radians(a)
+        c, s = abs(math.cos(r)), abs(math.sin(r))
+        newW = int(math.ceil(W*c + H*s))
+        newH = int(math.ceil(W*s + H*c))
 
-        bgr = cv2.imread(str(DRONE_IMG), cv2.IMREAD_COLOR)
-        if bgr is None:
-            raise FileNotFoundError(f"Cannot read {DRONE_IMG}")
-        bgr_rot90 = rotate_90_bgr(bgr, k90)
+        M = cv2.getRotationMatrix2D((W/2.0, H/2.0), a, 1.0)
+        # shift so the rotated content is centered in the padded canvas
+        M[0, 2] += (newW - W) / 2.0
+        M[1, 2] += (newH - H) / 2.0
 
-        DRONE_IMG_ROT_PATH = OUT_DIR /  f"drone_rot_{k90:+d}x90.png"
-        cv2.imwrite(str(DRONE_IMG_ROT_PATH), bgr_rot90)
+        bgr_rot = cv2.warpAffine(img, M, (newW, newH), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
+        DRONE_IMG_ROT_PATH = OUT_DIR / f"drone_rot_{a}.png"
 
-        extractor_local = SuperPoint(max_num_keypoints=MAX_KPTS).eval().to(device) if feat == "superpoint" \
-                        else DISK(max_num_keypoints=MAX_KPTS).eval().to(device)
+        R_orig2rot = np.eye(3, dtype=np.float64)
+        R_orig2rot[:2, :3] = M               
+
+        hR, wR = bgr_rot.shape[:2]
+        drone_rot_size = (wR, hR)
+        DRONE_IMG_FOR_VIZ = DRONE_IMG_ROT_PATH
+        cv2.imwrite(str(DRONE_IMG_ROT_PATH), bgr_rot)
+
+        if feat == "superpoint":
+            extractor_local = SuperPoint(max_num_keypoints=MAX_KPTS).eval().to(device)
+        elif feat == "disk":
+            extractor_local = DISK(max_num_keypoints=MAX_KPTS).eval().to(device)
+        elif feat == "aliked":
+            extractor_local = ALIKED(max_num_keypoints=MAX_KPTS).eval().to(device)
+        else:
+            raise ValueError("Unsupported feature type in rotated-drone branch.")
+
         with torch.inference_mode():
             img_t = load_image(str(DRONE_IMG_ROT_PATH)).to(device)
             feats0_batched = extractor_local.extract(img_t)
             feats0_r = rbd(feats0_batched)
 
-        hR, wR = bgr_rot90.shape[:2]
+        hR, wR = bgr_rot.shape[:2]
         drone_rot_size = (wR, hR)
         DRONE_IMG_FOR_VIZ = DRONE_IMG_ROT_PATH
         
@@ -482,6 +473,12 @@ for img_path in sorted(DRONE_IMG_CLEAN.iterdir()):
     scores_small = []
     with torch.inference_mode():
         for i, p in enumerate(tiles):
+            num_inliers = 0
+            avg_conf = float("nan")
+            median_err = float("inf")   
+            K = 0
+            H = None
+            inlier_mask = None
             print(f"Scoring tile {i+1}/{len(tiles)}")
             tile_pt = make_feature_pt_path_for(p)
             if tile_pt.exists():
@@ -517,6 +514,10 @@ for img_path in sorted(DRONE_IMG_CLEAN.iterdir()):
                     if scores_t is not None and num_inliers > 0:
                         scores_np = scores_t.detach().cpu().numpy()
                         avg_conf = float(np.mean(scores_np[inlier_mask]))
+                
+                #using DLT on inliers for better accuracy
+                if H is not None and num_inliers >= 4:
+                    H, _ = cv2.findHomography(pts0_np[inlier_mask], pts1_np[inlier_mask], method=0)
 
                 if H is not None:
                     _, _, median_err = geometric_confidence(H, pts0_np, pts1_np, inlier_mask)
@@ -526,7 +527,7 @@ for img_path in sorted(DRONE_IMG_CLEAN.iterdir()):
                 "inliers": num_inliers,
                 "total_matches": K,
                 "avg_conf": avg_conf,
-                "median_err": median_err if 'median_err' in locals() else float("nan"),
+                "median_err": median_err,
                 #"geom_conf": geom_conf if 'geom_conf' in locals() else 0.0,
                 #"inlier_ratio": inlier_ratio if 'inlier_ratio' in locals() else 0.0,
                 "sort_key": (num_inliers, - median_err), # prioritize inliers, then lower error
@@ -546,16 +547,17 @@ for img_path in sorted(DRONE_IMG_CLEAN.iterdir()):
         w.writerow(["tile", "total_matches", "inliers", "avg_confidence", "median_reproj_error", #"geom_confidence", "inlier_ratio"
                     ])
         for r in scores_small:
-            w.writerow([r["tile"].name, r["inliers"],
+            w.writerow([r["tile"].name, 
                         r["total_matches"],
+                        r["inliers"],
                         "" if math.isnan(r["avg_conf"]) else f"{r['avg_conf']:.4f}", 
-                        "" if math.isnan(r["median_err"]) else f"{r['median_err']:.2f}",
+                        "" if math.isnan(r["median_err"]) else f"{r['median_err']:.4f}",
                         #f"{r['geom_conf']:.4f}",
                         #f"{r['inlier_ratio']:.4f}"
                         ])
     print(f"[info] wrote CSV")
 
-    top3 = scores_small[:3]
+    top1 = scores_small[:1] # top-1 only for overlays chance this to visualise for more tiles
 
     # -------------------- Pass 2: matches viz + overlays --------------------
     sat_vis, SX, SY, _sat_meta = load_sat_display_and_scale()
@@ -567,7 +569,7 @@ for img_path in sorted(DRONE_IMG_CLEAN.iterdir()):
     _bgr_orig = cv2.imread(str(DRONE_IMG), cv2.IMREAD_COLOR)
     H_orig, W_orig = _bgr_orig.shape[:2]
 
-    for rank, r in enumerate(top3, 1):
+    for rank, r in enumerate(top1, 1):
         p = r["tile"]
         color = rank_colors[rank-1]
 
@@ -604,7 +606,11 @@ for img_path in sorted(DRONE_IMG_CLEAN.iterdir()):
                     if mask is not None:
                         inlier_mask = mask.ravel().astype(bool)
 
-        # (A) classic side-by-side in the frame LightGlue saw (rotated)
+                    #using DLT on inliers for better accuracy
+                    if H_rot2tile is not None and num_inliers >= 4:
+                        H_rot2tile, _ = cv2.findHomography(pts0_np[inlier_mask], pts1_np[inlier_mask], method=0)
+
+        # classic side-by-side in the frame LightGlue saw (rotated)
         out_match_png = OUT_DIR / f"top{rank:02d}_{p.stem}_matches.png"
         visualize_inliers(DRONE_IMG_FOR_VIZ, p, pts0_np, pts1_np, inlier_mask, str(out_match_png))
 
@@ -618,9 +624,7 @@ for img_path in sorted(DRONE_IMG_CLEAN.iterdir()):
                 torch.cuda.empty_cache()
             continue
 
-        # ----- Compose ORIGINAL → TILE using exact discrete rotation mapping -----
-        R_orig2rot = R_k90(k90, W_orig, H_orig)       # ORIGINAL -> ROTATED
-        H_orig2tile = H_rot2tile @ R_orig2rot         # (ORIG -> ROT) -> (ROT -> TILE)
+        H_orig2tile = H_rot2tile @ R_orig2rot         
 
         # Project ORIGINAL drone corners/center (for overlays & error)
         corners0 = np.array([[0,0],[W_orig,0],[W_orig,H_orig],[0,H_orig]], dtype=np.float32)
@@ -647,19 +651,7 @@ for img_path in sorted(DRONE_IMG_CLEAN.iterdir()):
                 total_matches = int(first_row["total_matches"])
                 median_err_px = float(first_row["median_reproj_error"])
             overall_confidence = absolute_confidence(num_inliers,total_matches,median_err_px)
-            # add to the bottom of results_{sat_number}.csv file:
-            with open(CSV_FINAL_RESULT_PATH, "a", newline="") as f:
-                w = csv.writer(f)
-                w.writerow([drone_img,
-                            first_row["tile"],
-                            num_inliers,
-                            first_row["avg_confidence"],
-                            median_err_px,
-                            f"{error:.2f}",
-                            f"{dtheta_deg:.2f}",
-                            f"{overall_confidence:.6f}",
-            ])
-
+        
             # Single overlay
             sat_individual = sat_base.copy()
             draw_polygon(sat_individual, corners_disp, color=color, thickness=3)
@@ -676,28 +668,35 @@ for img_path in sorted(DRONE_IMG_CLEAN.iterdir()):
             out_cropped = OUT_DIR / f"top01_{p.stem}_pred_vs_gt_TILE_cropped.png"
             crop_img, dtheta_deg, dotp = draw_cropped_pred_vs_gt_on_tile(
                 tile_path=p,
-                Hmat=H_orig2tile,                    # <-- original frame mapping
+                Hmat=H_orig2tile,                    
                 x_off=x_off, y_off=y_off,
-                DRONE_INPUT_W=W_orig, DRONE_INPUT_H=H_orig,  # <-- original size
+                DRONE_INPUT_W=W_orig, DRONE_INPUT_H=H_orig,  
                 DRONE_INFO_DIR=DRONE_INFO_DIR,
                 drone_img=drone_img,
                 SAT_LONG_LAT_INFO_DIR=SAT_LONG_LAT_INFO_DIR,
                 sat_number=sat_number,
                 SAT_DISPLAY_META=SAT_DISPLAY_META,
+                error=error,
                 crop_radius_px=450,
                 out_path=out_cropped,
                 heading_flip_180=Heading_flip_180
             )
             print(f"[Metrics] heading Δθ={dtheta_deg:.2f}°, dot={dotp:.4f}")
 
-            #if H is not None:
-            #    geom_conf, inlier_ratio, median_err = geometric_confidence(H, pts0_np, pts1_np, inlier_mask)
+            # add to the bottom of results_{sat_number}.csv file:
+            with open(CSV_FINAL_RESULT_PATH, "a", newline="") as f:
+                w = csv.writer(f)
+                w.writerow([drone_img,
+                            first_row["tile"],
+                            num_inliers,
+                            first_row["avg_confidence"],
+                            f"{median_err_px:.4f}",
+                            f"{error:.4f}",
+                            f"{dtheta_deg:.4f}",
+                            f"{overall_confidence:.6f}",
+            ])
 
-
-        # Accumulate into combined overlay
-        draw_polygon(sat_vis, corners_disp, color=color, thickness=3)
-        draw_point(sat_vis, center_disp, color=color, r=5)
-
+        # empty memory
         del feats1_b, feats1_r, matches01, m_r
         if 'img1_t' in locals():
             del img1_t
@@ -705,7 +704,5 @@ for img_path in sorted(DRONE_IMG_CLEAN.iterdir()):
         if device == "cuda":
             torch.cuda.empty_cache()
 
-    # Save combined overlay
-    combined_path = OUT_DIR / "top3_combined_overlay_on_sat.png"
-    cv2.imwrite(str(combined_path), sat_vis)
+
 
