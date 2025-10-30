@@ -14,7 +14,7 @@ import matplotlib.pyplot as plt
 # --- We may need to change this code later, to produce roughly 2x2 areas of the entire image, instead of just cropping around the drone position --- #
 # --- So that when the drone leaves the cropped area, we still have satellite images to match it with, in the new area --- #
 
-input_file = "geolocalization_dinov3/satellite03.tif"
+input_file = "geolocalization_dinov3/dataset_data/satellite_images/satellite03.tif"
 output_folder = "tiles_png_uniform"
 os.makedirs(output_folder, exist_ok=True)
 
@@ -27,7 +27,7 @@ lat_long_2 = (32.290290, 119.900052) # North, East
 geo_span = (abs(lat_long_1[0] - lat_long_2[0]), abs(lat_long_1[1] - lat_long_2[1])) # (degrees in lat, degrees in lon) - absolute value
 geo_center = ((lat_long_1[0] + lat_long_2[0]) / 2, (lat_long_1[1] + lat_long_2[1]) / 2) # 
 
-# Initial take of position of drone - Used to crop satellite image to 1x1 km area around drone
+# Initial take of position of drone - Used to crop satellite image to 2x2 km area around drone
 drone_position = (32.3, 119.87) # (lat, lon)
 
 # Covert the span to meters using the flat earth approximation
@@ -50,6 +50,8 @@ bottom = drone_position_meters[0] + crop_size_meters / 2
 with rasterio.open(input_file) as src:
     img_crs = src.crs
     img_transform = src.transform
+
+    print("image size is: ", src.width, src.height)
 
     # --- Convert meters to degrees
     meters_per_degree_lat = 111320
@@ -84,6 +86,8 @@ with rasterio.open(input_file) as src:
     row_max = min(row_max, src.height)
     col_min = max(col_min, 0)
     col_max = min(col_max, src.width)
+
+    print(col_min, row_min)
 
     # --- Ensure positive width/height ---
     height = max(row_max - row_min, 1)  # at least 1 row
