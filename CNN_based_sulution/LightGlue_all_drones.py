@@ -16,6 +16,8 @@ from matplotlib.collections import LineCollection
 from lightglue import LightGlue, SuperPoint, DISK, SIFT, ALIKED
 from lightglue.utils import load_image, rbd
 
+from datetime import datetime # to determine dt from csv
+
 # -------------------- Config --------------------
 FEATURES = "superpoint"       # 'superpoint' | 'disk' | 'sift' | 'aliked'
 DISPLAY_LONG_SIDE = 1200      # only for visualization
@@ -24,7 +26,12 @@ MAX_KPTS = 4048
 sat_number = "03"
 Heading_flip_180 = True  # flip GT heading by 180° if CSV stores view-direction (opposite of camera forward)
 starting_position_latlon = (32.30462673, 119.8968847)  # TODO for ROI tile selection
-confidence = 1.0  # initial confidence for ROI tile selection
+confidence_start = 1.0  # initial confidence for ROI tile selection
+last_dt = None # for finding dt between frames
+
+# Extended Kalman Filter 
+# we assume constant vel + heading brétween measurements
+vel = 3.00505077959289e-06 #distance/sec measure in lat long - from determine_vel_from_csv
 
 BASE = Path(__file__).parent.resolve()
 DATASET_DIR = BASE / "UAV_VisLoc_dataset"
@@ -46,8 +53,186 @@ with open(TILE_WH_DIR) as f:
     TILE_W, TILE_H = int(w_str), int(h_str)
 STRIDE_X = TILE_W // 2
 STRIDE_Y = TILE_H // 2
+# -------------- Kalman Filter Class --------------
+class EKF_ConstantSpeedHeading:
+    """
+    Extended Kalman Filter with constant speed + heading motion in 2D.
+    State x = [x, y, s, phi]^T  (position in map units, speed in units/s, heading in rad)
+    
+    Process (nonlinear):
+        x_{k+1}   = x_k + s_k * cos(phi_k) * dt
+        y_{k+1}   = y_k + s_k * sin(phi_k) * dt
+        s_{k+1}   = s_k + w_s          (random-walk on speed)
+        phi_{k+1} = phi_k + w_phi      (random-walk on heading)   # or add turn-rate input if you have it
+
+    Measurements supported:
+      - pos only:       z = [x, y]
+      - pos + heading:  z = [x, y, phi]
+    """
+
+    def __init__(
+        self,
+        x0, P0,
+        sigma_pos_proc=0.5,      # process noise to diffuse position indirectly (units)
+        sigma_speed=0.5,         # process noise on speed (units/sqrt(s))
+        sigma_phi=np.deg2rad(5)  # process noise on heading (rad/sqrt(s))
+    ):
+        """
+        x0: (4,) initial state [x,y,s,phi]
+        P0: (4,4) initial covariance
+        sigmas: process noise scales. Position process noise is approximated by
+                injecting into x,y via the Jacobian (below we fold via Q).
+        """
+        self.x = np.array(x0, dtype=float).reshape(4)
+        self.x[3] = _wrap_pi(self.x[3])
+        self.P = np.array(P0, dtype=float).reshape(4,4)
+
+        # Process noise scalars
+        self.sigma_pos_proc = float(sigma_pos_proc)
+        self.sigma_speed    = float(sigma_speed)
+        self.sigma_phi      = float(sigma_phi)
+
+    # ---------- Prediction ----------
+    def _f(self, x, dt):
+        """Nonlinear process model f(x, dt)."""
+        X, Y, S, PHI = x
+        c, s = np.cos(PHI), np.sin(PHI)
+        Xn = X + S * c * dt
+        Yn = Y + S * s * dt
+        Sn = S  # random walk handled in Q
+        PHIn = _wrap_pi(PHI)  # random walk handled in Q
+        return np.array([Xn, Yn, Sn, PHIn], dtype=float)
+
+    def _F_jac(self, x, dt):
+        """Jacobian F = df/dx at current x, dt."""
+        _, _, S, PHI = x
+        c, s = np.cos(PHI), np.sin(PHI)
+        F = np.eye(4)
+        F[0,2] = c * dt                  # dX/dS
+        F[0,3] = -S * s * dt             # dX/dphi
+        F[1,2] = s * dt                  # dY/dS
+        F[1,3] =  S * c * dt             # dY/dphi
+        # S, PHI rows are identity (random walk)
+        return F
+
+    def _Q_proc(self, dt):
+        """
+        Process noise covariance (4x4) for the random-walk parts.
+        We approximate position diffusion by a small baseline (sigma_pos_proc)
+        to remain robust when S≈0 or dt varies.
+        """
+        qx = (self.sigma_pos_proc * np.sqrt(dt))**2
+        qy = (self.sigma_pos_proc * np.sqrt(dt))**2
+        qs = (self.sigma_speed           )**2     # already per-step variance
+        qf = (self.sigma_phi * np.sqrt(dt))**2
+        Q = np.diag([qx, qy, qs, qf])
+        return Q
+
+    def predict(self, dt):
+        """EKF predict step."""
+        # 1) Nonlinear propagation
+        self.x = self._f(self.x, dt)
+        self.x[3] = _wrap_pi(self.x[3])
+
+        # 2) Linearize and propagate covariance
+        F = self._F_jac(self.x, dt)
+        Q = self._Q_proc(dt)
+        self.P = F @ self.P @ F.T + Q
+        return self.x.copy(), self.P.copy()
+
+    # ---------- Update (two variants) ----------
+    def update_pos(self, z_xy, R_pos):
+        """
+        Update with position-only measurement z = [x_meas, y_meas].
+        R_pos: (2,2) measurement covariance in same units as x,y.
+        """
+        z = np.array(z_xy, dtype=float).reshape(2)
+        H = np.array([[1,0,0,0],
+                      [0,1,0,0]], dtype=float)
+        z_pred = H @ self.x
+        y = z - z_pred
+        S = H @ self.P @ H.T + R_pos
+        K = self.P @ H.T @ np.linalg.inv(S)
+        self.x = self.x + K @ y
+        self.P = (np.eye(4) - K @ H) @ self.P
+        self.x[3] = _wrap_pi(self.x[3])
+        return self.x.copy(), self.P.copy()
+
+    def update_pos_heading(self, z_xyphi, R_xyphi):
+        """
+        Update with position + heading measurement z = [x_meas, y_meas, phi_meas].
+        R_xyphi: (3,3) diag([var_x, var_y, var_phi]) (rad^2 for phi).
+        """
+        z = np.array(z_xyphi, dtype=float).reshape(3)
+        H = np.array([[1,0,0,0],
+                      [0,1,0,0],
+                      [0,0,0,1]], dtype=float)
+
+        z_pred = np.array([self.x[0], self.x[1], self.x[3]])
+        y = z - z_pred
+        y[2] = _wrap_pi(y[2])  # wrap heading innovation
+
+        S = H @ self.P @ H.T + R_xyphi
+        K = self.P @ H.T @ np.linalg.inv(S)
+        self.x = self.x + K @ y
+        self.x[3] = _wrap_pi(self.x[3])
+
+        I = np.eye(4)
+        self.P = (I - K @ H) @ self.P
+        return self.x.copy(), self.P.copy()
+
+    # ---------- Utilities ----------
+    def gating_mahalanobis2(self, z_xy, R_pos):
+        """
+        Mahalanobis distance^2 for a position-only measurement against current prediction.
+        Useful if you want to gate candidate tiles before doing heavy work.
+        """
+        z = np.array(z_xy, dtype=float).reshape(2)
+        H = np.array([[1,0,0,0],
+                      [0,1,0,0]], dtype=float)
+        z_pred = H @ self.x
+        y = z - z_pred
+        S = H @ self.P @ H.T + R_pos
+        return float(y.T @ np.linalg.inv(S) @ y)
+
+    def search_ellipse(self, k_sigma=2.0):
+        """
+        Returns ellipse (center, cov2x2) for position search region:
+        { p | (p - mu)^T Σ^{-1} (p - mu) <= k_sigma^2 }.
+        """
+        mu = self.x[:2].copy()
+        Sigma = self.P[:2,:2].copy()
+        return mu, Sigma, float(k_sigma)
+
+    def set_process_noise(self, sigma_pos_proc=None, sigma_speed=None, sigma_phi=None):
+        if sigma_pos_proc is not None: self.sigma_pos_proc = float(sigma_pos_proc)
+        if sigma_speed    is not None: self.sigma_speed    = float(sigma_speed)
+        if sigma_phi      is not None: self.sigma_phi      = float(sigma_phi)
+
+    @staticmethod
+    def R_from_conf(pos_base_std, heading_base_std_rad=None, overall_conf=0.9,
+                    min_scale=0.3, max_scale=3.0):
+        """
+        Build a measurement covariance from a [0..1] confidence.
+        Higher confidence -> smaller variance (shrinks by ~overall_conf).
+        We clamp scaling to avoid extremes.
+        """
+        # invert confidence to get a noise scale
+        scale = np.clip(1.0 / max(1e-6, overall_conf), min_scale, max_scale)
+        Rx = (pos_base_std * scale)**2
+        Ry = (pos_base_std * scale)**2
+        if heading_base_std_rad is None:
+            return np.diag([Rx, Ry])
+        else:
+            Rphi = (heading_base_std_rad * scale)**2
+            return np.diag([Rx, Ry, Rphi])
+
+
 
 # -------------------- Helpers --------------------
+def _wrap_pi(a):
+    return (a + np.pi) % (2*np.pi) - np.pi
+
 def geometric_confidence(H, pts0, pts1, inlier_mask, sigma=10.0):
     """Compute a scalar geometric confidence in [0,1]."""
     if H is None or inlier_mask is None or not inlier_mask.any():
@@ -335,6 +520,9 @@ def visualize_inliers(drone_path: Path, tile_path: Path, pts0, pts1, inlier_mask
     plt.tight_layout(); plt.savefig(out_png, dpi=150); plt.close()
 
 def make_feature_pt_path_for(image_path: Path) -> Path:
+    """
+    returns path for feature file for image (.pt) files
+    """
     folder = TILE_PT_DIR if TILE_PT_DIR is not None else image_path.parent
     return folder / (image_path.stem + ".pt")
 
@@ -563,7 +751,19 @@ for img_path in sorted(DRONE_IMG_CLEAN.iterdir()):
     sat_vis, SX, SY, _sat_meta = load_sat_display_and_scale()
     sat_base = sat_vis.copy()
 
-    rank_colors = [(0,255,0), (255,0,0), (0,0,255)]  # BGR
+    rank_colors = [(0,255,0), (255,0,0), (0,0,255)]  # BGR defined for the top 3
+
+    #------------- extended kalman filter for search region estimation ------------
+    #kf = KalmanCV2D(x0=[x0, y0, vx0, vy0])
+    with open(DRONE_INFO_DIR, "r", newline="") as f:
+        r = csv.DictReader(f)
+        for row in r:
+            if row["filename"] == str(drone_img):
+                time = datetime.fromisoformat(row["date"])
+                if last_dt is not None:
+                    dt = (time -  last_dt).total_seconds()
+                    print(f"dt between frames: {dt} seconds")
+                last_dt = time
 
     # ORIGINAL drone size (for original-frame overlays / error)
     _bgr_orig = cv2.imread(str(DRONE_IMG), cv2.IMREAD_COLOR)
