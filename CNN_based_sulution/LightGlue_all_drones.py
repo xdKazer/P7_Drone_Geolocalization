@@ -1,6 +1,7 @@
 # run_batch_match_top3_constmem.py  (PT-features version)
 import csv, math, gc
 from pathlib import Path
+import shutil # to delete folders
 import csv
 from typing import Optional
 import json, re
@@ -24,14 +25,11 @@ DISPLAY_LONG_SIDE = 1200      # only for visualization
 MAX_KPTS = 4048
 
 sat_number = "03"
-Heading_flip_180 = True  # flip GT heading by 180° if CSV stores view-direction (opposite of camera forward)
-starting_position_latlon = (32.30462673, 119.8968847)  # TODO for ROI tile selection
-confidence_start = 1.0  # initial confidence for ROI tile selection
-last_dt = None # for finding dt between frames
+visualisations_enabled = True
+# --- EKF globals (top of file, before the big for-loop) ---
+ekf = None
+t_last = None   # timestamp of previous processed frame
 
-# Extended Kalman Filter 
-# we assume constant vel + heading brétween measurements
-vel = 3.00505077959289e-06 #distance/sec measure in lat long - from determine_vel_from_csv
 
 BASE = Path(__file__).parent.resolve()
 DATASET_DIR = BASE / "UAV_VisLoc_dataset"
@@ -40,6 +38,16 @@ DRONE_INFO_DIR = DATASET_DIR / sat_number / f"{sat_number}.csv"
 DRONE_IMG_CLEAN = DATASET_DIR / sat_number / "drone_test"  #TODO
 SAT_DIR   = DATASET_DIR / sat_number / "test_signe" #TODO
 OUT_DIR_CLEAN   = BASE / "outputs" / sat_number 
+
+# delete folder if exists
+folder = OUT_DIR_CLEAN
+
+if folder.exists() and folder.is_dir():
+    shutil.rmtree(folder)
+    print(f"Deleted folder: {folder}")
+else:
+    print(f"Folder does not exist: {folder}")
+
 OUT_DIR_CLEAN.mkdir(parents=True, exist_ok=True)
 CSV_FINAL_RESULT_PATH = BASE / "outputs" / sat_number / f"results_{sat_number}.csv"
 TILE_PT_DIR = DATASET_DIR / sat_number / f"{FEATURES}_features" / sat_number
@@ -53,186 +61,168 @@ with open(TILE_WH_DIR) as f:
     TILE_W, TILE_H = int(w_str), int(h_str)
 STRIDE_X = TILE_W // 2
 STRIDE_Y = TILE_H // 2
+
 # -------------- Kalman Filter Class --------------
-class EKF_ConstantSpeedHeading:
+class EKF_ConstantVelHeading:
     """
     Extended Kalman Filter with constant speed + heading motion in 2D.
-    State x = [x, y, s, phi]^T  (position in map units, speed in units/s, heading in rad)
-    
-    Process (nonlinear):
-        x_{k+1}   = x_k + s_k * cos(phi_k) * dt
-        y_{k+1}   = y_k + s_k * sin(phi_k) * dt
-        s_{k+1}   = s_k + w_s          (random-walk on speed)
-        phi_{k+1} = phi_k + w_phi      (random-walk on heading)   # or add turn-rate input if you have it
 
-    Measurements supported:
-      - pos only:       z = [x, y]
-      - pos + heading:  z = [x, y, phi]
+    State x = [x, y, v, phi]^T
+      - x, y  : position in your chosen map units (we'll use ORIGINAL sat pixels)
+      - v     : speed (units/second)
+      - phi   : heading in radians (image coords: +x right, +y down)
+
+    Motion model over dt:
+        x_{k+1}   = x_k + v_k * cos(phi_k) * dt
+        y_{k+1}   = y_k + v_k * sin(phi_k) * dt
+        v_{k+1}   = v_k + w_v          (random-walk on speed)
+        phi_{k+1} = phi_k + w_phi      (random-walk on heading, then wrapped)
     """
 
     def __init__(
         self,
         x0, P0,
-        sigma_pos_proc=0.5,      # process noise to diffuse position indirectly (units)
-        sigma_speed=0.5,         # process noise on speed (units/sqrt(s))
-        sigma_phi=np.deg2rad(5)  # process noise on heading (rad/sqrt(s))
+        sigma_pos_proc=0.75,             # px/√s : baseline diffusion on x,y
+        sigma_speed=0.5,                 # px/√s : how much v can wander
+        sigma_phi=np.deg2rad(3.0)        # rad/√s: how much heading can wander
     ):
         """
-        x0: (4,) initial state [x,y,s,phi]
-        P0: (4,4) initial covariance
-        sigmas: process noise scales. Position process noise is approximated by
-                injecting into x,y via the Jacobian (below we fold via Q).
+        Initialize the filter.
+
+        Args:
+          x0: (4,) initial state [x, y, v, phi]
+          P0: (4,4) initial covariance
+          sigma_*: process noise hyperparameters (tunable)
         """
         self.x = np.array(x0, dtype=float).reshape(4)
-        self.x[3] = _wrap_pi(self.x[3])
-        self.P = np.array(P0, dtype=float).reshape(4,4)
+        self.x[3] = _wrap_pi(self.x[3])              # keep phi in [-pi, pi]
+        self.P = np.array(P0, dtype=float).reshape(4, 4)
 
-        # Process noise scalars
+        # Process noise scales (hyperparameters you tune)
         self.sigma_pos_proc = float(sigma_pos_proc)
         self.sigma_speed    = float(sigma_speed)
         self.sigma_phi      = float(sigma_phi)
 
-    # ---------- Prediction ----------
+    # -------- PREDICT HELPERS USED BY predict() --------
     def _f(self, x, dt):
-        """Nonlinear process model f(x, dt)."""
-        X, Y, S, PHI = x
+        """Nonlinear motion model f(x, dt): propagates the state mean."""
+        X, Y, V, PHI = x
         c, s = np.cos(PHI), np.sin(PHI)
-        Xn = X + S * c * dt
-        Yn = Y + S * s * dt
-        Sn = S  # random walk handled in Q
-        PHIn = _wrap_pi(PHI)  # random walk handled in Q
-        return np.array([Xn, Yn, Sn, PHIn], dtype=float)
+        Xn = X + V * c * dt
+        Yn = Y + V * s * dt
+        Vn = V                                   # random walk handled via Q
+        PHIn = _wrap_pi(PHI)                     # random walk handled via Q
+        return np.array([Xn, Yn, Vn, PHIn], dtype=float)
 
     def _F_jac(self, x, dt):
-        """Jacobian F = df/dx at current x, dt."""
-        _, _, S, PHI = x
+        """Jacobian F = ∂f/∂x at current state; propagates covariance."""
+        _, _, V, PHI = x
         c, s = np.cos(PHI), np.sin(PHI)
         F = np.eye(4)
-        F[0,2] = c * dt                  # dX/dS
-        F[0,3] = -S * s * dt             # dX/dphi
-        F[1,2] = s * dt                  # dY/dS
-        F[1,3] =  S * c * dt             # dY/dphi
-        # S, PHI rows are identity (random walk)
+        F[0, 2] = c * dt           # dX/dV
+        F[0, 3] = -V * s * dt      # dX/dPHI
+        F[1, 2] = s * dt           # dY/dV
+        F[1, 3] =  V * c * dt      # dY/dPHI
+        # rows for V, PHI are identity (random-walk via Q)
         return F
 
     def _Q_proc(self, dt):
         """
-        Process noise covariance (4x4) for the random-walk parts.
-        We approximate position diffusion by a small baseline (sigma_pos_proc)
-        to remain robust when S≈0 or dt varies.
+        Process noise covariance (how uncertainty grows during predict).
+        - x,y get a small baseline diffusion: (sigma_pos_proc * sqrt(dt))^2
+        - v    random-walk per step:         (sigma_speed           )^2
+        - phi  random-walk:                   (sigma_phi * sqrt(dt) )^2
         """
         qx = (self.sigma_pos_proc * np.sqrt(dt))**2
         qy = (self.sigma_pos_proc * np.sqrt(dt))**2
-        qs = (self.sigma_speed           )**2     # already per-step variance
+        qv = (self.sigma_speed)**2
         qf = (self.sigma_phi * np.sqrt(dt))**2
-        Q = np.diag([qx, qy, qs, qf])
-        return Q
+        return np.diag([qx, qy, qv, qf])
 
+    # -------------------- PREDICT (called every frame) --------------------
     def predict(self, dt):
-        """EKF predict step."""
-        # 1) Nonlinear propagation
+        """
+        Time update (a.k.a. 'predict'):
+          1) propagate the state mean with the motion model over dt
+          2) propagate covariance with the Jacobian and process noise
+
+        Call this once per frame BEFORE any measurement updates for that frame.
+        """
+        dt = float(max(1e-6, dt))                 # guard tiny/zero dt
+        # propagate mean
         self.x = self._f(self.x, dt)
         self.x[3] = _wrap_pi(self.x[3])
 
-        # 2) Linearize and propagate covariance
+        # propagate covariance
         F = self._F_jac(self.x, dt)
         Q = self._Q_proc(dt)
         self.P = F @ self.P @ F.T + Q
-        return self.x.copy(), self.P.copy()
 
-    # ---------- Update (two variants) ----------
-    def update_pos(self, z_xy, R_pos):
-        """
-        Update with position-only measurement z = [x_meas, y_meas].
-        R_pos: (2,2) measurement covariance in same units as x,y.
-        """
-        z = np.array(z_xy, dtype=float).reshape(2)
-        H = np.array([[1,0,0,0],
-                      [0,1,0,0]], dtype=float)
-        z_pred = H @ self.x
-        y = z - z_pred
-        S = H @ self.P @ H.T + R_pos
-        K = self.P @ H.T @ np.linalg.inv(S)
-        self.x = self.x + K @ y
-        self.P = (np.eye(4) - K @ H) @ self.P
-        self.x[3] = _wrap_pi(self.x[3])
         return self.x.copy(), self.P.copy()
-
+    
+    #----------------- UPDATE (called when measurement is available) --------------------
     def update_pos_heading(self, z_xyphi, R_xyphi):
         """
-        Update with position + heading measurement z = [x_meas, y_meas, phi_meas].
-        R_xyphi: (3,3) diag([var_x, var_y, var_phi]) (rad^2 for phi).
+        OBS: PHI must be in pixel heading and radians (image coords: +x right, +y down).
+        Measurement update with z = [x_meas, y_meas, phi_meas].
+        R_xyphi is 3x3 diag([var_x, var_y, var_phi]).
         """
-        z = np.array(z_xyphi, dtype=float).reshape(3)
+        z = np.asarray(z_xyphi, dtype=float).reshape(3)
+        # H maps state -> measurement: [x, y, phi]
         H = np.array([[1,0,0,0],
-                      [0,1,0,0],
-                      [0,0,0,1]], dtype=float)
+                    [0,1,0,0],
+                    [0,0,0,1]], dtype=float)
 
-        z_pred = np.array([self.x[0], self.x[1], self.x[3]])
+        z_pred = np.array([self.x[0], self.x[1], self.x[3]], dtype=float)
         y = z - z_pred
-        y[2] = _wrap_pi(y[2])  # wrap heading innovation
+        # wrap the heading innovation
+        y[2] = _wrap_pi(y[2])
 
         S = H @ self.P @ H.T + R_xyphi
         K = self.P @ H.T @ np.linalg.inv(S)
+
         self.x = self.x + K @ y
-        self.x[3] = _wrap_pi(self.x[3])
+        self.x[3] = _wrap_pi(self.x[3]) # obs in rad and in image beskrivelse
 
         I = np.eye(4)
         self.P = (I - K @ H) @ self.P
         return self.x.copy(), self.P.copy()
 
-    # ---------- Utilities ----------
-    def gating_mahalanobis2(self, z_xy, R_pos):
-        """
-        Mahalanobis distance^2 for a position-only measurement against current prediction.
-        Useful if you want to gate candidate tiles before doing heavy work.
-        """
-        z = np.array(z_xy, dtype=float).reshape(2)
-        H = np.array([[1,0,0,0],
-                      [0,1,0,0]], dtype=float)
-        z_pred = H @ self.x
-        y = z - z_pred
-        S = H @ self.P @ H.T + R_pos
-        return float(y.T @ np.linalg.inv(S) @ y)
-
-    def search_ellipse(self, k_sigma=2.0):
-        """
-        Returns ellipse (center, cov2x2) for position search region:
-        { p | (p - mu)^T Σ^{-1} (p - mu) <= k_sigma^2 }.
-        """
-        mu = self.x[:2].copy()
-        Sigma = self.P[:2,:2].copy()
-        return mu, Sigma, float(k_sigma)
-
-    def set_process_noise(self, sigma_pos_proc=None, sigma_speed=None, sigma_phi=None):
-        if sigma_pos_proc is not None: self.sigma_pos_proc = float(sigma_pos_proc)
-        if sigma_speed    is not None: self.sigma_speed    = float(sigma_speed)
-        if sigma_phi      is not None: self.sigma_phi      = float(sigma_phi)
-
     @staticmethod
-    def R_from_conf(pos_base_std, heading_base_std_rad=None, overall_conf=0.9,
+    def R_from_conf(pos_base_std, heading_base_std_rad, overall_conf,
                     min_scale=0.3, max_scale=3.0):
         """
-        Build a measurement covariance from a [0..1] confidence.
-        Higher confidence -> smaller variance (shrinks by ~overall_conf).
-        We clamp scaling to avoid extremes.
+        Build measurement covariance from a confidence in [0,1].
+        Higher confidence -> smaller variance (clamped by min/max scale).
         """
-        # invert confidence to get a noise scale
-        scale = np.clip(1.0 / max(1e-6, overall_conf), min_scale, max_scale)
+        # turn confidence into a scale factor (invert, then clamp)
+        scale = np.clip(1.0 / max(1e-6, float(overall_conf)), min_scale, max_scale)
         Rx = (pos_base_std * scale)**2
         Ry = (pos_base_std * scale)**2
-        if heading_base_std_rad is None:
-            return np.diag([Rx, Ry])
-        else:
-            Rphi = (heading_base_std_rad * scale)**2
-            return np.diag([Rx, Ry, Rphi])
+        Rphi = (heading_base_std_rad * scale)**2
+        return np.diag([Rx, Ry, Rphi]).astype(float)
 
 
 
-# -------------------- Helpers --------------------
-def _wrap_pi(a):
+# -------------------- Angle wrapping --------------------
+def wrap_deg(a): # this is used to get between -180 and 180 which is used in campass based heading
+    """Wrap degrees to [-180, 180)."""
+    return ((a + 180.0) % 360.0) - 180.0
+
+def img_to_compass(phi_img_deg): # 
+    """Convert image angle -> compass heading."""
+    # Check: φ_img= -90 (North) -> ψ = 0 ; φ_img=0 (East) -> ψ=90
+    return wrap_deg(phi_img_deg + 90.0) # to make sure its between -180 and 180
+
+def compass_to_img(psi_deg):
+    """Convert compass heading -> image angle."""
+    # Check: ψ=0 (North) -> φ_img=-90 ; ψ=90 (East) -> φ_img=0
+    return wrap_deg(psi_deg - 90.0) # to make sure its between -180 and 180
+
+def _wrap_pi(a: float) -> float:
+    """Wrap angle to [-pi, pi]. Use anywhere you touch headings."""
     return (a + np.pi) % (2*np.pi) - np.pi
-
+# -------------------- Helpers --------------------
 def geometric_confidence(H, pts0, pts1, inlier_mask, sigma=10.0):
     """Compute a scalar geometric confidence in [0,1]."""
     if H is None or inlier_mask is None or not inlier_mask.any():
@@ -259,36 +249,40 @@ def get_location_in_sat_img(drone_img_centre, SAT_LONG_LAT_INFO_DIR, sat_number,
     with open(SAT_LONG_LAT_INFO_DIR, newline="") as f:
         for r in csv.DictReader(f):
             if r["mapname"] == f"satellite{sat_number}.tif":
-                LT_lat = np.float64(r["LT_lat_map"])
-                LT_lon = np.float64(r["LT_lon_map"])
-                RB_lat = np.float64(r["RB_lat_map"])
-                RB_lon = np.float64(r["RB_lon_map"])
+                LT_lat = np.float128(r["LT_lat_map"])
+                LT_lon = np.float128(r["LT_lon_map"])
+                RB_lat = np.float128(r["RB_lat_map"])
+                RB_lon = np.float128(r["RB_lon_map"])
                 break
         else:
             raise FileNotFoundError(f"Bounds for satellite{sat_number}.tif not found")
 
-    u, v = np.float64(drone_img_centre)
+    u, v = np.float128(drone_img_centre)
     lon = LT_lon + (u / sat_W) * (RB_lon - LT_lon)
     lat = LT_lat + (v / sat_H) * (RB_lat - LT_lat)
     return (lat, lon)
 
 def determine_pos_error(pose, DRONE_INFO_DIR, drone_img):
-    pose = np.array(pose, dtype=np.float64)
+    pose = np.array(pose, dtype=np.float128)
 
     gt_lat = gt_lon = None
     with open(DRONE_INFO_DIR, newline="") as f:
         for r in csv.DictReader(f):
             if r["filename"] == f"{drone_img}":
-                gt_lat = np.float64(r["lat"])
-                gt_lon = np.float64(r["lon"])
+                gt_lat = np.float128(r["lat"])
+                gt_lon = np.float128(r["lon"])
                 break
     if gt_lat is None or gt_lon is None:
         raise ValueError(f"GT lat/lon not found for {drone_img}")
+    
+    # for debugging GT values
+    x, y = latlon_to_orig_xy(gt_lat, gt_lon, SAT_LONG_LAT_INFO_DIR, sat_number, SAT_DISPLAY_META)  
+    print(f"GT values for {drone_img}: x={x}, y={y}, phi={get_phi_deg(DRONE_INFO_DIR, drone_img)}")
 
-    difference = pose - np.array([gt_lat, gt_lon], dtype=np.float64)
-    mean_lat = np.radians((pose[0] + gt_lat) / np.float64(2.0))
+    difference = pose - np.array([gt_lat, gt_lon], dtype=np.float128)
+    mean_lat = np.radians((pose[0] + gt_lat) / np.float128(2.0))
 
-    meters_per_degree_lat = np.float64(111_320.0)
+    meters_per_degree_lat = np.float128(111_320.0)
     meters_per_degree_lon = meters_per_degree_lat * np.cos(mean_lat)
 
     dy = difference[0] * meters_per_degree_lat
@@ -304,8 +298,8 @@ def get_R_rotated_by_phi1(phi_rad: float, W_orig: int, H_orig: int) -> np.ndarra
     T_back = np.array([[1,0,cx],[0,1,cy],[0,0,1]], dtype=np.float64)
     return T_back @ R @ T_to
 
-def get_phi_deg(DRONE_INFO_DIR, drone_img):
-    """Read Φ heading (deg) for this frame. Returns float or raises."""
+def get_phi_deg(DRONE_INFO_DIR, drone_img,):
+    """ Read Φ heading (deg) for this frame. Returns float or raises."""
     with open(DRONE_INFO_DIR, newline="") as f:
         for r in csv.DictReader(f):
             if r["filename"] == f"{drone_img}":
@@ -324,23 +318,80 @@ def latlon_to_orig_xy(lat, lon, SAT_LONG_LAT_INFO_DIR, sat_number, SAT_DISPLAY_M
     with open(SAT_LONG_LAT_INFO_DIR, newline="") as f:
         for r in csv.DictReader(f):
             if r["mapname"] == f"satellite{sat_number}.tif":
-                LT_lat = np.float64(r["LT_lat_map"])
-                LT_lon = np.float64(r["LT_lon_map"])
-                RB_lat = np.float64(r["RB_lat_map"])
-                RB_lon = np.float64(r["RB_lon_map"])
+                LT_lat = np.float128(r["LT_lat_map"])
+                LT_lon = np.float128(r["LT_lon_map"])
+                RB_lat = np.float128(r["RB_lat_map"])
+                RB_lon = np.float128(r["RB_lon_map"])
                 break
         else:
             raise FileNotFoundError(f"Bounds for satellite{sat_number}.tif not found")
-    u = (np.float64(lon) - LT_lon) / (RB_lon - LT_lon) * sat_W
-    v = (np.float64(lat) - LT_lat) / (RB_lat - LT_lat) * sat_H
+    u = (np.float128(lon) - LT_lon) / (RB_lon - LT_lon) * sat_W
+    v = (np.float128(lat) - LT_lat) / (RB_lat - LT_lat) * sat_H
     return u, v
 
+def get_visualisation_parameters(Hmat, DRONE_ORIGINAL_W, DRONE_ORIGINAL_H, x_off, y_off):
+    """
+    Hmat: homography from ORIGINAL drone frame to TILE coords (ORIGINAL sat pixels).
+    Drone image size: DRONE_ORIGINAL_W, DRONE_ORIGINAL_H (original drone frame size).
+    Get center and forward points in TILE coordinates (ORIGINAL sat pixels).
+    Get heading unit vector from homography (in image orientation)
+    output: center_global, corners_global, forward_global, heading_unitvector_measurement
+    """
+    w0, h0 = float(DRONE_ORIGINAL_W), float(DRONE_ORIGINAL_H) # drone image size
+    
+    # --- 1. reference points in drone image ---
+    center0  = np.array([[w0/2.0, h0/2.0]], dtype=np.float32)
+    forward0 = np.array([[w0/2.0, h0/2.0 - max(20.0, 0.10*h0)]], dtype=np.float32)
+
+    # --- 2. project both points into TILE coords via homography ---
+    center_tile  = project_pts(H_orig2tile, center0)[0].astype(np.float64)
+    forward_tile = project_pts(H_orig2tile, forward0)[0].astype(np.float64)
+
+    # --- 3. lift to ORIGINAL satellite pixel coords using tile offsets ---
+    center_global = center_tile  + np.array([x_off, y_off], dtype=np.float64)
+    forward_global = forward_tile + np.array([x_off, y_off], dtype=np.float64)
+
+    # --- 4. compute heading vector in ORIGINAL sat coordinates ---
+    v_pred = forward_global - center_global
+    norm = float(np.hypot(v_pred[0], v_pred[1])) or 1.0
+    heading_unitvector_measurement = (v_pred / norm).astype(np.float64)
+
+    corners0 = np.array([[0,0],[w0,0],[w0,h0],[0,h0]], dtype=np.float32)
+    center0  = np.array([[w0/2, h0/2]], dtype=np.float32)
+
+    # project to TILE frame for visualization
+    corners_tile = project_pts(H_orig2tile, corners0)
+    center_tile  = project_pts(H_orig2tile, center0)[0]
+
+    # get tile offsets from name to get GLOBAL sat coords
+    corners_global = corners_tile + np.array([x_off, y_off], np.float32)
+    center_global  = center_tile  + np.array([x_off, y_off], np.float32)
+            
+
+    return center_global, corners_global, forward_global, heading_unitvector_measurement
+
+
+def get_measurements(Hmat, DRONE_INPUT_W, DRONE_INPUT_H, forward_global, center_global, heading_unitvector_from_homography):
+    """
+    Hmat: homography from ORIGINAL drone frame to TILE coords (ORIGINAL sat pixels).
+    Drone image size: DRONE_INPUT_W, DRONE_INPUT_H (original drone frame size).
+    Get measurements: (meas_phi_rad, meas_phi_deg, (meas_x, meas_y)) in ORIGINAL satellite pixel coords.
+
+    """
+    # ---  extract position & angle ---
+    meas_x, meas_y = float(center_global[0]), float(center_global[1])
+    meas_phi_rad = float(np.arctan2(heading_unitvector_from_homography[1], heading_unitvector_from_homography[0]))
+    meas_phi_deg = float(np.degrees(meas_phi_rad))
+    meas_phi_deg = img_to_compass(meas_phi_deg)  # convert to compass heading
+
+    return meas_phi_rad, meas_phi_deg, (meas_x, meas_y)
+
 def draw_cropped_pred_vs_gt_on_tile(
-    tile_path, Hmat, x_off, y_off,
+    tile_path, Hmat, x_off, y_off, heading_unitvector_measurement_in_pixel_heading,
     DRONE_INPUT_W, DRONE_INPUT_H,
     DRONE_INFO_DIR, drone_img,
     SAT_LONG_LAT_INFO_DIR, sat_number, SAT_DISPLAY_META, error, 
-    crop_radius_px=450, out_path=None, heading_flip_180=False
+    crop_radius_px=450, out_path=None, fix_gt_heading=False
 ):
     """
     Draw Pred vs GT centers + heading arrows directly on the TILE image,
@@ -354,23 +405,15 @@ def draw_cropped_pred_vs_gt_on_tile(
         raise FileNotFoundError(f"Cannot read tile: {tile_path}")
     TH, TW = tile.shape[:2]
 
-    # Predicted center/forward in TILE coords
-    w0, h0 = float(DRONE_INPUT_W), float(DRONE_INPUT_H)
-    center0  = np.array([[w0/2.0, h0/2.0]], dtype=np.float32)
-    forward0 = np.array([[w0/2.0, h0/2.0 - max(20.0, 0.10*h0)]], dtype=np.float32)  # forward = -y
-
-    center_tile  = project_pts(Hmat, center0)[0].astype(np.float64)
-    forward_tile = project_pts(Hmat, forward0)[0].astype(np.float64)
-
-    v_pred = forward_tile - center_tile
-    n_pred = float(np.linalg.norm(v_pred))
     ray_len = np.float64(220.0)
-    if n_pred < 1e-12:
-        v_pred_unit = np.array([1.0, 0.0], np.float64)
-        pred_tip = center_tile + ray_len * v_pred_unit
-    else:
-        v_pred_unit = (v_pred / n_pred).astype(np.float64)
-        pred_tip = center_tile + ray_len * v_pred_unit
+
+    center0  = np.array([[DRONE_INPUT_W/2, DRONE_INPUT_H/2]], dtype=np.float32)
+
+    # project to TILE frame for visualization
+    center_tile  = project_pts(Hmat, center0)[0].astype(np.float64)
+
+    # Pred center on TILE + heading
+    pred_tip = center_tile + ray_len * heading_unitvector_measurement_in_pixel_heading # for drawing
 
     # GT center on TILE + heading
     gt_lat = gt_lon = None
@@ -378,23 +421,21 @@ def draw_cropped_pred_vs_gt_on_tile(
     with open(DRONE_INFO_DIR, newline="") as f:
         for r in csv.DictReader(f):
             if r["filename"] == f"{drone_img}":
-                gt_lat = np.float64(r["lat"]); gt_lon = np.float64(r["lon"])
+                gt_lat = np.float128(r["lat"]); gt_lon = np.float128(r["lon"])
                 for key in ("Phi1", "heading", "yaw_deg"):
                     if key in r and r[key] not in (None, "", "nan"):
-                        gt_heading_deg = float(r[key]); break
+                        gt_heading_deg = float(r[key]); break  
                 break
     if gt_lat is None or gt_lon is None:
         raise ValueError("GT lat/lon not found.")
-
-    if (gt_heading_deg is not None) and heading_flip_180:
-        gt_heading_deg = (gt_heading_deg + 180.0) % 360.0
 
     gt_u, gt_v = latlon_to_orig_xy(gt_lat, gt_lon, SAT_LONG_LAT_INFO_DIR, sat_number, SAT_DISPLAY_META)
     gt_tile = np.array([gt_u - x_off, gt_v - y_off], dtype=np.float64)
 
     if gt_heading_deg is not None:
+        gt_heading_deg = compass_to_img(gt_heading_deg) 
         th = np.deg2rad(np.float64(gt_heading_deg))
-        v_gt_unit = np.array([np.cos(th), -np.sin(th)], np.float64)  # East=0, CCW+, y down
+        v_gt_unit = np.array([np.cos(th), np.sin(th)], np.float64)  
     else:
         v_gt_unit = np.array([np.nan, np.nan], np.float64)
 
@@ -402,7 +443,7 @@ def draw_cropped_pred_vs_gt_on_tile(
 
     # Metrics
     if np.isfinite(v_gt_unit).all():
-        dotp = float(np.clip(np.dot(v_pred_unit, v_gt_unit), -1.0, 1.0))
+        dotp = float(np.clip(np.dot(heading_unitvector_measurement_in_pixel_heading, v_gt_unit), -1.0, 1.0))
         dtheta = float(np.degrees(np.arccos(dotp)))
     else:
         dotp, dtheta = float("nan"), float("nan")
@@ -426,7 +467,7 @@ def draw_cropped_pred_vs_gt_on_tile(
 
     cv2.rectangle(crop, (10,10), (420,90), (255,255,255), -1)
     cv2.putText(crop, "Pred (tile H)", (20,40), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,180,0), 2)
-    cv2.putText(crop, "GT (Phi, CCW+)", (20,65), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (170,0,170), 2)
+    cv2.putText(crop, "GT (Phi1)", (20,65), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (170,0,170), 2)
     cv2.putText(crop, f"angle={dtheta:.1f}, dot={dotp:.3f}, error={error:.3f}m", (20,85), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 2)
 
     if out_path is not None:
@@ -546,6 +587,9 @@ def load_feats_pt_batched(pt_path: Path, device: str):
 
 def absolute_confidence(num_inliers, total_matches, median_err_px,
                         s_inl=80.0, s_err=3.0, w=(0.6, 0.25, 0.15)):
+    """
+    TODO add explanation here!!!
+    """
     if total_matches <= 0 or num_inliers <= 0 or not np.isfinite(median_err_px):
         return 0.0
     inlier_score = 1.0 - np.exp(-num_inliers / s_inl)
@@ -558,7 +602,7 @@ def absolute_confidence(num_inliers, total_matches, median_err_px,
 # -------------------- Device & models --------------------
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"[info] device: {device}. Extracting features using {FEATURES}.")
-
+# -------------------- Feature extractor & matcher --------------------
 
 feat = FEATURES.lower()
 if feat not in ("superpoint", "disk", "sift", "aliked"):
@@ -579,14 +623,15 @@ matcher = LightGlue(features=feat).eval().to(device)
 
 with open(CSV_FINAL_RESULT_PATH, "a", newline="") as f:
                 w = csv.writer(f)
-                w.writerow(["drone_image", "tile", "inliers", "avg_confidence", "median_reproj_error", "error", "heading_diff", "overall_confidence"])
+                w.writerow(["drone_image", "tile", "total_matches", "inliers", "avg_confidence", "median_reproj_error", "error", "heading_diff", "overall_confidence"])
 
 # -------------------- Load drone features --------------------
-for img_path in sorted(DRONE_IMG_CLEAN.iterdir()):
+for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
     if img_path.suffix.lower() not in [".jpg", ".png", ".jpeg"]:
         continue
     print("---")
     drone_img = img_path.name
+
     print(f"[info] Processing drone image: {drone_img}")
     DRONE_IMG = DRONE_IMG_CLEAN / str(drone_img)
     OUT_DIR = OUT_DIR_CLEAN / str(drone_img)
@@ -606,13 +651,14 @@ for img_path in sorted(DRONE_IMG_CLEAN.iterdir()):
         drone_rot_size = (_bgr.shape[1], _bgr.shape[0])  # (W,H)
         DRONE_IMG_FOR_VIZ = DRONE_IMG
     else:
-        # SuperPoint / DISK: rotate by k*90° based on heading 
-        phi_deg = get_phi_deg(DRONE_INFO_DIR, drone_img)
+        # -------------------- Rotate drone image by csv heading --------------------
+        # SuperPoint / DISK: rotate according to heading from CSV
+        phi_deg_flip = get_phi_deg(DRONE_INFO_DIR, drone_img)
            
         # Arbitrary-angle rotation with padding; save the exact affine
         img = cv2.imread(str(DRONE_IMG), cv2.IMREAD_COLOR)
         H, W = img.shape[:2]
-        a = -phi_deg                        
+        a = -phi_deg_flip
         r = math.radians(a)
         c, s = abs(math.cos(r)), abs(math.sin(r))
         newW = int(math.ceil(W*c + H*s))
@@ -624,15 +670,18 @@ for img_path in sorted(DRONE_IMG_CLEAN.iterdir()):
         M[1, 2] += (newH - H) / 2.0
 
         bgr_rot = cv2.warpAffine(img, M, (newW, newH), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
-        DRONE_IMG_ROT_PATH = OUT_DIR / f"drone_rot_{a}.png"
 
         R_orig2rot = np.eye(3, dtype=np.float64)
         R_orig2rot[:2, :3] = M               
 
         hR, wR = bgr_rot.shape[:2]
         drone_rot_size = (wR, hR)
-        DRONE_IMG_FOR_VIZ = DRONE_IMG_ROT_PATH
-        cv2.imwrite(str(DRONE_IMG_ROT_PATH), bgr_rot)
+        if visualisations_enabled:
+            DRONE_IMG_ROT_PATH = OUT_DIR / f"drone_rot_{a}.png"
+            DRONE_IMG_FOR_VIZ = DRONE_IMG_ROT_PATH
+            cv2.imwrite(str(DRONE_IMG_ROT_PATH), bgr_rot)
+
+        # -------------------- Extract features from rotated drone image --------------------
 
         if feat == "superpoint":
             extractor_local = SuperPoint(max_num_keypoints=MAX_KPTS).eval().to(device)
@@ -653,7 +702,7 @@ for img_path in sorted(DRONE_IMG_CLEAN.iterdir()):
         DRONE_IMG_FOR_VIZ = DRONE_IMG_ROT_PATH
         
 
-    # -------------------- Pass 1: score all tiles --------------------
+    # -------------------- Pass 1: score all tiles (does not compute performance, just finds best match) --------------------
     tiles = [p for p in SAT_DIR.iterdir() if p.is_file() and p.suffix.lower() == ".png"]
     if not tiles:
         raise FileNotFoundError(f"No PNG tiles in {SAT_DIR}")
@@ -728,7 +777,7 @@ for img_path in sorted(DRONE_IMG_CLEAN.iterdir()):
             if device == "cuda":
                 torch.cuda.empty_cache()
 
-    # -------------------- Rank & write CSV --------------------
+    # -------------------- Rank them and save in CSV. There is gonna be one CSV for each drone image --------------------
     scores_small.sort(key=lambda d: d["sort_key"], reverse=True)
     with open(CSV_RESULT_PATH, "w", newline="") as f:
         w = csv.writer(f)
@@ -745,54 +794,51 @@ for img_path in sorted(DRONE_IMG_CLEAN.iterdir()):
                         ])
     print(f"[info] wrote CSV")
 
-    top1 = scores_small[:1] # top-1 only for overlays chance this to visualise for more tiles
 
-    # -------------------- Pass 2: matches viz + overlays --------------------
+    #### OBS this decides how many top tiles to visualize in detail ####
+    top1 = scores_small[:1] # top-1 only. if you want to visualise for more than the top 1, change here
+
+
+    ########################################################################################################
+    #- --------------------- Pass 2: Visualization and Kalman Filtering on top 1 candidate --------------------
+    ##########################################################################################################
+    #initialize satellite display
     sat_vis, SX, SY, _sat_meta = load_sat_display_and_scale()
     sat_base = sat_vis.copy()
 
-    rank_colors = [(0,255,0), (255,0,0), (0,0,255)]  # BGR defined for the top 3
-
-    #------------- extended kalman filter for search region estimation ------------
-    #kf = KalmanCV2D(x0=[x0, y0, vx0, vy0])
-    with open(DRONE_INFO_DIR, "r", newline="") as f:
-        r = csv.DictReader(f)
-        for row in r:
-            if row["filename"] == str(drone_img):
-                time = datetime.fromisoformat(row["date"])
-                if last_dt is not None:
-                    dt = (time -  last_dt).total_seconds()
-                    print(f"dt between frames: {dt} seconds")
-                last_dt = time
+    rank_colors = [(0,255,0), (255,0,0), (0,0,255)]  # Green, Red, Blue for top -1,2,3
 
     # ORIGINAL drone size (for original-frame overlays / error)
     _bgr_orig = cv2.imread(str(DRONE_IMG), cv2.IMREAD_COLOR)
     H_orig, W_orig = _bgr_orig.shape[:2]
 
-    for rank, r in enumerate(top1, 1):
-        p = r["tile"]
-        color = rank_colors[rank-1]
+    ########## main loop in preprocessing each of the top-N tiles ##########
+    for rank, r in enumerate(top1, 1): 
+        # first step is to extract/load features for the tile and compute H for candidate tile
+        tile_name = r["tile"]  # read tile name
+        color = rank_colors[rank-1] # set color
 
-        with torch.inference_mode():
-            tile_pt = make_feature_pt_path_for(p)
+        with torch.inference_mode(): # extracting precomputed features 
+            tile_pt = make_feature_pt_path_for(tile_name)
             if tile_pt.exists():
-                feats1_b, feats1_r = load_feats_pt_batched(tile_pt, device if feat != "sift" else "cpu")
-            else:
-                if extractor is None:
-                    raise FileNotFoundError(f"Missing {tile_pt} and no extractor available.")
-                img1_t  = load_image(str(p)).to(device if feat != "sift" else "cpu")
+                # use precomputed features instead of extracting on the fly
+                feats1_b, feats1_r = load_feats_pt_batched(tile_pt, device if feat != "sift" else "cpu") 
+            else: # no precomputed features extract on the fly
+                img1_t  = load_image(str(tile_name)).to(device if feat != "sift" else "cpu")
                 feats1_b = extractor.extract(img1_t)
                 feats1_r = rbd(feats1_b)
 
-            matches01 = matcher({"image0": feats0_batched, "image1": feats1_b})
-            m_r = rbd(matches01)
+            #call LightGlue matcher to get matches
+            matches01 = matcher({"image0": feats0_batched, "image1": feats1_b}) 
+            m_r = rbd(matches01) #Lightglue utility to make dimensions nice (possability of batches are removed)
             matches = m_r.get("matches", None)
 
-            inlier_mask = None
-            pts0_np = np.empty((0,2), np.float32)
-            pts1_np = np.empty((0,2), np.float32)
-            H_rot2tile = None
+            inlier_mask = None #initialise
+            pts0_np = np.empty((0,2), np.float32) # initialise
+            pts1_np = np.empty((0,2), np.float32) # initialise
+            H_rot2tile = None   #initialise
 
+            # Estimate homography using RANSAC + DLT refinement
             if matches is not None and matches.numel() > 0:
                 pts0_np = feats0_r["keypoints"][matches[:, 0]].detach().cpu().numpy()
                 pts1_np = feats1_r["keypoints"][matches[:, 1]].detach().cpu().numpy()
@@ -807,42 +853,38 @@ for img_path in sorted(DRONE_IMG_CLEAN.iterdir()):
                         inlier_mask = mask.ravel().astype(bool)
 
                     #using DLT on inliers for better accuracy
-                    if H_rot2tile is not None and num_inliers >= 4:
+                    if H_rot2tile is not None and inlier_mask is not None and inlier_mask.sum() >= 4:
                         H_rot2tile, _ = cv2.findHomography(pts0_np[inlier_mask], pts1_np[inlier_mask], method=0)
+        # Now we have H_rot2tile mapping FROM ROTATED drone frame TO TILE frame
 
-        # classic side-by-side in the frame LightGlue saw (rotated)
-        out_match_png = OUT_DIR / f"top{rank:02d}_{p.stem}_matches.png"
-        visualize_inliers(DRONE_IMG_FOR_VIZ, p, pts0_np, pts1_np, inlier_mask, str(out_match_png))
+        # -------------------- Visualizations --------------------
+        if visualisations_enabled:
+            # Visualisation: classic side-by-side in the frame LightGlue saw (rotated)
+            out_match_png = OUT_DIR / f"top{rank:02d}_{tile_name.stem}_matches.png"
+            visualize_inliers(DRONE_IMG_FOR_VIZ, tile_name, pts0_np, pts1_np, inlier_mask, str(out_match_png))
 
+        # If homography is not reliable, skip overlay and error metrics TODO We schould still do EKF update?
         if H_rot2tile is None or inlier_mask is None or inlier_mask.sum() < 4:
-            print(f"[warn] Homography not reliable for {p.name}; skipping overlay.")
+            print(f"[warn] Homography not reliable for {tile_name.name}; skipping overlay.")
+            # TODO: Implement EKF update even if overlay is skipped
+
             del feats1_b, feats1_r, matches01, m_r
             if 'img1_t' in locals():
                 del img1_t
             gc.collect()
             if device == "cuda":
                 torch.cuda.empty_cache()
-            continue
+            continue # EKFupdate schould be made
+        
+        # Compute H from ORIGINAL drone frame to TILE frame
+        H_orig2tile = H_rot2tile @ R_orig2rot      
 
-        H_orig2tile = H_rot2tile @ R_orig2rot         
+        # -------------------- Get visualisation parameters --------------------
+        x_off, y_off = tile_offset_from_name(tile_name) # Project ORIGINAL drone corners/center (for overlays & error)
+        center_global, corners_global, forward_global, heading_unitvector_measurement = get_visualisation_parameters(H_orig2tile, W_orig, H_orig, x_off, y_off)
 
-        # Project ORIGINAL drone corners/center (for overlays & error)
-        corners0 = np.array([[0,0],[W_orig,0],[W_orig,H_orig],[0,H_orig]], dtype=np.float32)
-        center0  = np.array([[W_orig/2, H_orig/2]], dtype=np.float32)
-
-        corners_tile = project_pts(H_orig2tile, corners0)
-        center_tile  = project_pts(H_orig2tile, center0)[0]
-
-        # tile offsets are ORIGINAL sat pixels parsed from filename
-        x_off, y_off = tile_offset_from_name(p)
-        corners_global = corners_tile + np.array([x_off, y_off], np.float32)
-        center_global  = center_tile  + np.array([x_off, y_off], np.float32)
-
-        # map to DOWNSCALED satellite coords
-        corners_disp = corners_global * np.array([SX, SY], np.float32)
-        center_disp  = center_global  * np.array([SX, SY], np.float32)
-
-        if rank == 1:
+        ####################################### EKF + metrics for only top candidate #######################################
+        if rank == 1:  # top-1 candidate
             # compute overall_confidence:
             with open(CSV_RESULT_PATH, newline="") as f:
                 reader = csv.DictReader(f)
@@ -850,27 +892,129 @@ for img_path in sorted(DRONE_IMG_CLEAN.iterdir()):
                 num_inliers = int(first_row["inliers"])
                 total_matches = int(first_row["total_matches"])
                 median_err_px = float(first_row["median_reproj_error"])
-            overall_confidence = absolute_confidence(num_inliers,total_matches,median_err_px)
-        
+            overall_confidence = absolute_confidence(num_inliers,total_matches,median_err_px) 
+
+
+            #------------- extended kalman filter for search region estimation ------------
+            
+            # ---- Build measurement (x, y, phi) from homography in ORIGINAL pixels ----
+            meas_phi_deg, meas_phi_rad,(meas_x_px, meas_y_px) = get_measurements(H_orig2tile, W_orig, H_orig, forward_global, center_global, heading_unitvector_measurement) 
+
+            # ---- Measurement covariance from confidence ----
+            R = EKF_ConstantVelHeading.R_from_conf(
+                    pos_base_std=20.0, # px
+                    heading_base_std_rad=np.deg2rad(8.0), # rad
+                    overall_conf=overall_confidence  # between 0 and 1
+                )  # this gives us R matrix for EKF update. R tells us how ceartain we are about the measurements.
+
+            # ---- EKF: initialization ----
+            if ekf is None: # first drone image
+                # -------------------- EKF initialization (global across frames) --------------------
+                #read CSV to get starting lat lon and velocity estimate
+                with open(DRONE_INFO_DIR, "r", newline="") as f:
+                        r = csv.DictReader(f)
+                        for row in r:
+                            if row["filename"] == str(drone_img):
+                                starting_position_latlon = (np.float128(row["lat"]), np.float128(row["lon"]))
+                                starting_position_xy = latlon_to_orig_xy(starting_position_latlon[0], starting_position_latlon[1], SAT_LONG_LAT_INFO_DIR, sat_number, SAT_DISPLAY_META)
+                                t_current = datetime.fromisoformat(row["date"])
+                                t_last = t_current  # for next frame
+                                # get phi
+                                phi_deg0 = np.float64(row["Phi1"])
+                                phi0 = np.deg2rad(phi_deg0)
+                                print(f"[info] Initial heading from CSV: {phi_deg0:.2f} deg")
+
+                                # try reading the very next row in the file to get velocity estimate
+                                next_row = next(r)
+                                lat1 = float(next_row["lat"])
+                                lon1 = float(next_row["lon"])
+                                k1_position_xy = latlon_to_orig_xy(lat1, lon1, SAT_LONG_LAT_INFO_DIR, sat_number, SAT_DISPLAY_META)
+                                # find dt between the two rows
+                                t1 = datetime.fromisoformat(next_row["date"])
+                                dt = (t1 - t_current).total_seconds()
+                                if dt > 0 and not None:
+                                    vel_x = (k1_position_xy[0] - starting_position_xy[0]) / dt
+                                    vel_y = (k1_position_xy[1] - starting_position_xy[1]) / dt
+                                    vel = np.sqrt(vel_x**2 + vel_y**2)
+                                    print(f"[info] Initial velocity estimate from CSV: {vel:.2f} px/s over dt={dt:.2f}s")
+                                else:
+                                    vel = 50.0
+                                    print(f"[warning] Non-positive dt={dt:.2f}s between first two rows in CSV. Using default initial vel={vel:.2f} px/s")
+                                break  
+
+                # initial state: (x, y, v, phi) OBS: it is very important this is from the original sat pixels (before downscale for visualization)
+                x0 = np.array([starting_position_xy[0], starting_position_xy[1], vel, phi0], dtype=np.float64)  # x,y in ORIGINAL sat pixels
+                # initial covariance. We are very certain about position as its GT from GPS
+                P0 = np.diag([0.01**2,                # σx = 0.01 px
+                            0.01**2,                # σy = 0.01 px
+                            0.5**2,                # σv = 0.5 px/s (since we have a rough estimate)
+                            np.deg2rad(1.0)**2     # σφ = 1° # also very sure here
+                            ])  # this is something we only set for this first run it will be updated by EKF later.
+                ekf = EKF_ConstantVelHeading(x0, P0, 
+                                            sigma_pos_proc=0.75,            # px/√s : baseline diffusion on x,y
+                                            sigma_speed=0.5,                # px/√s : how much v can wander
+                                            sigma_phi=np.deg2rad(3.0)       # rad/√s : how much phi can wander pr second
+                                            ) # the sigmas here are for model process noise Q. TODO tune these!
+                continue
+            else: # not first frame
+                #determine dt for model prediction:
+                with open(DRONE_INFO_DIR, "r", newline="") as f:
+                    r = csv.DictReader(f)
+                    for row in r:
+                        if row["filename"] == str(drone_img):
+                            t_current = datetime.fromisoformat(row["date"])
+                            if t_last is not None:
+                                dt = (t_current - t_last).total_seconds()
+                                print(f"dt between frames: {dt} seconds")
+                            t_last = t_current
+                # ---- EKF: predict + update ----
+                x_pred, _ = ekf.predict(dt)
+
+                # Store or log this for debugging
+                x_pred_pos = x_pred[:2]   # (x, y)
+                phi_pred   = np.degrees(x_pred[3])
+                print(f"[Predict-only] Predicted position: ({x_pred_pos[0]:.1f}, {x_pred_pos[1]:.1f}) px, heading={phi_pred:.1f}°")
+                
+                # get measurements in ORIGINAL sat pixels
+                meas_phi_rad, meas_phi_deg, (meas_x, meas_y) = get_measurements(H_orig2tile, W_orig, H_orig, forward_global, center_global, heading_unitvector_measurement)
+                print(f"Measurement: x={meas_x:.2f}, y={meas_y:.2f}, phi={meas_phi_deg:.2f} deg")
+                x_estimated, P_estimated = ekf.update_pos_heading([meas_x, meas_y, np.deg2rad(compass_to_img(meas_phi_deg))], R) # note that the update function expects heading in radians and image frame convention
+                x_estimated[3] = img_to_compass(np.rad2deg(x_estimated[3]))  # convert back to degrees for logging
+                print(f"[EKF] Updated state: x={x_estimated[0]:.2f}, y={x_estimated[1]:.2f}, v={x_estimated[2]:.2f} px/s, phi={np.rad2deg(x_estimated[3]):.2f} deg")
+            # -------------------- EKF done  --------------------
+            
+            
+            # ------------- Overlays on SATELLITE image -------------------- TODO: this can be removed and integrated in get_unit_heading_vector_and_measurements_in_tile
+            # map to DOWNSCALED satellite coords for visualization
+            corners_disp = corners_global * np.array([SX, SY], np.float32)
+            center_disp  = center_global  * np.array([SX, SY], np.float32)
+            
+
+            #------------- Position error computation --------------------
+            # Error in meters (using ORIGINAL-frame center)
+            lat_long_pose_estimated = get_location_in_sat_img(center_global, SAT_LONG_LAT_INFO_DIR, sat_number, SAT_DISPLAY_META)
+            error, dx, dy = determine_pos_error(lat_long_pose_estimated, DRONE_INFO_DIR, drone_img)
+            print(f"[Metrics] Mean Error: {error}m, dx: {dx}m, dy: {dy}m")
+
             # Single overlay
             sat_individual = sat_base.copy()
             draw_polygon(sat_individual, corners_disp, color=color, thickness=3)
             draw_point(sat_individual, center_disp, color=color, r=5)
-            out_overlay = OUT_DIR / f"top{rank:02d}_{p.stem}_overlay_on_sat.png"
+            out_overlay = OUT_DIR / f"top{rank:02d}_{tile_name.stem}_overlay_on_sat.png"
             cv2.imwrite(str(out_overlay), sat_individual)
 
-            # Error in meters (using ORIGINAL-frame center)
-            pose_estimated = get_location_in_sat_img(center_global, SAT_LONG_LAT_INFO_DIR, sat_number, SAT_DISPLAY_META)
-            error, dx, dy = determine_pos_error(pose_estimated, DRONE_INFO_DIR, drone_img)
-            print(f"[Metrics] Mean Error: {error}m, dx: {dx}m, dy: {dy}m")
-
+            # ------------- Make overlay on tile --------------------
             # Tight crop + heading metrics on TILE, using ORIGINAL-frame H and size
-            out_cropped = OUT_DIR / f"top01_{p.stem}_pred_vs_gt_TILE_cropped.png"
-            crop_img, dtheta_deg, dotp = draw_cropped_pred_vs_gt_on_tile(
-                tile_path=p,
-                Hmat=H_orig2tile,                    
-                x_off=x_off, y_off=y_off,
-                DRONE_INPUT_W=W_orig, DRONE_INPUT_H=H_orig,  
+            out_cropped = OUT_DIR / f"top01_{tile_name.stem}_pred_vs_gt_TILE_cropped.png"
+            heading_uv = np.array([np.cos(np.deg2rad(compass_to_img(meas_phi_deg))),
+                                    np.sin(np.deg2rad(compass_to_img(meas_phi_deg)))], 
+                                    dtype=np.float64
+                                )
+            _, dtheta_deg, dotp = draw_cropped_pred_vs_gt_on_tile(
+                tile_path=tile_name,
+                Hmat=H_orig2tile,
+                x_off=x_off, y_off=y_off, heading_unitvector_measurement_in_pixel_heading=heading_uv,
+                DRONE_INPUT_W=W_orig, DRONE_INPUT_H=H_orig,
                 DRONE_INFO_DIR=DRONE_INFO_DIR,
                 drone_img=drone_img,
                 SAT_LONG_LAT_INFO_DIR=SAT_LONG_LAT_INFO_DIR,
@@ -878,16 +1022,17 @@ for img_path in sorted(DRONE_IMG_CLEAN.iterdir()):
                 SAT_DISPLAY_META=SAT_DISPLAY_META,
                 error=error,
                 crop_radius_px=450,
-                out_path=out_cropped,
-                heading_flip_180=Heading_flip_180
-            )
+                out_path=out_cropped
+            ) # this saves the cropped image too
             print(f"[Metrics] heading Δθ={dtheta_deg:.2f}°, dot={dotp:.4f}")
 
+            #------------- save final results to overall CSV file --------------------
             # add to the bottom of results_{sat_number}.csv file:
             with open(CSV_FINAL_RESULT_PATH, "a", newline="") as f:
                 w = csv.writer(f)
                 w.writerow([drone_img,
                             first_row["tile"],
+                            first_row["total_matches"],
                             num_inliers,
                             first_row["avg_confidence"],
                             f"{median_err_px:.4f}",
@@ -896,6 +1041,8 @@ for img_path in sorted(DRONE_IMG_CLEAN.iterdir()):
                             f"{overall_confidence:.6f}",
             ])
 
+
+
         # empty memory
         del feats1_b, feats1_r, matches01, m_r
         if 'img1_t' in locals():
@@ -903,6 +1050,3 @@ for img_path in sorted(DRONE_IMG_CLEAN.iterdir()):
         gc.collect()
         if device == "cuda":
             torch.cuda.empty_cache()
-
-
-
