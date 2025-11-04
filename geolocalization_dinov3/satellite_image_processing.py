@@ -57,6 +57,12 @@ with rasterio.open(input_file) as src:
     meters_per_degree_lat = 111320
     meters_per_degree_lon = 111320 * np.cos(np.radians(drone_position[0]))
 
+    # Compute the resolution of the satellite image in meters per pixel
+    res_meters_per_pixel_lat = geo_span_meters[0] / src.height
+    res_meters_per_pixel_lon = geo_span_meters[1] / src.width
+    print("Resolution (meters per pixel - lat, lon): ", res_meters_per_pixel_lat, res_meters_per_pixel_lon)
+    print("Mean resolution (meters per pixel): ", (res_meters_per_pixel_lat + res_meters_per_pixel_lon) / 2)
+
     crop_size_deg_lat = crop_size_meters / meters_per_degree_lat
     crop_size_deg_lon = crop_size_meters / meters_per_degree_lon
 
@@ -103,6 +109,9 @@ with rasterio.open(input_file) as src:
 
     # Get dimensions of the cropped image
     img_height, img_width = img_cropped.shape[:2]
+
+    print("Cropped image size (H x W):", img_height, "x", img_width)
+    print("Cropped image spans x meters in lat, y meters in lon: ", img_height * res_meters_per_pixel_lat, img_width * res_meters_per_pixel_lon)
 
     # Compute number of tiles (at least 1)
     num_tiles_width = max(round(img_width / desired_tile_width), 1)
