@@ -255,20 +255,34 @@ def locate_drone_position(drone_features: torch.Tensor,
     # -------------------------------
     # Robustly split features into fine num_tiles_width x num_tiles_height patches
     # -------------------------------
-    num_fine_tiles = num_tiles_height * num_tiles_width
-    features_per_fine_tile = patch_features.shape[0] // num_fine_tiles
+    # Total number of ViT features in the patch
+    total_patches = patch_features.shape[0]
+
+    # Preserve aspect ratio from the original coarse satellite tile grid
+    aspect_ratio = num_tiles_rows / num_tiles_cols  # e.g., 5/4
+    w_patch_patches = int(np.sqrt(total_patches / aspect_ratio))
+    h_patch_patches = total_patches // w_patch_patches
+    D = patch_features.shape[1]
+
+    print(f"ViT patch grid for this patch: {h_patch_patches} x {w_patch_patches} patches (D={D})")
+
+    # Reshape features into spatial grid
+    patch_features_grid = patch_features[:h_patch_patches * w_patch_patches].reshape(h_patch_patches, w_patch_patches, D)
+
+    # Compute fine tile size in ViT patch units
+    fine_tile_h = h_patch_patches // num_tiles_height
+    fine_tile_w = w_patch_patches // num_tiles_width
 
     patch_features_list = []
-    start = 0
-    for _ in range(num_fine_tiles):
-        end = start + features_per_fine_tile
-        patch_features_list.append(patch_features[start:end])
-        start = end
-
-    # If leftover rows exist (from floor division), merge into last tile
-    if start < patch_features.shape[0]:
-        leftover = patch_features[start:]
-        patch_features_list[-1] = torch.vstack([patch_features_list[-1], leftover])
+    for i in range(num_tiles_height):
+        for j in range(num_tiles_width):
+            h_start = i * fine_tile_h
+            h_end   = (i + 1) * fine_tile_h if i < num_tiles_height - 1 else h_patch_patches
+            w_start = j * fine_tile_w
+            w_end   = (j + 1) * fine_tile_w if j < num_tiles_width - 1 else w_patch_patches
+            
+            tile_feat = patch_features_grid[h_start:h_end, w_start:w_end, :].reshape(-1, D)
+            patch_features_list.append(tile_feat)
 
     # -------------------------------
     # Fine-grained heatmap
@@ -294,7 +308,7 @@ def locate_drone_position(drone_features: torch.Tensor,
             kernel_features = F.normalize(kernel_features, dim=-1)
             
             similarity = torch.matmul(drone_features, kernel_features.T) # (N, 1024) x (1024, M) -> (N, M)
-            top_k = max(1, kernel_features.shape[0] // 2) # top 50%
+            top_k = max(1, kernel_features.shape[0] // 20) # top 5%
             topk_vals, _ = similarity.flatten().topk(top_k)
             mean_topk = topk_vals.mean().item()
 
@@ -328,9 +342,9 @@ def locate_drone_position(drone_features: torch.Tensor,
     plt.imshow(best_patch)
     plt.title(f"Satellite Fine-Patch Candidate")
     plt.axis('off')
-    plt.show()
 
     # Show the best heatmap
+    plt.figure(figsize=(6, 6))
     plt.imshow(heatmap_fine, cmap='hot', interpolation='nearest')
     plt.title(f"Best Fine-grained Heatmap")
     plt.colorbar()
@@ -539,7 +553,7 @@ if __name__ == "__main__":
         num_tiles_rows=5,                   # Number of rows in satellite feature grid - Read from satellite_image_processing.py
         num_tiles_cols=4,                   # Number of columns in satellite feature grid - Read from satellite_image_processing.py
         kernel_size=3,                      # Expands kernel from top-left tile to N x N tiles
-        fine_kernel_size=9,                 # For fine grained search within each candidate
+        fine_kernel_size=8,                 # For fine grained search within each candidate
         device=device                       # Use same device as model (likely 'cuda' - GPU)
         )
 
@@ -610,38 +624,7 @@ if __name__ == "__main__":
             # Fine grained search is likely the cause of most of the time, optimizations possible. (5.7 seconds for single candidate search)
             # Depending on DINO performance, maybe just assume candidate 1 is correct?
 
-            i += 1
-
-            """""
-            # --- Everything below is for visualization/report only ---
-            # Visualize best matching satellite patch
-            plt.figure(figsize=(8, 8))
-            plt.imshow(patch)
-            plt.axis("off")
-            plt.title("Best Matching Satellite Patch")
-
-            # Visualize heatmap
-            # Only the valid top-left positions (Removes padding zeros for 1-1 kernel positions)
-            valid_rows = heatmap.any(axis=1)
-            valid_cols = heatmap.any(axis=0)
-            valid_heatmap = heatmap[np.ix_(valid_rows, valid_cols)]
-            plt.figure(figsize=(8, 6))
-            plt.imshow(valid_heatmap, cmap='hot', interpolation='nearest')
-            plt.colorbar(label='Mean Cosine Similarity')
-            plt.title("Drone-to-Satellite Kernel Matching Heatmap")
-            plt.xlabel("Kernel Column")
-            plt.ylabel("Kernel Row")
-
-            # PCA project to RGB for visualization
-            projected_image = pca_project_rgb(features, image_resized)
-            projected_image_np = projected_image.permute(1, 2, 0).cpu().numpy()
-            plt.figure(figsize=(8, 8))
-            plt.imshow(projected_image_np)
-            plt.axis("off")
-            plt.title("PCA Projected Drone Image")
-            
-            plt.show()
-            """""
+            i += 1  # Move to next image in dataset
         else:
             print("Homography could not be computed for this frame. - Skipping localisation to avoid noise")
             i += 1
