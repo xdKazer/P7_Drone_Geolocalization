@@ -416,3 +416,10 @@ FodyWeavers.xsd
 *.msix
 *.msm
 *.msp
+
+/tiles_png_uniform/*
+/pca_projected_images/*
+/geolocalization_dinov3/testingstuff.py
+/geolocalization_dinov3/dataset_data/satellite_images/satellite03.tif
+/dino_features/*
+/geolocalization_dinov3/fine_grained_candidates/*
