@@ -1,14 +1,12 @@
 # run_batch_match_top3_constmem.py  (PT-features version)
-import csv, math, gc
+import csv, math, gc, random, cv2, torch
+from scipy.stats import chi2
 from pathlib import Path
 import shutil # to delete folders
-import csv
 from typing import Optional
 import json, re
 
 import numpy as np
-import torch
-import cv2
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -36,7 +34,7 @@ DATASET_DIR = BASE / "UAV_VisLoc_dataset"
 SAT_LONG_LAT_INFO_DIR = DATASET_DIR / "satellite_ coordinates_range.csv"
 DRONE_INFO_DIR = DATASET_DIR / sat_number / f"{sat_number}.csv"
 DRONE_IMG_CLEAN = DATASET_DIR / sat_number / "drone_test"  #TODO
-SAT_DIR   = DATASET_DIR / sat_number / "test_signe" #TODO
+SAT_DIR   = DATASET_DIR / sat_number / "sat_tiles_overlap" 
 OUT_DIR_CLEAN   = BASE / "outputs" / sat_number 
 
 # delete folder if exists
@@ -190,13 +188,13 @@ class EKF_ConstantVelHeading:
 
     @staticmethod
     def R_from_conf(pos_base_std, heading_base_std_rad, overall_conf,
-                    min_scale=0.3, max_scale=3.0):
+                    min_scale=0.3, max_scale=2.0): #TODO
         """
         Build measurement covariance from a confidence in [0,1].
         Higher confidence -> smaller variance (clamped by min/max scale).
         """
-        # turn confidence into a scale factor (invert, then clamp)
-        scale = np.clip(1.0 / max(1e-6, float(overall_conf)), min_scale, max_scale)
+        # liniar mapping from confidence to scale between min and max scale
+        scale = np.interp(np.clip(overall_conf, 0.0, 1.0), [0.0, 1.0], [max_scale, min_scale]) 
         Rx = (pos_base_std * scale)**2
         Ry = (pos_base_std * scale)**2
         Rphi = (heading_base_std_rad * scale)**2
@@ -262,14 +260,17 @@ def get_location_in_sat_img(drone_img_centre, SAT_LONG_LAT_INFO_DIR, sat_number,
     lat = LT_lat + (v / sat_H) * (RB_lat - LT_lat)
     return (lat, lon)
 
-def determine_pos_error(pose, pose_ekf, DRONE_INFO_DIR, drone_img):
+def determine_pos_error(pose, pose_ekf, heading_deg, heading_ekf_deg, DRONE_INFO_DIR, drone_img):
     """ Compute position error in meters between estimated pose and GT from CSV.
     pose: (lat, lon) as float128
-    pose_ekf: (lat, lon) as float128
-    output: total_error_m, dx, dy, total_error_m_ekf, dx_ekf, dy_ekf
+    pose_ekf: in pixels
+    heading_deg: float (compass heading in degrees)
+    heading_ekf_deg: float (compass heading in degrees)
+    output: total_error_m, dx, dy, total_error_m_ekf, dx_ekf, dy_ekf, dphi ,dphi_ekf, gt_pose_px
     """
     pose = np.array(pose, dtype=np.float128)
-    pose_ekf = np.array(pose, dtype=np.float128)
+    pose_ekf = np.array(pose_ekf, dtype=np.float128) # is in pixels
+    pose_ekf = get_location_in_sat_img(pose_ekf, SAT_LONG_LAT_INFO_DIR, sat_number, SAT_DISPLAY_META) # convert to lat/lon
 
     gt_lat = gt_lon = None
     with open(DRONE_INFO_DIR, newline="") as f:
@@ -277,13 +278,14 @@ def determine_pos_error(pose, pose_ekf, DRONE_INFO_DIR, drone_img):
             if r["filename"] == f"{drone_img}":
                 gt_lat = np.float128(r["lat"])
                 gt_lon = np.float128(r["lon"])
+                gt_heading = np.float128(r["Phi1"]) 
                 break
     if gt_lat is None or gt_lon is None:
         raise ValueError(f"GT lat/lon not found for {drone_img}")
     
     # for debugging GT values
-    x, y = latlon_to_orig_xy(gt_lat, gt_lon, SAT_LONG_LAT_INFO_DIR, sat_number, SAT_DISPLAY_META)  
-    print(f"GT values for {drone_img}: x={x}, y={y}, phi={get_phi_deg(DRONE_INFO_DIR, drone_img)}")
+    gt_pose_px = latlon_to_orig_xy(gt_lat, gt_lon, SAT_LONG_LAT_INFO_DIR, sat_number, SAT_DISPLAY_META)  
+    print(f"GT values for {drone_img}: x={gt_pose_px[0]}, y={gt_pose_px[1]}, phi={get_phi_deg(DRONE_INFO_DIR, drone_img)}")
 
     difference = pose - np.array([gt_lat, gt_lon], dtype=np.float128)
     difference_ekf = pose_ekf - np.array([gt_lat, gt_lon], dtype=np.float128)
@@ -302,7 +304,10 @@ def determine_pos_error(pose, pose_ekf, DRONE_INFO_DIR, drone_img):
 
     total_error_m = np.sqrt(dx**2 + dy**2)
     total_error_m_ekf = np.sqrt(dx_ekf**2 + dy_ekf**2)
-    return total_error_m, dx, dy, total_error_m_ekf, dx_ekf, dy_ekf
+
+    dphi = wrap_deg(float(heading_deg - gt_heading))
+    dphi_ekf = wrap_deg(float(heading_ekf_deg - gt_heading))
+    return total_error_m, dx, dy, total_error_m_ekf, dx_ekf, dy_ekf, dphi ,dphi_ekf, gt_pose_px
 
 def get_R_rotated_by_phi1(phi_rad: float, W_orig: int, H_orig: int) -> np.ndarray:
     c, s = np.cos(phi_rad), np.sin(phi_rad)
@@ -481,14 +486,15 @@ def draw_cropped_pred_vs_gt_on_tile(
     cv2.arrowedLine(crop, S(center_tile), S(pred_tip), (0,255,0), 3, tipLength=0.2)
     cv2.circle(crop, S(gt_tile), 10, (255,0,255), -1)
     cv2.arrowedLine(crop, S(gt_tile), S(gt_tip), (255,0,255), 3, tipLength=0.2)
-    cv2.circle(crop, S(ekf_tile), 10, (255,255,0), -1)
-    cv2.arrowedLine(crop, S(ekf_tile), S(ekf_tip), (255,255,0), 3, tipLength=0.2)
+    #cv2.circle(crop, S(ekf_tile), 10, (255,255,0), -1)
+    #cv2.arrowedLine(crop, S(ekf_tile), S(ekf_tip), (255,255,0), 3, tipLength=0.2)
 
-    cv2.rectangle(crop, (10,10), (420,110), (255,255,255), -1)
+    cv2.rectangle(crop, (10,10), (500,130), (255,255,255), -1)
     cv2.putText(crop, "Pred (tile H)", (20,40), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,180,0), 2)
     cv2.putText(crop, "GT (Phi1)", (20,65), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (170,0,170), 2)
-    cv2.putText(crop, f"angle={dtheta:.1f}, dot={dotp:.3f}, error={error:.3f}m", (20,85), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 2)
-    cv2.putText(crop, f"angle_ekf={dtheta_ekf:.1f}, dot_ekf={dotp_ekf:.3f}, error_ekf={error_ekf:.3f}m", (20,105), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 2)
+    cv2.putText(crop, "EKF", (20,85), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180,180,0), 2)
+    cv2.putText(crop, f"angle={dtheta:.1f}, dot={dotp:.3f}, error={error:.3f}m", (20,100), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 2)
+    cv2.putText(crop, f"angle_ekf={dtheta_ekf:.1f}, dot_ekf={dotp_ekf:.3f}, error_ekf={error_ekf:.3f}m", (20,115), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 2)
 
     if out_path is not None:
         cv2.imwrite(str(out_path), crop)
@@ -527,6 +533,50 @@ def draw_polygon(img_bgr, poly_xy, color=(0,255,0), thickness=2):
 
 def draw_point(img_bgr, pt_xy, color=(0,0,255), r=4):
     cv2.circle(img_bgr, (int(pt_xy[0]), int(pt_xy[1])), r, color, -1)
+
+def label_point(
+    img, pt, text, color,
+    offset=(20, -10), font_scale=0.5, thickness=1
+):
+    """
+    Draw text near a point with a line connecting them.
+
+    Args:
+        img: target image (BGR)
+        pt: (x, y) coordinates of the point
+        text: label string
+        color: (B, G, R)
+        offset: (dx, dy) offset of text from the point
+        font_scale: text size
+        thickness: text thickness
+        line_thickness: thickness of the connector line
+    """
+    x, y = int(pt[0]), int(pt[1])
+    ox, oy = offset
+    tx, ty = x + ox, y + oy
+
+    # draw the text label
+    cv2.putText(
+        img, text, (tx, ty),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        font_scale, color, thickness, lineType=cv2.LINE_AA
+    )
+
+def draw_ellipse(img_bgr, center_xy, cov2x2, k_sigma=2.0, color=(255,0,0), thickness=2):
+    vals, vecs = np.linalg.eigh(cov2x2)
+    order = vals.argsort()[::-1]
+    vals = vals[order]
+    vecs = vecs[:, order]
+    angle = np.degrees(np.arctan2(vecs[1,0], vecs[0,0]))
+    a = k_sigma * np.sqrt(vals[0])
+    b = k_sigma * np.sqrt(vals[1])
+    cv2.ellipse(img_bgr,
+                (int(round(center_xy[0])), int(round(center_xy[1]))),
+                (int(round(a)), int(round(b))),
+                angle,
+                0, 360,
+                color,
+                thickness)
 
 def to_numpy_image(t: torch.Tensor):
     return t.detach().permute(1, 2, 0).clamp(0, 1).cpu().numpy()
@@ -605,18 +655,59 @@ def load_feats_pt_batched(pt_path: Path, device: str):
     feats_r = rbd(feats_b)
     return feats_b, feats_r
 
-def absolute_confidence(num_inliers, total_matches, median_err_px,
-                        s_inl=80.0, s_err=3.0, w=(0.6, 0.25, 0.15)):
+def absolute_confidence(num_inliers, avg_conf, median_err_px,
+                        s_inl=30.0, s_err=5.0, w=(0.65, 0.10, 0.25)):  
     """
-    TODO add explanation here!!!
+    Compute an absolute confidence score in [0,1] based on:
+    - num_inliers: number of inlier matches
+    - avg_conf: average matching confidence [0,1]
+    - median_err_px: median reprojection error in pixels
+
+    s_inl: scaling factor for inliers
+    s_err: scaling factor for reproj error
+    w: weights for (inliers, avg_conf, err_score)
     """
-    if total_matches <= 0 or num_inliers <= 0 or not np.isfinite(median_err_px):
+    if avg_conf <= 0 or num_inliers <= 0 or not np.isfinite(median_err_px):
         return 0.0
     inlier_score = 1.0 - np.exp(-num_inliers / s_inl)
-    ratio_score  = np.clip(num_inliers / total_matches, 0.0, 1.0)
     err_score    = np.exp(- (median_err_px / s_err)**2)
-    w_inl, w_ratio, w_err = w
-    return float(np.clip(w_inl*inlier_score + w_ratio*ratio_score + w_err*err_score, 0.0, 1.0))
+    w_inl, w_avg_c, w_err = w
+    return float(np.clip(w_inl*inlier_score + w_avg_c*avg_conf + w_err*err_score, 0.0, 1.0))
+
+# ---------------------- search region ----------------------
+def ellipse_from_cov(mu_xy, Sigma_xy, k=2.0):
+    # mu_xy: (2,) ; Sigma_xy: (2,2)
+    vals, vecs = np.linalg.eigh(Sigma_xy)       # vals ascending
+    a = k * np.sqrt(vals[1])                    # major axis length
+    b = k * np.sqrt(vals[0])                    # minor axis length
+    angle_rad = np.arctan2(vecs[1,1], vecs[0,1])  # angle of major axis
+    return a, b, angle_rad, mu_xy
+
+def ellipse_bbox(mu_xy, Sigma_xy, k=2.0, n=72): # n is number of points to sample
+    a,b,theta,mu = ellipse_from_cov(mu_xy, Sigma_xy, k)
+    t = np.linspace(0, 2*np.pi, n, endpoint=False)
+    pts = np.stack([a*np.cos(t), b*np.sin(t)], axis=0)  # 2×n
+    R = np.array([[np.cos(theta), -np.sin(theta)],
+                  [np.sin(theta),  np.cos(theta)]])
+    pts_world = (R @ pts).T + mu[None,:]
+    x0,y0 = pts_world.min(axis=0)
+    x1,y1 = pts_world.max(axis=0)
+    return (x0,y0,x1,y1)  # bbox in ORIGINAL sat px
+
+def tiles_in_bbox(bbox, TILE_W, TILE_H, STRIDE_X, STRIDE_Y, all_tile_names):
+    x_min, y_min, x_max, y_max = bbox
+    selected_tiles = []
+    for tile_path in all_tile_names:
+        x_off, y_off = tile_offset_from_name(tile_path)
+        tile_bbox = (x_off, y_off, x_off + TILE_W, y_off + TILE_H)
+        # check intersection
+        if not (tile_bbox[2] < x_min or tile_bbox[0] > x_max or
+                tile_bbox[3] < y_min or tile_bbox[1] > y_max):
+            selected_tiles.append(tile_path)
+    return selected_tiles 
+
+
+###################################################################################################
 
 
 # -------------------- Device & models --------------------
@@ -644,9 +735,14 @@ matcher = LightGlue(features=feat).eval().to(device)
 with open(CSV_FINAL_RESULT_PATH, "a", newline="") as f:
                 w = csv.writer(f)
                 w.writerow(["drone_image", "tile", "total_matches", "inliers", "avg_confidence", 
-                            "median_reproj_error_px", "overall_confidence", "measurements", 
-                            "ekf_estimation", "dx_dy", "ekf_dx_dy", "error", "ekf_error", 
-                            "heading_diff", "ekf_heading_diff", "time_s", "ekf_time_s"])
+                            "median_reproj_error_px", "overall_confidence", 
+                            "x_meas", "y_meas", "phi_meas_deg",
+                            "x_ekf", "y_ekf", "phi_ekf_deg",
+                            "dx", "dy", 
+                            "dx_ekf", "dy_ekf",
+                            "error", "ekf_error", 
+                            "heading_diff", "ekf_heading_diff", 
+                            "time_s", "ekf_time_s"])
 
 # -------------------- Load drone features --------------------
 for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
@@ -662,7 +758,90 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
     CSV_RESULT_PATH  = OUT_DIR / "results.csv" 
     if not DRONE_IMG.exists():
         raise FileNotFoundError(f"Missing drone image: {DRONE_IMG}")
+    
+        # -------------------- EKF initialisation--------------------
+    if ekf is None: # first frame is skipped for EKF initialization
+        # -------------------- EKF initialization (global across frames) --------------------
+        #read CSV to get starting lat lon and velocity estimate
+        with open(DRONE_INFO_DIR, "r", newline="") as f:
+            r = csv.DictReader(f)
+            for row in r:
+                if row["filename"] == str(drone_img):
+                    starting_position_latlon = (np.float128(row["lat"]), np.float128(row["lon"]))
+                    starting_position_xy = latlon_to_orig_xy(starting_position_latlon[0], starting_position_latlon[1], SAT_LONG_LAT_INFO_DIR, sat_number, SAT_DISPLAY_META)
+                    t_current = datetime.fromisoformat(row["date"])
+                    t_last = t_current  # needed for next frame
 
+                    # get phi
+                    phi_deg0 = np.float64(row["Phi1"])
+                    phi0 = np.deg2rad(phi_deg0)
+                    print(f"[info] Initial heading from CSV: {phi_deg0:.2f} deg")
+                    phi0_rad = np.deg2rad(compass_to_img(phi_deg0)) # convert to image frame and rad
+
+                    # try reading the very next row in the file to get velocity estimate
+                    next_row = next(r)
+                    lat1 = float(next_row["lat"])
+                    lon1 = float(next_row["lon"])
+                    k1_position_xy = latlon_to_orig_xy(lat1, lon1, SAT_LONG_LAT_INFO_DIR, sat_number, SAT_DISPLAY_META)
+
+                    # find dt between the two rows
+                    t1 = datetime.fromisoformat(next_row["date"])
+                    dt = (t1 - t_current).total_seconds()
+                    if dt > 0 and not None:
+                        vel_x = (k1_position_xy[0] - starting_position_xy[0]) / dt
+                        vel_y = (k1_position_xy[1] - starting_position_xy[1]) / dt
+                        vel0 = np.sqrt(vel_x**2 + vel_y**2)
+                        print(f"[info] Initial velocity estimate from CSV: {vel0:.2f} px/s over dt={dt:.2f}s")
+                    else:
+                        vel0 = 50.0
+                        print(f"[warning] Non-positive dt={dt:.2f}s between first two rows in CSV. Using default initial vel={vel0:.2f} px/s")
+                    break
+
+        # initial state: (x, y, v, phi) OBS: must be in imiage representation and phi:rad!!!
+        x0 = np.array([starting_position_xy[0], starting_position_xy[1], vel0, phi0_rad], dtype=np.float64)  # x,y in ORIGINAL sat pixels
+        # initial covariance. We are very certain about position as its GT from GPS
+        P0 = np.diag([0.01**2,                # σx = 0.01 px
+                    0.01**2,                # σy = 0.01 px
+                    0.5**2,                # σv = 0.5 px/s (since we have a rough estimate)
+                    np.deg2rad(1.0)**2     # σφ = 1° # also very sure here
+                    ])  # this is something we only set for this first run it will be updated by EKF later.
+        ekf = EKF_ConstantVelHeading(x0, P0, 
+                                    sigma_pos_proc=0.75,            # px/√s : baseline diffusion on x,y
+                                    sigma_speed=0.5,                # px/√s : how much v can wander
+                                    sigma_phi=np.deg2rad(3.0)       # rad/√s : how much phi can wander pr second
+                                    ) # the sigmas here are for model process noise Q. TODO tune these!
+        continue # next drone image
+
+    # ---------------------------- EKF prediction + ellipse for search area ---------------
+    #determine dt for model prediction: 
+    with open(DRONE_INFO_DIR, "r", newline="") as f:
+        r = csv.DictReader(f)
+        for row in r:
+            if row["filename"] == str(drone_img):
+                t_current = datetime.fromisoformat(row["date"])
+                if t_last is not None:
+                    dt = (t_current - t_last).total_seconds()
+                    print(f"dt between frames: {dt} seconds")
+                t_last = t_current
+
+    # -------------------- EKF predict step --------------------
+    x_pred, _ = ekf.predict(dt)
+    x_pred[3] = img_to_compass(np.rad2deg(x_pred[3]))
+    print(f"[Predict-only] Predicted position: ({x_pred[0]:.2f}, {x_pred[1]:.2f}) px, heading={x_pred[3]:.2f}°")
+
+    # -------------------- EKF search area (2,-sigma ellipse) --------------------
+    # create search area using Predicted covariance P:
+    P_pred = ekf.P
+    sigma = P_pred[:2, :2]  # position covariance 2x2
+    k = math.sqrt(chi2.ppf(0.99, df=2)) # confidence scaling for 2D ellipse (99%). so how conservative we are. the df is 2 since 2D.
+    
+    ellipse_bbox_coords = ellipse_bbox(x_pred[:2], sigma, k=k, n=72) # this uses SVD to determine viedest axes and orienation of ellipse to get bbx
+
+    # -------------------- Determine tiles in search area --------------------
+    all_tile_names = [p for p in SAT_DIR.iterdir() if p.is_file() and p.suffix.lower() == ".png"]
+    selected_tiles = tiles_in_bbox(ellipse_bbox_coords, TILE_W, TILE_H, STRIDE_X, STRIDE_Y, all_tile_names)
+
+    # -------------------- Rotate drone image & extract features --------------------
     if feat == "sift":
         R_orig2rot = np.eye(3, dtype=np.float64)
         with torch.inference_mode():
@@ -723,22 +902,20 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
         hR, wR = bgr_rot.shape[:2]
         drone_rot_size = (wR, hR)
         
-
-    # -------------------- Pass 1: score all tiles (does not compute performance, just finds best match) --------------------
-    tiles = [p for p in SAT_DIR.iterdir() if p.is_file() and p.suffix.lower() == ".png"]
-    if not tiles:
+    # -------------------- Pass 1: score all tiles (does not compute performance, just finds best match) --------------------   
+    if not selected_tiles:
         raise FileNotFoundError(f"No PNG tiles in {SAT_DIR}")
 
     scores_small = []
     with torch.inference_mode():
-        for i, p in enumerate(tiles):
+        for i, p in enumerate(selected_tiles):
             num_inliers = 0
             avg_conf = float("nan")
             median_err = float("inf")   
             K = 0
             H = None
             inlier_mask = None
-            print(f"Scoring tile {i+1}/{len(tiles)}")
+            print(f"Scoring tile {i+1}/{len(selected_tiles)}")
             tile_pt = make_feature_pt_path_for(p)
             if tile_pt.exists():
                 feats1_b, feats1_r = load_feats_pt_batched(tile_pt, device if feat != "sift" else "cpu")
@@ -786,8 +963,8 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
                 "inliers": num_inliers,
                 "total_matches": K,
                 "avg_conf": avg_conf,
-                "median_err": median_err,
-                "sort_key": (num_inliers, - median_err), # prioritize inliers, then lower error
+                "median_err": median_err,  # describes quality of inliers based on 
+                "sort_key": (num_inliers, - median_err), # prioritize inliers, then lower error 
             })
 
             del feats1_b, feats1_r, matches01, matches01_r
@@ -813,8 +990,10 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
 
     #### OBS this decides how many top tiles to visualize in detail ####
     top1 = scores_small[:1] # top-1 only. if you want to visualise for more than the top 1, change here
+    rank_colors = [(0,255,0)]  # Green for top-1
+
     if visualisations_enabled:
-        top1 = scores_small[:3]  # top-3 for visualizations
+        top1 = scores_small[:1]  # top-3 for visualizations TODO
         rank_colors = [(0,255,0), (255,0,0), (0,0,255)]  # Green, Red, Blue for top -1,2,3
 
 
@@ -904,171 +1083,99 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
             # compute overall_confidence:
             with open(CSV_RESULT_PATH, newline="") as f:
                 reader = csv.DictReader(f)
-                first_row = next(reader) 
+                first_row = next(reader)  # skip the overview line
                 num_inliers = int(first_row["inliers"])
-                total_matches = int(first_row["total_matches"])
+                avg_confidence = float(first_row["avg_confidence"])
                 median_err_px = float(first_row["median_reproj_error"])
-            overall_confidence = absolute_confidence(num_inliers,total_matches,median_err_px) 
+            overall_confidence = absolute_confidence(num_inliers, avg_confidence, median_err_px)
 
-
-            #------------- extended kalman filter for search region estimation ------------
+            #------------- extended kalman filter update step ------------
         
             # ---- Measurement covariance from confidence ---- must be computed each frame
-            R = EKF_ConstantVelHeading.R_from_conf(
-                    pos_base_std=20.0, # px
-                    heading_base_std_rad=np.deg2rad(8.0), # rad
+            R = ekf.R_from_conf(
+                    pos_base_std=36.0, # in px. we expect araound +-10 m = 36px error in position measurement
+                    heading_base_std_rad=np.deg2rad(8.0), # is observed to be -7 degrees off on average
                     overall_conf=overall_confidence  # between 0 and 1
                 )  # this gives us R matrix for EKF update. R tells us how ceartain we are about the measurements.
 
-            # ---- EKF: initialization ----
-            if ekf is None: # first drone image
-                # -------------------- EKF initialization (global across frames) --------------------
-                #read CSV to get starting lat lon and velocity estimate
-                with open(DRONE_INFO_DIR, "r", newline="") as f:
-                        r = csv.DictReader(f)
-                        for row in r:
-                            if row["filename"] == str(drone_img):
-                                starting_position_latlon = (np.float128(row["lat"]), np.float128(row["lon"]))
-                                starting_position_xy = latlon_to_orig_xy(starting_position_latlon[0], starting_position_latlon[1], SAT_LONG_LAT_INFO_DIR, sat_number, SAT_DISPLAY_META)
-                                t_current = datetime.fromisoformat(row["date"])
-                                t_last = t_current  # for next frame
-                                # get phi
-                                phi_deg0 = np.float64(row["Phi1"])
-                                phi0 = np.deg2rad(phi_deg0)
-                                print(f"[info] Initial heading from CSV: {phi_deg0:.2f} deg")
-                                phi0_rad = np.deg2rad(compass_to_img(phi_deg0)) # convert to image frame and rad
+            # ---- Build measurement (x, y, phi) from homography in ORIGINAL pixels. compass heading ----
+            meas_phi_deg, (meas_x_px, meas_y_px) = get_measurements(W_orig, H_orig, forward_global, center_global, heading_unitvector_measurement)
+            print(f"Measurement: x={meas_x_px:.2f}, y={meas_y_px:.2f}, phi={meas_phi_deg:.2f} deg")
 
-                                # try reading the very next row in the file to get velocity estimate
-                                next_row = next(r)
-                                lat1 = float(next_row["lat"])
-                                lon1 = float(next_row["lon"])
-                                k1_position_xy = latlon_to_orig_xy(lat1, lon1, SAT_LONG_LAT_INFO_DIR, sat_number, SAT_DISPLAY_META)
-                                # find dt between the two rows
-                                t1 = datetime.fromisoformat(next_row["date"])
-                                dt = (t1 - t_current).total_seconds()
-                                if dt > 0 and not None:
-                                    vel_x = (k1_position_xy[0] - starting_position_xy[0]) / dt
-                                    vel_y = (k1_position_xy[1] - starting_position_xy[1]) / dt
-                                    vel0 = np.sqrt(vel_x**2 + vel_y**2)
-                                    print(f"[info] Initial velocity estimate from CSV: {vel0:.2f} px/s over dt={dt:.2f}s")
-                                else:
-                                    vel0 = 50.0
-                                    print(f"[warning] Non-positive dt={dt:.2f}s between first two rows in CSV. Using default initial vel={vel0:.2f} px/s")
-                                break
+            # EKF update with measurement (OBS: phi is in rad and in image representation!!! )
+            # NOTE: the update function expects input heading in radians and image frame convention!
+            x_updated, P_estimated = ekf.update_pos_heading([meas_x_px, meas_y_px, np.deg2rad(compass_to_img(meas_phi_deg))], R) 
 
-                # initial state: (x, y, v, phi) OBS: must be in imiage representation and phi:rad!!!
-                x0 = np.array([starting_position_xy[0], starting_position_xy[1], vel0, phi0_rad], dtype=np.float64)  # x,y in ORIGINAL sat pixels
-                # initial covariance. We are very certain about position as its GT from GPS
-                P0 = np.diag([0.01**2,                # σx = 0.01 px
-                            0.01**2,                # σy = 0.01 px
-                            0.5**2,                # σv = 0.5 px/s (since we have a rough estimate)
-                            np.deg2rad(1.0)**2     # σφ = 1° # also very sure here
-                            ])  # this is something we only set for this first run it will be updated by EKF later.
-                ekf = EKF_ConstantVelHeading(x0, P0, 
-                                            sigma_pos_proc=0.75,            # px/√s : baseline diffusion on x,y
-                                            sigma_speed=0.5,                # px/√s : how much v can wander
-                                            sigma_phi=np.deg2rad(3.0)       # rad/√s : how much phi can wander pr second
-                                            ) # the sigmas here are for model process noise Q. TODO tune these!
-                continue
-            else: # not first frame
-                # ---- Build measurement (x, y, phi) from homography in ORIGINAL pixels. compass heading ----
-                meas_phi_deg, (meas_x_px, meas_y_px) = get_measurements(W_orig, H_orig, forward_global, center_global, heading_unitvector_measurement)
-                print(f"Measurement: x={meas_x_px:.2f}, y={meas_y_px:.2f}, phi={meas_phi_deg:.2f} deg")
-
-                #determine dt for model prediction:
-                with open(DRONE_INFO_DIR, "r", newline="") as f:
-                    r = csv.DictReader(f)
-                    for row in r:
-                        if row["filename"] == str(drone_img):
-                            t_current = datetime.fromisoformat(row["date"])
-                            if t_last is not None:
-                                dt = (t_current - t_last).total_seconds()
-                                print(f"dt between frames: {dt} seconds")
-                            t_last = t_current
-                # ---- EKF: predict + update ----
-                x_pred, _ = ekf.predict(dt)
-                x_pred[3] = img_to_compass(np.rad2deg(x_pred[3]))
-
-                print(f"[Predict-only] Predicted position: ({x_pred[0]:.2f}, {x_pred[1]:.2f}) px, heading={x_pred[3]:.2f}°")
-
-                # EKF update with measurement (OBS: phi is in rad and in image representation!!! )
-                # NOTE: the update function expects input heading in radians and image frame convention!
-                x_updated, P_estimated = ekf.update_pos_heading([meas_x_px, meas_y_px, np.deg2rad(compass_to_img(meas_phi_deg))], R) 
-
-                # To get phi estimated back to compass representation and degrees:
-                x_updated[3] = img_to_compass(np.rad2deg(x_updated[3]))  # convert back to degrees for logging
-                print(f"[EKF] Updated state: x={x_updated[0]:.2f}, y={x_updated[1]:.2f}, v={x_updated[2]:.2f} px/s, phi={(x_updated[3]):.2f} deg")
-            # -------------------- EKF done  --------------------           
+            # To get phi estimated back to compass representation and degrees:
+            x_updated[3] = img_to_compass(np.rad2deg(x_updated[3]))  # convert back to degrees for logging
+            print(f"[EKF] Updated state: x={x_updated[0]:.2f}, y={x_updated[1]:.2f}, v={x_updated[2]:.2f} px/s, phi={(x_updated[3]):.2f} deg")
+            #EKF done
 
             #------------- Position error computation --------------------
             # Error in meters (using ORIGINAL-frame center)
             lat_long_pose_estimated = get_location_in_sat_img(center_global, SAT_LONG_LAT_INFO_DIR, sat_number, SAT_DISPLAY_META)
-            error, dx, dy, error_ekf, dx_ekf, dy_ekf = determine_pos_error(lat_long_pose_estimated, (x_updated[0], x_updated[1]), DRONE_INFO_DIR, drone_img)
+            error, dx, dy, error_ekf, dx_ekf, dy_ekf, dphi, dphi_ekf, gt_pose_px = determine_pos_error(lat_long_pose_estimated, (x_updated[0], x_updated[1]), meas_phi_deg, x_updated[3], DRONE_INFO_DIR, drone_img)
 
             print(f"[Metrics] Mean Error: {error}m, dx: {dx}m, dy: {dy}m")
             print(f"[Metrics] Mean Error (EKF): {error_ekf}m, dx: {dx_ekf}m, dy: {dy_ekf}m")
 
-            if visualisations_enabled:
-                # ------------- Overlays on SATELLITE image -------------------- TODO: this can be removed and integrated in get_visualisation_parameters
+            if visualisations_enabled: 
+                # ------------- Overlays on SATELLITE image -------------------- 
                 # map to DOWNSCALED satellite coords for visualization
                 corners_disp = corners_global * np.array([SX, SY], np.float32)
                 center_disp  = center_global  * np.array([SX, SY], np.float32)
+                center_ekf_disp = np.array([x_updated[0]*SX, x_updated[1]*SY], np.float32)
+                center_gt = np.array([gt_pose_px[0]*SX, gt_pose_px[1]*SY], np.float32)
 
-                # Single overlay
-                sat_individual = sat_base.copy()
-                draw_polygon(sat_individual, corners_disp, color=color, thickness=3)
-                draw_point(sat_individual, center_disp, color=color, r=5)
-                out_overlay = OUT_DIR / f"top{rank:02d}_{tile_name.stem}_overlay_on_sat.png"
-                cv2.imwrite(str(out_overlay), sat_individual)
+                for i in range(2):
+                    if i == 0:
+                        sat_individual = sat_base.copy()
+                        out_overlay = OUT_DIR / f"top{rank:02d}_{tile_name.stem}_overlay_on_sat.png"
+                        color = [(255, 0, 0), (0, 255, 0), (0, 0, 255), (255,255,0)]
 
-                # ------------- Make overlay on tile --------------------
-                # Tight crop + heading metrics on TILE, using ORIGINAL-frame H and size
-                out_cropped = OUT_DIR / f"top01_{tile_name.stem}_pred_vs_gt_TILE_cropped.png"
-                heading_uv = np.array([np.cos(np.deg2rad(compass_to_img(meas_phi_deg))),
-                                        np.sin(np.deg2rad(compass_to_img(meas_phi_deg)))], 
-                                        dtype=np.float64
-                                    )
-                dtheta_deg, dotp, dtheta_deg_ekf, dotp_ekf = draw_cropped_pred_vs_gt_on_tile(
-                    tile_path=tile_name,
-                    Hmat=H_orig2tile,
-                    x_off=x_off, y_off=y_off, heading_unitvector_measurement_in_pixel_heading=heading_uv,
-                    lat_long_pose_ekf=(x_updated[0], x_updated[1]), heading_ekf_deg=x_updated[3],
-                    DRONE_INPUT_W=W_orig, DRONE_INPUT_H=H_orig,
-                    DRONE_INFO_DIR=DRONE_INFO_DIR,
-                    drone_img=drone_img,
-                    SAT_LONG_LAT_INFO_DIR=SAT_LONG_LAT_INFO_DIR,
-                    sat_number=sat_number,
-                    SAT_DISPLAY_META=SAT_DISPLAY_META,
-                    error=error, error_ekf = error_ekf,
-                    crop_radius_px=450,
-                    out_path=out_cropped
-                ) # this saves the cropped image too
-                print(f"[Metrics] heading Δθ={dtheta_deg:.2f}°, dot={dotp:.4f}, heading_ekf Δθ={dtheta_deg_ekf:.2f}°, dot_ekf={dotp_ekf:.4f}")
+                        # same center as we use color to destingish
+                        label_point(sat_individual, center_gt, "GT", color[0], offset=(150, 20), font_scale=0.5, thickness=1, line_thickness=1)
+                        label_point(sat_individual, center_gt, "EKF", color[1], offset=(150, 0), font_scale=0.5, thickness=1, line_thickness=1)
+                        label_point(sat_individual, center_gt, "Meas", color[2], offset=(150, -20), font_scale=0.5, thickness=1, line_thickness=1)
+                    else:
+                        out_overlay = OUT_DIR.parent / f"overall_overlay_on_sat.png"
+                        overlay_img = cv2.imread(str(out_overlay))
+                        if overlay_img is None:
+                            overlay_img = sat_base.copy()  # use base if file doesn't exist
+                            
+                        sat_individual = overlay_img
+                        random_color = tuple(random.randint(128, 255) for _ in range(3))
+                        color = [random_color,random_color,random_color,random_color]  # different color for overall overlay
+                    # Overlay
+                    draw_polygon(sat_individual, corners_disp, color=color[3], thickness=2)
+                    draw_point(sat_individual, center_disp, color=color[0], r=2)
+                    draw_point(sat_individual, center_ekf_disp, color=color[1], r=2)
+                    draw_point(sat_individual, center_gt, color=color[2], r=2)
+                    draw_ellipse(sat_individual, center_disp, P_estimated[:2, :2], k_sigma=k, color=color, thickness=2)
 
+                    cv2.imwrite(str(out_overlay), sat_individual)
+            
             #------------- save final results to overall CSV file --------------------
             # add to the bottom of results_{sat_number}.csv file:
             with open(CSV_FINAL_RESULT_PATH, "a", newline="") as f:
                 w = csv.writer(f)
-                w.writerow([drone_img,
-                            first_row["tile"],
-                            first_row["total_matches"],
-                            num_inliers,
-                            first_row["avg_confidence"],
-                            f"{median_err_px:.4f}",
-                            f"{overall_confidence:.4f}",
-                            f"{(meas_x_px, meas_y_px, meas_phi_deg):.4f}",
-                            f"{(x_updated[0], x_updated[1], x_updated[3]):.4f}",
-                            f"{(dx, dy):.4f}",
-                            f"{(dx_ekf, dy_ekf):.4f}",
-                            f"{error:.4f}",
-                            f"{error_ekf:.4f}",
-                            f"{dtheta_deg:.4f}",
-                            f"{dtheta_deg_ekf:.4f}",
-                            # f"{time_total:.4f}",
-                            # f"{time_total_ekf:.4f}",
-            ])
-
-
+                w.writerow([
+                    drone_img,
+                    first_row["tile"],
+                    first_row["total_matches"],
+                    num_inliers,
+                    first_row["avg_confidence"],
+                    f"{median_err_px:.4f}",
+                    f"{overall_confidence:.4f}",
+                    f"{meas_x_px:.4f}", f"{meas_y_px:.4f}", f"{meas_phi_deg:.4f}",
+                    f"{x_updated[0]:.4f}", f"{x_updated[1]:.4f}", f"{x_updated[3]:.4f}",
+                    f"{dx:.4f}", f"{dy:.4f}",
+                    f"{dx_ekf:.4f}", f"{dy_ekf:.4f}",
+                    f"{error:.4f}", f"{error_ekf:.4f}",
+                    f"{dphi:.4f}", f"{dphi_ekf:.4f}",
+                    # f"{time_total:.4f}",
+                    # f"{time_total_ekf:.4f}",
+                ])
 
         # empty memory
         del feats1_b, feats1_r, matches01, m_r
