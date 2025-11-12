@@ -27,6 +27,8 @@ visualisations_enabled = True
 # --- EKF globals (top of file, before the big for-loop) ---
 ekf = None
 t_last = None   # timestamp of previous processed frame
+x_updated = None # needed for rotation of drone img
+starting_drone_images = ["03_0001.JPG", "03_0097.JPG", "03_0193.JPG", "03_0289.JPG", "03_0385.JPG", "03_0481.JPG", "03_0577.JPG", "03_0673.JPG", ] # the names of the drone images that starts a run
 
 
 BASE = Path(__file__).parent.resolve()
@@ -65,16 +67,18 @@ class EKF_ConstantVelHeading:
     """
     Extended Kalman Filter with constant speed + heading motion in 2D.
 
-    State x = [x, y, v, phi]^T
+    State x = [x, y, v, phi, b_phi]^T
       - x, y  : position in your chosen map units (we'll use ORIGINAL sat pixels)
       - v     : speed (units/second)
       - phi   : heading in radians (image coords: +x right, +y down)
+        b_phi : bias in heading
 
     Motion model over dt:
         x_{k+1}   = x_k + v_k * cos(phi_k) * dt
         y_{k+1}   = y_k + v_k * sin(phi_k) * dt
         v_{k+1}   = v_k + w_v          (random-walk on speed)
         phi_{k+1} = phi_k + w_phi      (random-walk on heading, then wrapped)
+        b_phi{k+1}= b_phi + w_b_phi    (random-walk on bias)
     """
 
     def __init__(
@@ -82,7 +86,8 @@ class EKF_ConstantVelHeading:
         x0, P0,
         sigma_pos_proc=0.75,             # px/√s : baseline diffusion on x,y
         sigma_speed=0.5,                 # px/√s : how much v can wander
-        sigma_phi=np.deg2rad(3.0)        # rad/√s: how much heading can wander
+        sigma_phi=np.deg2rad(3.0),       # rad/√s: how much heading can wander
+        sigma_b_phi=np.deg2rad(0.10),     # rad/√s: how much bias can wander (should be very small!!!)
     ):
         """
         Initialize the filter.
@@ -92,36 +97,38 @@ class EKF_ConstantVelHeading:
           P0: (4,4) initial covariance
           sigma_*: process noise hyperparameters (tunable)
         """
-        self.x = np.array(x0, dtype=float).reshape(4)
+        self.x = np.array(x0, dtype=float).reshape(-1)
         self.x[3] = _wrap_pi(self.x[3])              # keep phi in [-pi, pi]
-        self.P = np.array(P0, dtype=float).reshape(4, 4)
+        self.P = np.array(P0, dtype=float).reshape(5, 5)
 
         # Process noise scales (hyperparameters you tune)
         self.sigma_pos_proc = float(sigma_pos_proc)
         self.sigma_speed    = float(sigma_speed)
         self.sigma_phi      = float(sigma_phi)
+        self.sigma_b_phi    = float(sigma_b_phi)
 
     # -------- PREDICT HELPERS USED BY predict() --------
     def _f(self, x, dt):
         """Nonlinear motion model f(x, dt): propagates the state mean."""
-        X, Y, V, PHI = x
+        X, Y, V, PHI, B = x
         c, s = np.cos(PHI), np.sin(PHI)
         Xn = X + V * c * dt
         Yn = Y + V * s * dt
         Vn = V                                   # random walk handled via Q
         PHIn = _wrap_pi(PHI)                     # random walk handled via Q
-        return np.array([Xn, Yn, Vn, PHIn], dtype=float)
+        Bn = B                                  # random walk handled via Q
+        return np.array([Xn, Yn, Vn, PHIn, Bn], dtype=float)
 
     def _F_jac(self, x, dt):
         """Jacobian F = ∂f/∂x at current state; propagates covariance."""
-        _, _, V, PHI = x
+        _, _, V, PHI, _ = x
         c, s = np.cos(PHI), np.sin(PHI)
-        F = np.eye(4)
+        F = np.eye(5)
         F[0, 2] = c * dt           # dX/dV
         F[0, 3] = -V * s * dt      # dX/dPHI
         F[1, 2] = s * dt           # dY/dV
         F[1, 3] =  V * c * dt      # dY/dPHI
-        # rows for V, PHI are identity (random-walk via Q)
+        # rows for V, PHI, B are identity (random-walks handled via Q)
         return F
 
     def _Q_proc(self, dt):
@@ -135,7 +142,8 @@ class EKF_ConstantVelHeading:
         qy = (self.sigma_pos_proc * np.sqrt(dt))**2
         qv = (self.sigma_speed)**2
         qf = (self.sigma_phi * np.sqrt(dt))**2
-        return np.diag([qx, qy, qv, qf])
+        qb = (self.sigma_b_phi * np.sqrt(dt))**2
+        return np.diag([qx, qy, qv, qf, qb])
 
     # -------------------- PREDICT (called every frame) --------------------
     def predict(self, dt):
@@ -167,11 +175,11 @@ class EKF_ConstantVelHeading:
         """
         z = np.asarray(z_xyphi, dtype=float).reshape(3)
         # H maps state -> measurement: [x, y, phi]
-        H = np.array([[1,0,0,0],
-                    [0,1,0,0],
-                    [0,0,0,1]], dtype=float)
+        H = np.array([[1,0,0,0, 0],
+                    [0,1,0,0, 0],
+                    [0,0,0,1, 1]], dtype=float) # we want to measure phi + b_phi
 
-        z_pred = np.array([self.x[0], self.x[1], self.x[3]], dtype=float)
+        z_pred = np.array([self.x[0], self.x[1], _wrap_pi(self.x[3] + self.x[4])], dtype=float)
         y = z - z_pred
         # wrap the heading innovation
         y[2] = _wrap_pi(y[2])
@@ -182,13 +190,13 @@ class EKF_ConstantVelHeading:
         self.x = self.x + K @ y
         self.x[3] = _wrap_pi(self.x[3]) # obs in rad and in image beskrivelse
 
-        I = np.eye(4)
+        I = np.eye(5)
         self.P = (I - K @ H) @ self.P
         return self.x.copy(), self.P.copy()
 
     @staticmethod
     def R_from_conf(pos_base_std, heading_base_std_rad, overall_conf,
-                    min_scale=0.3, max_scale=2.0): #TODO
+                    min_scale=0.3, max_scale=2.0): 
         """
         Build measurement covariance from a confidence in [0,1].
         Higher confidence -> smaller variance (clamped by min/max scale).
@@ -705,11 +713,72 @@ def tiles_in_bbox(bbox, TILE_W, TILE_H, STRIDE_X, STRIDE_Y, all_tile_names):
                 tile_bbox[3] < y_min or tile_bbox[1] > y_max):
             selected_tiles.append(tile_path)
     return selected_tiles 
-
-
 ###################################################################################################
 
+################################## EKF Tuning parameters ##################################
+"""
+P0: initial state covariance matrix before we start
+    Set it to the initial uncertainty in (x, y, phi, bias)
+    This one converges over time
+    Big P0 = you are open to being corrected quickly by the first good measurements.
+    Small P0 = you start “confident” and resist early corrections.
 
+    P: P carries our total uncertainty of the different states over timesteps.
+
+Q: process noise covariance matrix (model uncertainty) (this one is defined in the EKF initialization)
+    how much we trust our motion model
+    high Q = we expect the state to change a lot between steps (less trust in model)
+    low Q  = we expect the state to change little between steps (more trust in model
+
+EKF initialization:
+    state vector: [x, y, v, phi, bias_phi]
+
+    P0 = diag([sigma_x0^2, sigma_y0^2, sigma_v0^2, sigma_phi0^2, sigma_b_phi0^2])
+
+    sigma_pos_proc (px/√s): baseline random diffusion in (x,y).
+        Bigger → looser ellipse / faster expansion of search; more responsive to measurements; noisier track.
+
+    sigma_speed (px/√s in your code it’s used as absolute per step, i.e., Q uses (sigma_speed)**2): how much speed can wander.
+        Bigger → speed adapts quickly; smaller → speed is sticky (constant-velocity).
+
+    sigma_phi (rad/√s): how much true heading can meander per second.
+        Bigger → allows turns/heading jitter; smaller → straight-line assumption.
+
+    sigma_b_phi (rad/√s): how much heading bias can drift per second.
+        Smaller → bias is nearly constant (good if offset is truly fixed).
+        Bigger → bias can change quickly (good if offset drifts with time/conditions).
+
+R: measurement noise covariance matrix (sensor noise)
+    how much we trust our measurements
+    Higher R → trust measurements less (updates are small).
+    Lower R → trust measurements more (updates are big).
+    This is controlled by our measurement confidence!!! We set some sigma values for the mean expected uncertainty
+
+R AND Q WILL DEFINE HOW MUCH WE TRUST MEASUREMENTS VS MODEL PREDICTIONS, SO TUNING IS IMPORTANT. IF ONE IS VERY HIGH THE OTHER IS TRUSTED MORE!!
+
+
+################################### Kalman steps #############################################
+
+When using the kalman filter, we need to initialize it. We need known starting position, delta time and velocity.
+We need to track dt between frames for the process model.
+
+This is done by giving the following to the ekf class:
+    dt: time difference between frames in seconds
+    vel0: initial speed estimate in px/s
+    phi0: initial heading estimate in rad
+    initial_state (x0): [x0, y0, v0, phi0, bias_phi]
+    initial_P (P0): covariance matrix for initial state
+    process_noise_cov (Q): covariance matrix for process noise
+
+For each step we call ekf.predict(dt) followed by ekf.update(measurement, R). R has to be set each run as it uses measurement confidence. 
+
+
+#################### Bias #####################
+P0 bias just let it converge.
+If after convergence you still see bias hopping. either sigma_b_phi is too large (Q keeps re-inflating the bias uncertainty each predict), or
+R_phi is too small (you are over-trusting noisy heading measurements).
+"""
+###################################################################################################
 # -------------------- Device & models --------------------
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"[info] device: {device}. Extracting features using {FEATURES}.")
@@ -751,6 +820,12 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
     print("---")
     drone_img = img_path.name
 
+    if drone_img in starting_drone_images: # this indicates a new sequence so ekf reset
+        meas_phi_deg = None #for rotation consistency check
+        ekf = None
+        t_last = None
+        print(f"[info] Resetting EKF for new sequence starting at {drone_img}")
+
     print(f"[info] Processing drone image: {drone_img}")
     DRONE_IMG = DRONE_IMG_CLEAN / str(drone_img)
     OUT_DIR = OUT_DIR_CLEAN / str(drone_img)
@@ -759,7 +834,7 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
     if not DRONE_IMG.exists():
         raise FileNotFoundError(f"Missing drone image: {DRONE_IMG}")
     
-        # -------------------- EKF initialisation--------------------
+    # -------------------- EKF initialisation--------------------
     if ekf is None: # first frame is skipped for EKF initialization
         # -------------------- EKF initialization (global across frames) --------------------
         #read CSV to get starting lat lon and velocity estimate
@@ -797,18 +872,22 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
                         print(f"[warning] Non-positive dt={dt:.2f}s between first two rows in CSV. Using default initial vel={vel0:.2f} px/s")
                     break
 
-        # initial state: (x, y, v, phi) OBS: must be in imiage representation and phi:rad!!!
-        x0 = np.array([starting_position_xy[0], starting_position_xy[1], vel0, phi0_rad], dtype=np.float64)  # x,y in ORIGINAL sat pixels
-        # initial covariance. We are very certain about position as its GT from GPS
-        P0 = np.diag([0.01**2,                # σx = 0.01 px
-                    0.01**2,                # σy = 0.01 px
-                    0.5**2,                # σv = 0.5 px/s (since we have a rough estimate)
-                    np.deg2rad(1.0)**2     # σφ = 1° # also very sure here
-                    ])  # this is something we only set for this first run it will be updated by EKF later.
+        # initial state: (x, y, v, phi, bias_phi) OBS: must be in image representation and phi:rad!!!
+        x0 = np.array([starting_position_xy[0], starting_position_xy[1], vel0, phi0_rad, np.deg2rad(0.0)], dtype=np.float64)  # x,y in ORIGINAL sat pixels
+
+        # P is the initial covariance for measurement uncertainty
+        P0 = np.diag([(36.0)**2,            # σx = 36 px
+                    (36.0)**2,              # σy = 36 px
+                    (3.0)**2,               # σv = 3 px/s (since we have a rough estimate)
+                    np.deg2rad(1.0)**2,     # σφ = 1° deg/s
+                    np.deg2rad(9.0)**2      # at t0 we are unsure with around σbias_φ = 10.0 deg (This only affect us at start untill convergence)
+                    ])  # this is something we only set for this first run it will be updated by EKF later. 
         ekf = EKF_ConstantVelHeading(x0, P0, 
+                                     # the following are process noise sigmas (Q):
                                     sigma_pos_proc=0.75,            # px/√s : baseline diffusion on x,y
                                     sigma_speed=0.5,                # px/√s : how much v can wander
-                                    sigma_phi=np.deg2rad(3.0)       # rad/√s : how much phi can wander pr second
+                                    sigma_phi=np.deg2rad(3.0),      # rad/√s : how much phi can wander pr second. # we fly straight so expect small changes
+                                    sigma_b_phi=np.deg2rad(0.005)    # rad/√s : how much bias_phi can wander pr second
                                     ) # the sigmas here are for model process noise Q. TODO tune these!
         continue # next drone image
 
@@ -827,13 +906,13 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
     # -------------------- EKF predict step --------------------
     x_pred, _ = ekf.predict(dt)
     x_pred[3] = img_to_compass(np.rad2deg(x_pred[3]))
-    print(f"[Predict-only] Predicted position: ({x_pred[0]:.2f}, {x_pred[1]:.2f}) px, heading={x_pred[3]:.2f}°")
+    print(f"[Predict-only] Predicted position: ({x_pred[0]:.2f}, {x_pred[1]:.2f}) px, heading={x_pred[3]:.2f}°, Bias_phi={np.rad2deg(x_pred[4]):.2f}°")
 
     # -------------------- EKF search area (2,-sigma ellipse) --------------------
     # create search area using Predicted covariance P:
     P_pred = ekf.P
     sigma = P_pred[:2, :2]  # position covariance 2x2
-    k = math.sqrt(chi2.ppf(0.95, df=2)) # TODO confidence scaling for 2D ellipse. so how conservative we are. the df is 2 since 2D.
+    k = math.sqrt(chi2.ppf(0.85, df=2)) # TODO confidence scaling for 2D ellipse. so how conservative we are. the df is 2 since 2D.
     
     ellipse_bbox_coords = ellipse_bbox(x_pred[:2], sigma, k=k, n=72) # this uses SVD to determine viedest axes and orienation of ellipse to get bbx
 
@@ -855,8 +934,11 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
     else:
         # -------------------- additionally rotate drone image by csv heading --------------------
         # SuperPoint / DISK: rotate according to heading from CSV
-        phi_deg_flip = get_phi_deg(DRONE_INFO_DIR, drone_img)
-           
+        if meas_phi_deg is None:
+            phi_deg_flip = get_phi_deg(DRONE_INFO_DIR, drone_img)
+        else:
+            phi_deg_flip = meas_phi_deg
+
         # Arbitrary-angle rotation with padding; save the exact affine
         img = cv2.imread(str(DRONE_IMG), cv2.IMREAD_COLOR)
         H, W = img.shape[:2]
@@ -940,7 +1022,7 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
                 H, mask = cv2.findHomography(
                     pts0_np, pts1_np, method=cv2.USAC_MAGSAC,
                     ransacReprojThreshold=3.0, confidence=0.999
-                )
+                ) 
                 if mask is not None:
                     inlier_mask = mask.ravel().astype(bool)
                     num_inliers = int(inlier_mask.sum())
@@ -1043,13 +1125,14 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
                         method=cv2.USAC_MAGSAC,
                         ransacReprojThreshold=3.0,
                         confidence=0.999
-                    )
+                    )  # TODO check convexity
                     if mask is not None:
                         inlier_mask = mask.ravel().astype(bool)
 
                     #using DLT on inliers for better accuracy
                     if H_rot2tile is not None and inlier_mask is not None and inlier_mask.sum() >= 4:
                         H_rot2tile, _ = cv2.findHomography(pts0_np[inlier_mask], pts1_np[inlier_mask], method=0)
+                        # TODO: check convexity of projected drone corners in tile frame?
         # Now we have H_rot2tile mapping FROM ROTATED drone frame TO TILE frame
 
         # If homography is not reliable, skip overlay and error metrics TODO We schould still do EKF update?
@@ -1093,7 +1176,7 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
             # ---- Measurement covariance from confidence ---- must be computed each frame
             R = ekf.R_from_conf(
                     pos_base_std=36.0, # in px. we expect araound +-10 m = 36px error in position measurement
-                    heading_base_std_rad=np.deg2rad(8.0), # is observed to be -7 degrees off on average
+                    heading_base_std_rad=np.deg2rad(8.0), # can jump due to bad matches
                     overall_conf=overall_confidence  # between 0 and 1
                 )  # this gives us R matrix for EKF update. R tells us how ceartain we are about the measurements.
 
@@ -1122,35 +1205,45 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
                 # ------------- Overlays on SATELLITE image -------------------- 
                 # map to DOWNSCALED satellite coords for visualization
                 corners_disp = corners_global * np.array([SX, SY], np.float32)
-                center_disp  = center_global  * np.array([SX, SY], np.float32)
-                center_ekf_disp = np.array([x_updated[0]*SX, x_updated[1]*SY], np.float32)
+                center_measurement  = center_global  * np.array([SX, SY], np.float32)
+                center_ekf = np.array([x_updated[0]*SX, x_updated[1]*SY], np.float32)
                 center_gt = np.array([gt_pose_px[0]*SX, gt_pose_px[1]*SY], np.float32)
+                center_pred = np.array([x_pred[0]*SX, x_pred[1]*SY], np.float32)
 
                 for i in range(2):
                     if i == 0:
                         sat_individual = sat_base.copy()
                         out_overlay = OUT_DIR / f"top{rank:02d}_{tile_name.stem}_overlay_on_sat.png"
-                        color = [(255, 0, 0), (0, 255, 0), (0, 0, 255), (255,255,0)]
+                        color = [(255, 0, 0), (0, 255, 0), (0, 0, 255), (255,255,0),(0,255,255)]  # Red: GT, Green: EKF, Blue: Meas, Yellow: Pred, Cyan: overall
 
                         # same center as we use color to destingish
+                        label_point(sat_individual, center_gt, "Pred", color[4], offset=(100, 40), font_scale=0.5, thickness=1)
                         label_point(sat_individual, center_gt, "GT", color[0], offset=(100, 20), font_scale=0.5, thickness=1)
                         label_point(sat_individual, center_gt, "EKF", color[1], offset=(100, 0), font_scale=0.5, thickness=1)
                         label_point(sat_individual, center_gt, "Meas", color[2], offset=(100, -20), font_scale=0.5, thickness=1)
                     else:
                         out_overlay = OUT_DIR.parent / f"overall_overlay_on_sat.png"
                         overlay_img = cv2.imread(str(out_overlay))
+                        random_color = tuple(random.randint(128, 255) for _ in range(3))
+                        color = [random_color, (255, 0, 0), (0, 255, 0), (0, 0, 255), (0,255,255)]   # Random for image. Red: GT, Green: EKF, Blue: Meas, Yellow: Pred, Cyan: overall
+
                         if overlay_img is None:
                             overlay_img = sat_base.copy()  # use base if file doesn't exist
+                            # make label colors clear in img by text
+                            label_point(overlay_img, [10,70], "Pred", color[4], offset=(0, 0), font_scale=3, thickness=3)
+                            label_point(overlay_img, [300,70], "GT", color[1], offset=(0, 0), font_scale=3, thickness=3)
+                            label_point(overlay_img, [450,70], "EKF", color[2], offset=(0, 0), font_scale=3, thickness=3)
+                            label_point(overlay_img, [700,70], "Meas", color[3], offset=(0, 0), font_scale=3, thickness=3)
                             
                         sat_individual = overlay_img
-                        random_color = tuple(random.randint(128, 255) for _ in range(3))
-                        color = [random_color,random_color,random_color,random_color]  # different color for overall overlay
+
                     # Overlay
-                    draw_polygon(sat_individual, corners_disp, color=color[3], thickness=2)
-                    draw_point(sat_individual, center_disp, color=color[0], r=2)
-                    draw_point(sat_individual, center_ekf_disp, color=color[1], r=2)
-                    draw_point(sat_individual, center_gt, color=color[2], r=2)
-                    draw_ellipse(sat_individual, center_disp, P_estimated[:2, :2], k_sigma=k, color=color[3], thickness=2)
+                    draw_polygon(sat_individual, corners_disp, color=color[0], thickness=2)
+                    draw_point(sat_individual, center_pred, color=color[4], r=2)
+                    draw_point(sat_individual, center_measurement, color=color[3], r=2)
+                    draw_point(sat_individual, center_ekf, color=color[2], r=2)
+                    draw_point(sat_individual, center_gt, color=color[1], r=2)
+                    draw_ellipse(sat_individual, center_measurement, P_estimated[:2, :2], k_sigma=k, color=color[0], thickness=2)
 
                     cv2.imwrite(str(out_overlay), sat_individual)
             
