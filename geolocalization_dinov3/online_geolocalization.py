@@ -55,6 +55,152 @@ def resize_transform_square_img(image: Image, image_size: int = IMAGE_SIZE, patc
 
     return TF.to_tensor(TF.resize(image, (final_size, final_size)))
 
+# -------------- Kalman Filter Class --------------
+class EKF_ConstantVelHeading:
+    """
+    Extended Kalman Filter with constant speed + heading motion in 2D.
+
+    State x = [x, y, v, phi, b_phi]^T
+      - x, y  : position in your chosen map units (we'll use ORIGINAL sat pixels)
+      - v     : speed (units/second)
+      - phi   : heading in radians (image coords: +x right, +y down)
+        b_phi : bias in heading
+
+    Motion model over dt:
+        x_{k+1}   = x_k + v_k * cos(phi_k) * dt
+        y_{k+1}   = y_k + v_k * sin(phi_k) * dt
+        v_{k+1}   = v_k + w_v          (random-walk on speed)
+        phi_{k+1} = phi_k + w_phi      (random-walk on heading, then wrapped)
+        b_phi{k+1}= b_phi + w_b_phi    (random-walk on bias)
+    """
+
+    def __init__(
+        self,
+        x0, P0,
+        sigma_pos_proc=0.75,             # px/√s : baseline diffusion on x,y
+        sigma_speed=0.5,                 # px/√s : how much v can wander
+        sigma_phi=np.deg2rad(3.0),       # rad/√s: how much heading can wander
+        sigma_b_phi=np.deg2rad(0.10),     # rad/√s: how much bias can wander (should be very small!!!)
+    ):
+        """
+        Initialize the filter.
+
+        Args:
+          x0: (4,) initial state [x, y, v, phi]
+          P0: (4,4) initial covariance
+          sigma_*: process noise hyperparameters (tunable)
+        """
+        self.x = np.array(x0, dtype=float).reshape(-1)
+        self.x[3] = (self.x[3] + np.pi) % (2*np.pi) - np.pi # keep phi in [-pi, pi]
+        self.P = np.array(P0, dtype=float).reshape(5, 5)
+
+        # Process noise scales (hyperparameters you tune)
+        self.sigma_pos_proc = float(sigma_pos_proc)
+        self.sigma_speed    = float(sigma_speed)
+        self.sigma_phi      = float(sigma_phi)
+        self.sigma_b_phi    = float(sigma_b_phi)
+
+    # -------- PREDICT HELPERS USED BY predict() --------
+    def _f(self, x, dt):
+        """Nonlinear motion model f(x, dt): propagates the state mean."""
+        X, Y, V, PHI, B = x
+        c, s = np.cos(PHI), np.sin(PHI)
+        Xn = X + V * c * dt
+        Yn = Y + V * s * dt
+        Vn = V                                      # random walk handled via Q
+        PHIn = (PHI + np.pi) % (2*np.pi) - np.pi    # random walk handled via Q
+        Bn = B                                      # random walk handled via Q
+        return np.array([Xn, Yn, Vn, PHIn, Bn], dtype=float)
+
+    def _F_jac(self, x, dt):
+        """Jacobian F = ∂f/∂x at current state; propagates covariance."""
+        _, _, V, PHI, _ = x
+        c, s = np.cos(PHI), np.sin(PHI)
+        F = np.eye(5)
+        F[0, 2] = c * dt           # dX/dV
+        F[0, 3] = -V * s * dt      # dX/dPHI
+        F[1, 2] = s * dt           # dY/dV
+        F[1, 3] =  V * c * dt      # dY/dPHI
+        # rows for V, PHI, B are identity (random-walks handled via Q)
+        return F
+
+    def _Q_proc(self, dt):
+        """
+        Process noise covariance (how uncertainty grows during predict).
+        - x,y get a small baseline diffusion: (sigma_pos_proc * sqrt(dt))^2
+        - v    random-walk per step:         (sigma_speed           )^2
+        - phi  random-walk:                   (sigma_phi * sqrt(dt) )^2
+        """
+        qx = (self.sigma_pos_proc * np.sqrt(dt))**2
+        qy = (self.sigma_pos_proc * np.sqrt(dt))**2
+        qv = (self.sigma_speed)**2
+        qf = (self.sigma_phi * np.sqrt(dt))**2
+        qb = (self.sigma_b_phi * np.sqrt(dt))**2
+        return np.diag([qx, qy, qv, qf, qb])
+
+    # -------------------- PREDICT (called every frame) --------------------
+    def predict(self, dt):
+        """
+        Time update (a.k.a. 'predict'):
+          1) propagate the state mean with the motion model over dt
+          2) propagate covariance with the Jacobian and process noise
+
+        Call this once per frame BEFORE any measurement updates for that frame.
+        """
+        dt = float(max(1e-6, dt))                 # guard tiny/zero dt
+        # propagate mean
+        self.x = self._f(self.x, dt)
+        self.x[3] = (self.x[3] + np.pi) % (2*np.pi) - np.pi
+
+        # propagate covariance
+        F = self._F_jac(self.x, dt)
+        Q = self._Q_proc(dt)
+        self.P = F @ self.P @ F.T + Q
+
+        return self.x.copy(), self.P.copy()
+    
+    #----------------- UPDATE (called when measurement is available) --------------------
+    def update_pos_heading(self, z_xyphi, R_xyphi):
+        """
+        OBS: PHI must be in pixel heading and radians (image coords: +x right, +y down).
+        Measurement update with z = [x_meas, y_meas, phi_meas].
+        R_xyphi is 3x3 diag([var_x, var_y, var_phi]).
+        """
+        z = np.asarray(z_xyphi, dtype=float).reshape(3)
+        # H maps state -> measurement: [x, y, phi]
+        H = np.array([[1,0,0,0, 0],
+                    [0,1,0,0, 0],
+                    [0,0,0,1, 1]], dtype=float) # we want to measure phi + b_phi
+
+        z_pred = np.array([self.x[0], self.x[1], (self.x[3] + self.x[4] + np.pi) % (2*np.pi) - np.pi], dtype=float)
+        y = z - z_pred
+        # wrap the heading innovation
+        y[2] = (y[2] + np.pi) % (2*np.pi) - np.pi
+
+        S = H @ self.P @ H.T + R_xyphi
+        K = self.P @ H.T @ np.linalg.inv(S)
+
+        self.x = self.x + K @ y
+        self.x[3] = (self.x[3] + np.pi) % (2*np.pi) - np.pi # obs in rad and in image beskrivelse
+
+        I = np.eye(5)
+        self.P = (I - K @ H) @ self.P
+        return self.x.copy(), self.P.copy()
+
+    @staticmethod
+    def R_from_conf(pos_base_std, heading_base_std_rad, overall_conf,
+                    min_scale=0.3, max_scale=2.0): 
+        """
+        Build measurement covariance from a confidence in [0,1].
+        Higher confidence -> smaller variance (clamped by min/max scale).
+        """
+        # liniar mapping from confidence to scale between min and max scale
+        scale = np.interp(np.clip(overall_conf, 0.0, 1.0), [0.0, 1.0], [max_scale, min_scale]) 
+        Rx = (pos_base_std * scale)**2
+        Ry = (pos_base_std * scale)**2
+        Rphi = (heading_base_std_rad * scale)**2
+        return np.diag([Rx, Ry, Rphi]).astype(float)
+
 def preprocess_image(image: Image) -> torch.Tensor:
     """Preprocess image for model input"""
     image_resized = resize_transform_preserve_aspect_ratio(image, image_size=IMAGE_SIZE, patch_size=PATCH_SIZE) # Uses aspect ratio preserving resize
