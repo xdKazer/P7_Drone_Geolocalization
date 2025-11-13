@@ -10,10 +10,14 @@ from lightglue.utils import rbd
 # Image handling
 from PIL import Image, ImageDraw
 import cv2
+import rasterio
 
 # Math Stuff
 import numpy as np
 import matplotlib.pyplot as plt
+from datetime import datetime # to determine dt from csv
+import math
+from scipy.stats import chi2
 
 # Debugging & Information
 import time
@@ -37,23 +41,43 @@ def resize_transform_preserve_aspect_ratio(image: Image, image_size: int = IMAGE
     w_patches = int((w * image_size) / (h * patch_size))
     return TF.to_tensor(TF.resize(image, (h_patches * patch_size, w_patches * patch_size)))
 
-# Alternative: Resize to square image (not preserving aspect ratio)
-def resize_transform_square_img(image: Image, image_size: int = IMAGE_SIZE, patch_size: int = PATCH_SIZE) -> torch.Tensor:
-    """Resize image so its dimensions are divisible by patch size and the output is square."""
-    # Resize shorter side to image_size
-    w, h = image.size
-    h_patches = int(image_size / patch_size)
-    w_patches = int((w * image_size) / (h * patch_size))
-    
-    # Make divisible by patch size
-    new_h = (h_patches * patch_size)
-    new_w = (w_patches * patch_size)
+def latlon_to_orig_xy(lat, lon, SAT_LONG_LAT_INFO_DIR, sat_number, SAT_DISPLAY_META):
+    """(lat, lon) -> ORIGINAL satellite pixel (u, v) as float64 (no downscale)."""
+    with rasterio.open(SAT_DISPLAY_META) as src:
+        sat_W = src.width
+        sat_H = src.height
+    with open(SAT_LONG_LAT_INFO_DIR, newline="") as f:
+        for r in pd.read_csv(f).to_dict(orient="records"):
+            if r["mapname"] == f"satellite{sat_number:02d}.tif":
+                LT_lat = np.float64(r["LT_lat_map"])
+                LT_lon = np.float64(r["LT_lon_map"])
+                RB_lat = np.float64(r["RB_lat_map"])
+                RB_lon = np.float64(r["RB_lon_map"])
+                break
+        else:
+            raise FileNotFoundError(f"Bounds for satellite{sat_number}.tif not found")
+    u = (np.float64(lon) - LT_lon) / (RB_lon - LT_lon) * sat_W
+    v = (np.float64(lat) - LT_lat) / (RB_lat - LT_lat) * sat_H
+    return u, v
 
-    # Make square: take the larger of new_h and new_w, round up to nearest multiple of patch_size
-    final_size = max(new_h, new_w)
-    final_size = ((final_size + patch_size - 1) // patch_size) * patch_size  # round up
+def ellipse_from_cov(mu_xy, Sigma_xy, k=2.0):
+    # mu_xy: (2,) ; Sigma_xy: (2,2)
+    vals, vecs = np.linalg.eigh(Sigma_xy)       # vals ascending
+    a = k * np.sqrt(vals[1])                    # major axis length
+    b = k * np.sqrt(vals[0])                    # minor axis length
+    angle_rad = np.arctan2(vecs[1,1], vecs[0,1])  # angle of major axis
+    return a, b, angle_rad, mu_xy
 
-    return TF.to_tensor(TF.resize(image, (final_size, final_size)))
+def ellipse_bbox(mu_xy, Sigma_xy, k=2.0, n=72): # n is number of points to sample
+    a,b,theta,mu = ellipse_from_cov(mu_xy, Sigma_xy, k)
+    t = np.linspace(0, 2*np.pi, n, endpoint=False)
+    pts = np.stack([a*np.cos(t), b*np.sin(t)], axis=0)  # 2×n
+    R = np.array([[np.cos(theta), -np.sin(theta)],
+                  [np.sin(theta),  np.cos(theta)]])
+    pts_world = (R @ pts).T + mu[None,:]
+    x0,y0 = pts_world.min(axis=0)
+    x1,y1 = pts_world.max(axis=0)
+    return (x0,y0,x1,y1)  # bbox in ORIGINAL sat px
 
 # -------------- Kalman Filter Class --------------
 class EKF_ConstantVelHeading:
@@ -665,6 +689,10 @@ if __name__ == "__main__":
     # Itteration variables (For testing with dataset images)
     i = 747                # Image index to process (For full set testing, start at 1)
     used_dataset = 3       # This is the dataset we are using (01, 02 ..., -> 11)
+    
+    # Initialize EKF variables
+    ekf = None
+    t_last = None
 
     # If working with a dataset, then we need to load their CSV file:
     csv_file_path = f"geolocalization_dinov3/dataset_data/csv_files/{used_dataset:02d}.csv"
@@ -678,8 +706,89 @@ if __name__ == "__main__":
     while True: # <-- Replace with loop that runs for each image in dataset (or ROS2 image callback for full onboard drone processing)
         start_time = time.time()
         
-        # Capture image from drone camera feed
-        #image = capture_image_from_drone()
+        # EKF initialisation (Only occours for first image)
+        if ekf is None:
+                for row in df.itertuples(index=False):
+                    if row.filename == f"{used_dataset:02d}_{i:04d}.JPG":
+                        starting_position_latlon = (np.float64(row.lat), np.float64(row.lon))
+                        starting_position_xy = latlon_to_orig_xy(starting_position_latlon[0], starting_position_latlon[1], 
+                                                                 f"geolocalization_dinov3/dataset_data/csv_files/satellite_coordinates_range.csv", used_dataset, 
+                                                                 f"geolocalization_dinov3/dataset_data/satellite_images/satellite{used_dataset:02d}.tif")
+                        t_current = datetime.fromisoformat(row.date)
+                        t_last = t_current  # needed for next frame
+
+                        # get phi
+                        phi_deg0 = np.float64(row.Phi1)
+                        phi0 = np.deg2rad(phi_deg0)
+                        print(f"[info] Initial heading from CSV: {phi_deg0:.2f} deg")
+                        phi0_rad = np.deg2rad((((phi_deg0 - 90) + 180.0) % 360.0) - 180.0) # convert to image frame and rad
+                        print(f"[info] Initial heading in image frame: {np.rad2deg(phi0_rad):.2f} deg") # Seemingly just an offset of -90 degrees
+
+                        # try reading the very next row in the file to get velocity estimate
+                        next_row = next(df.itertuples(index=False))
+                        lat1 = float(next_row.lat)
+                        lon1 = float(next_row.lon)
+                        k1_position_xy = latlon_to_orig_xy(lat1, lon1,
+                                                           f"geolocalization_dinov3/dataset_data/csv_files/satellite_coordinates_range.csv", used_dataset, 
+                                                           f"geolocalization_dinov3/dataset_data/satellite_images/satellite{used_dataset:02d}.tif")
+
+                        # find dt between the two rows
+                        t1 = datetime.fromisoformat(next_row.date)
+                        dt = (t1 - t_current).total_seconds()
+                        if dt > 0 and not None:
+                            vel_x = (k1_position_xy[0] - starting_position_xy[0]) / dt
+                            vel_y = (k1_position_xy[1] - starting_position_xy[1]) / dt
+                            vel0 = np.sqrt(vel_x**2 + vel_y**2)
+                            print(f"[info] Initial velocity estimate from CSV: {vel0:.2f} px/s over dt={dt:.2f}s")
+                        else:
+                            vel0 = 50.0
+                            print(f"[warning] Non-positive dt={dt:.2f}s between first two rows in CSV. Using default initial vel={vel0:.2f} px/s")
+                        break
+
+                # initial state: (x, y, v, phi, bias_phi) OBS: must be in image representation and phi:rad!!!
+                x0 = np.array([starting_position_xy[0], starting_position_xy[1], vel0, phi0_rad, np.deg2rad(0.0)], dtype=np.float64)  # x,y in ORIGINAL sat pixels
+
+                # P is the initial covariance for measurement uncertainty
+                P0 = np.diag([(36.0)**2,            # σx = 36 px
+                            (36.0)**2,              # σy = 36 px
+                            (3.0)**2,               # σv = 3 px/s (since we have a rough estimate)
+                            np.deg2rad(1.0)**2,     # σφ = 1° deg/s
+                            np.deg2rad(9.0)**2      # at t0 we are unsure with around σbias_φ = 10.0 deg (This only affect us at start untill convergence)
+                            ])  # this is something we only set for this first run it will be updated by EKF later. 
+                ekf = EKF_ConstantVelHeading(x0, P0, 
+                                            # the following are process noise sigmas (Q):
+                                            sigma_pos_proc=0.75,            # px/√s : baseline diffusion on x,y
+                                            sigma_speed=0.5,                # px/√s : how much v can wander
+                                            sigma_phi=np.deg2rad(3.0),      # rad/√s : how much phi can wander pr second. # we fly straight so expect small changes
+                                            sigma_b_phi=np.deg2rad(0.005)    # rad/√s : how much bias_phi can wander pr second
+                                            ) # the sigmas here are for model process noise Q. TODO tune these!
+                continue # next drone image
+        
+        # Ensure that time difference is still computed, even if EKF is initialised
+        for row in df.itertuples(index=False):
+            if row.filename == f"{used_dataset:02d}_{i:04d}.JPG":
+                t_current = datetime.fromisoformat(row.date)
+                if t_last is not None:
+                    dt = (t_current - t_last).total_seconds()
+                    print(f"dt between frames: {dt} seconds")
+                t_last = t_current
+
+        # EKF Prediction step - Done prior to measurement update
+        x_pred, _ = ekf.predict(dt)
+        x_pred[3] = np.deg2rad((((x_pred[3] + 90) + 180.0) % 360.0) - 180.0) # Shift frame by 90 degress and wrap.
+        print(f"[Predict-only] Predicted position: ({x_pred[0]:.2f}, {x_pred[1]:.2f}) px, heading={x_pred[3]:.2f}°, Bias_phi={np.rad2deg(x_pred[4]):.2f}°")
+
+        P_pred = ekf.P
+        sigma = P_pred[:2, :2]  # position covariance 2x2
+        k = math.sqrt(chi2.ppf(0.85, df=2)) # TODO confidence scaling for 2D ellipse. so how conservative we are. the df is 2 since 2D.
+        
+        ellipse_bbox_coords = ellipse_bbox(x_pred[:2], sigma, k=k, n=72) # this uses SVD to determine viedest axes and orienation of ellipse to get bbx
+
+        # Now for the reason we include EKF, we need to figure what tiles are present in the ellipse
+        # This will minimize the need to load and process tiles.
+        # NOTE: Continue from here
+        #all_tile_names = [p for p in SAT_DIR.iterdir() if p.is_file() and p.suffix.lower() == ".png"]
+        #selected_tiles = tiles_in_bbox(ellipse_bbox_coords, TILE_W, TILE_H, STRIDE_X, STRIDE_Y, all_tile_names)
 
         # For testing, load image from file (remove once drone image capture works)
         # Due to file formatting, we need to fill in leading zeros for dataset and image index (The first drone image is 0001)
