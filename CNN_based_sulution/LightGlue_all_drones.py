@@ -33,7 +33,7 @@ starting_drone_images = ["03_0001.JPG", "03_0097.JPG", "03_0193.JPG", "03_0289.J
 
 BASE = Path(__file__).parent.resolve()
 DATASET_DIR = BASE / "UAV_VisLoc_dataset"
-SAT_LONG_LAT_INFO_DIR = DATASET_DIR / "satellite_ coordinates_range.csv"
+SAT_LONG_LAT_INFO_DIR = DATASET_DIR / "satellite_coordinates_range.csv"
 DRONE_INFO_DIR = DATASET_DIR / sat_number / f"{sat_number}.csv"
 DRONE_IMG_CLEAN = DATASET_DIR / sat_number / "drone"  
 SAT_DIR   = DATASET_DIR / sat_number / "sat_tiles_overlap" 
@@ -1211,21 +1211,22 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
                 center_pred = np.array([x_pred[0]*SX, x_pred[1]*SY], np.float32)
 
                 for i in range(2):
-                    if i == 0:
+                    if i == 0: # individual overlay for this tile
                         sat_individual = sat_base.copy()
                         out_overlay = OUT_DIR / f"top{rank:02d}_{tile_name.stem}_overlay_on_sat.png"
-                        color = [(255, 0, 0), (0, 255, 0), (0, 0, 255), (255,255,0),(0,255,255)]  # Red: GT, Green: EKF, Blue: Meas, Yellow: Pred, Cyan: overall
+                        #BGR colors
+                        color = [(255,255,255), (255, 0, 0), (0, 255, 0), (0, 0, 255),(0,255,255)]  # Blue: GT, Green: EKF, Red: Meas, Yellow: Pred, Cyan: overall
 
                         # same center as we use color to destingish
                         label_point(sat_individual, center_gt, "Pred", color[4], offset=(100, 40), font_scale=0.5, thickness=1)
-                        label_point(sat_individual, center_gt, "GT", color[0], offset=(100, 20), font_scale=0.5, thickness=1)
-                        label_point(sat_individual, center_gt, "EKF", color[1], offset=(100, 0), font_scale=0.5, thickness=1)
-                        label_point(sat_individual, center_gt, "Meas", color[2], offset=(100, -20), font_scale=0.5, thickness=1)
+                        label_point(sat_individual, center_gt, "GT", color[1], offset=(100, 20), font_scale=0.5, thickness=1)
+                        label_point(sat_individual, center_gt, "EKF", color[2], offset=(100, 0), font_scale=0.5, thickness=1)
+                        label_point(sat_individual, center_gt, "Meas", color[3], offset=(100, -20), font_scale=0.5, thickness=1)
                     else:
                         out_overlay = OUT_DIR.parent / f"overall_overlay_on_sat.png"
                         overlay_img = cv2.imread(str(out_overlay))
                         random_color = tuple(random.randint(128, 255) for _ in range(3))
-                        color = [random_color, (255, 0, 0), (0, 255, 0), (0, 0, 255), (0,255,255)]   # Random for image. Red: GT, Green: EKF, Blue: Meas, Yellow: Pred, Cyan: overall
+                        color = [random_color, (255, 0, 0), (0, 255, 0), (0, 0, 255), (0,255,255)]   # Random for image. Red: GT, Green: EKF, Blue: Meas, Yellow: Pred
 
                         if overlay_img is None:
                             overlay_img = sat_base.copy()  # use base if file doesn't exist
@@ -1243,7 +1244,7 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
                     draw_point(sat_individual, center_measurement, color=color[3], r=2)
                     draw_point(sat_individual, center_ekf, color=color[2], r=2)
                     draw_point(sat_individual, center_gt, color=color[1], r=2)
-                    draw_ellipse(sat_individual, center_measurement, P_estimated[:2, :2], k_sigma=k, color=color[0], thickness=2)
+                    draw_ellipse(sat_individual, center_measurement, P_estimated[:2, :2], k_sigma=k, color=color[0], thickness=1)
 
                     cv2.imwrite(str(out_overlay), sat_individual)
             
