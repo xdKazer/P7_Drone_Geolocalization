@@ -417,9 +417,7 @@ FodyWeavers.xsd
 *.msm
 *.msp
 
-/tiles_png_uniform/*
-/pca_projected_images/*
-/geolocalization_dinov3/testingstuff.py
+# Files and Directories which are too large to push to GitHub
 /geolocalization_dinov3/dataset_data/satellite_images/satellite03.tif
-/dino_features/*
-/geolocalization_dinov3/fine_grained_candidates/*
+/geolocalization_dinov3/tiles_png_1km/
+/geolocalization_dinov3/tile_features/
