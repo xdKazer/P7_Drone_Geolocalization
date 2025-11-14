@@ -4,8 +4,8 @@ from transformers import AutoModel              # For DINOv3 model
 from sklearn.decomposition import PCA           # For PCA projection
 import torchvision.transforms.functional as TF  # For image transformations
 import torch.nn.functional as F                 # For normalization
-from lightglue import LightGlue, SuperPoint     # For feature matching
-from lightglue.utils import rbd                 # For robust backdoor matching
+from lightglue import LightGlue, SuperPoint     # type: ignore # For feature matching
+from lightglue.utils import rbd                 # type: ignore # For robust backdoor matching
 
 # Image handling
 from PIL import Image, ImageDraw                # For image loading and drawing
@@ -435,7 +435,7 @@ def locate_drone_position(
 
             del kernel_features, similarity
             torch.cuda.empty_cache()
-            
+
     # Map fine kernel to pixel coordinates
     row, col = best_pos_fine
     fine_tile_h = patch_height // num_tiles_height
