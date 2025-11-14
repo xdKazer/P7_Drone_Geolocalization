@@ -229,8 +229,8 @@ def _wrap_pi(a: float) -> float:
     """Wrap angle to [-pi, pi]. Use anywhere you touch headings."""
     return (a + np.pi) % (2*np.pi) - np.pi
 # -------------------- Helpers --------------------
-def geometric_confidence(H, pts0, pts1, inlier_mask, sigma=10.0):
-    """Compute a scalar geometric confidence in [0,1]."""
+def geometric_confidence(H, pts0, pts1, inlier_mask):
+    """ Compute median projection error confidence based on reprojection error of inliers."""
     if H is None or inlier_mask is None or not inlier_mask.any():
         return 0.0
 
@@ -240,12 +240,12 @@ def geometric_confidence(H, pts0, pts1, inlier_mask, sigma=10.0):
     p0h = np.c_[p0, np.ones(len(p0))]
     q1h = (H @ p0h.T).T
     q1 = q1h[:, :2] / q1h[:, 2:3]
-    reproj_error = np.linalg.norm(q1 - p1, axis=1)
-
+    reproj_error = np.linalg.norm(q1 - p1, axis=1) # TODO check if this can be done smarter + delete unused variables
+    print(f"Reprojection errors of inliers: {reproj_error}")
     inlier_ratio = len(idx) / len(pts0)
+    print(f"mean reproj error: {np.mean(reproj_error)}, median reproj error: {np.median(reproj_error)}")
     median_err = np.median(reproj_error)
-    geom_conf = inlier_ratio * math.exp(-median_err / sigma)
-    return geom_conf, inlier_ratio, median_err
+    return inlier_ratio, median_err
 
 def get_location_in_sat_img(drone_img_centre, SAT_LONG_LAT_INFO_DIR, sat_number, SAT_DISPLAY_META):
     meta = json.loads(SAT_DISPLAY_META.read_text())
@@ -664,15 +664,15 @@ def load_feats_pt_batched(pt_path: Path, device: str):
     return feats_b, feats_r
 
 def absolute_confidence(num_inliers, avg_conf, median_err_px,
-                        s_inl=30.0, s_err=5.0, w=(0.65, 0.10, 0.25)):  
+                        s_inl=60.0, s_err=2.0, w=(0.45, 0.20, 0.35)):   # TODO this needs to be tuned as we currently trusts the measurement to much
     """
     Compute an absolute confidence score in [0,1] based on:
     - num_inliers: number of inlier matches
     - avg_conf: average matching confidence [0,1]
     - median_err_px: median reprojection error in pixels
 
-    s_inl: scaling factor for inliers
-    s_err: scaling factor for reproj error
+    s_inl: scaling factor for inliers. higher = more inliers needed for high score.
+    s_err: scaling factor for reproj error. higher = more error tolerated for high score.
     w: weights for (inliers, avg_conf, err_score)
     """
     if avg_conf <= 0 or num_inliers <= 0 or not np.isfinite(median_err_px):
@@ -702,7 +702,7 @@ def ellipse_bbox(mu_xy, Sigma_xy, k=2.0, n=72): # n is number of points to sampl
     x1,y1 = pts_world.max(axis=0)
     return (x0,y0,x1,y1)  # bbox in ORIGINAL sat px
 
-def tiles_in_bbox(bbox, TILE_W, TILE_H, STRIDE_X, STRIDE_Y, all_tile_names):
+def tiles_in_bbox(bbox, TILE_W, TILE_H, all_tile_names):
     x_min, y_min, x_max, y_max = bbox
     selected_tiles = []
     for tile_path in all_tile_names:
@@ -738,7 +738,7 @@ EKF initialization:
     sigma_pos_proc (px/√s): baseline random diffusion in (x,y).
         Bigger → looser ellipse / faster expansion of search; more responsive to measurements; noisier track.
 
-    sigma_speed (px/√s in your code it’s used as absolute per step, i.e., Q uses (sigma_speed)**2): how much speed can wander.
+    sigma_speed (px/√s in your code it is used as absolute per step, i.e., Q uses (sigma_speed)**2): how much speed can wander.
         Bigger → speed adapts quickly; smaller → speed is sticky (constant-velocity).
 
     sigma_phi (rad/√s): how much true heading can meander per second.
@@ -910,7 +910,7 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
 
     # -------------------- EKF search area (2,-sigma ellipse) --------------------
     # create search area using Predicted covariance P:
-    P_pred = ekf.P
+    P_pred = ekf.P # TODO are this the same as we use in the visualisation???? becouse that one seem to be based on measurements
     sigma = P_pred[:2, :2]  # position covariance 2x2
     k = math.sqrt(chi2.ppf(0.85, df=2)) # TODO confidence scaling for 2D ellipse. so how conservative we are. the df is 2 since 2D.
     
@@ -918,7 +918,7 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
 
     # -------------------- Determine tiles in search area --------------------
     all_tile_names = [p for p in SAT_DIR.iterdir() if p.is_file() and p.suffix.lower() == ".png"]
-    selected_tiles = tiles_in_bbox(ellipse_bbox_coords, TILE_W, TILE_H, STRIDE_X, STRIDE_Y, all_tile_names)
+    selected_tiles = tiles_in_bbox(ellipse_bbox_coords, TILE_W, TILE_H, all_tile_names)
 
     # -------------------- Rotate drone image & extract features --------------------
     if feat == "sift":
@@ -1005,7 +1005,7 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
                     raise FileNotFoundError(f"Missing {tile_pt} and no extractor available.")
                 img1_t  = load_image(str(p)).to(device if feat != "sift" else "cpu")
                 feats1_b = extractor.extract(img1_t)
-                feats1_r = rbd(feats1_b)
+                feats1_r = rbd(feats1_b) # TODO save the features from drone imge for future runs
 
             matches01 = matcher({"image0": feats0_batched, "image1": feats1_b})
             matches01_r = rbd(matches01)
@@ -1035,9 +1035,10 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
                 #using DLT on inliers for better accuracy
                 if H is not None and num_inliers >= 4:
                     H, _ = cv2.findHomography(pts0_np[inlier_mask], pts1_np[inlier_mask], method=0)
+                    # TODO: save the top match H for later use
 
                 if H is not None:
-                    _, _, median_err = geometric_confidence(H, pts0_np, pts1_np, inlier_mask)
+                    _, _, median_err = geometric_confidence(H, pts0_np, pts1_np, inlier_mask) #TODO clean up add overall_confidence
 
             scores_small.append({
                 "tile": p,
@@ -1045,7 +1046,7 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
                 "total_matches": K,
                 "avg_conf": avg_conf,
                 "median_err": median_err,  # describes quality of inliers based on 
-                "sort_key": (num_inliers, - median_err), # prioritize inliers, then lower error 
+                "sort_key": (num_inliers, - median_err), # prioritize inliers, then lower error  # TODO schould overall confidence be used here?
             })
 
             del feats1_b, feats1_r, matches01, matches01_r
@@ -1095,7 +1096,7 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
         tile_name = r["tile"]  # read tile name
         color = rank_colors[rank-1] # set color
 
-        with torch.inference_mode(): # extracting precomputed features 
+        with torch.inference_mode(): # extracting precomputed features  # TODO is it faster to save H from earlier?
             tile_pt = make_feature_pt_path_for(tile_name)
             if tile_pt.exists():
                 # use precomputed features instead of extracting on the fly
@@ -1124,7 +1125,7 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
                         pts0_np, pts1_np,
                         method=cv2.USAC_MAGSAC,
                         ransacReprojThreshold=3.0,
-                        confidence=0.999
+                        confidence=0.999 # TODO adjust confidence level
                     )  # TODO check convexity
                     if mask is not None:
                         inlier_mask = mask.ravel().astype(bool)
@@ -1169,7 +1170,7 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
                 num_inliers = int(first_row["inliers"])
                 avg_confidence = float(first_row["avg_confidence"])
                 median_err_px = float(first_row["median_reproj_error"])
-            overall_confidence = absolute_confidence(num_inliers, avg_confidence, median_err_px)
+            overall_confidence = absolute_confidence(num_inliers, avg_confidence, median_err_px) # TODO just get from earlier?
 
             #------------- extended kalman filter update step ------------
         
