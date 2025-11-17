@@ -44,9 +44,6 @@ folder = OUT_DIR_CLEAN
 
 if folder.exists() and folder.is_dir():
     shutil.rmtree(folder)
-    print(f"Deleted folder: {folder}")
-else:
-    print(f"Folder does not exist: {folder}")
 
 OUT_DIR_CLEAN.mkdir(parents=True, exist_ok=True)
 CSV_FINAL_RESULT_PATH = BASE / "outputs" / sat_number / f"results_{sat_number}.csv"
@@ -229,7 +226,7 @@ def _wrap_pi(a: float) -> float:
     """Wrap angle to [-pi, pi]. Use anywhere you touch headings."""
     return (a + np.pi) % (2*np.pi) - np.pi
 # -------------------- Helpers --------------------
-def geometric_confidence(H, pts0, pts1, inlier_mask):
+def get_median_projection_error(H, pts0, pts1, inlier_mask):
     """ Compute median projection error confidence based on reprojection error of inliers."""
     if H is None or inlier_mask is None or not inlier_mask.any():
         return 0.0
@@ -240,12 +237,9 @@ def geometric_confidence(H, pts0, pts1, inlier_mask):
     p0h = np.c_[p0, np.ones(len(p0))]
     q1h = (H @ p0h.T).T
     q1 = q1h[:, :2] / q1h[:, 2:3]
-    reproj_error = np.linalg.norm(q1 - p1, axis=1) # TODO check if this can be done smarter + delete unused variables
-    print(f"Reprojection errors of inliers: {reproj_error}")
-    inlier_ratio = len(idx) / len(pts0)
-    print(f"mean reproj error: {np.mean(reproj_error)}, median reproj error: {np.median(reproj_error)}")
+    reproj_error = np.linalg.norm(q1 - p1, axis=1)
     median_err = np.median(reproj_error)
-    return inlier_ratio, median_err
+    return median_err
 
 def get_location_in_sat_img(drone_img_centre, SAT_LONG_LAT_INFO_DIR, sat_number, SAT_DISPLAY_META):
     meta = json.loads(SAT_DISPLAY_META.read_text())
@@ -664,7 +658,7 @@ def load_feats_pt_batched(pt_path: Path, device: str):
     return feats_b, feats_r
 
 def absolute_confidence(num_inliers, avg_conf, median_err_px,
-                        s_inl=60.0, s_err=2.0, w=(0.45, 0.20, 0.35)):   # TODO this needs to be tuned as we currently trusts the measurement to much
+                        s_inl=60.0, s_err=2.0, w=(0.45, 0.20, 0.35)): # TODO tune if needed
     """
     Compute an absolute confidence score in [0,1] based on:
     - num_inliers: number of inlier matches
@@ -826,7 +820,6 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
         t_last = None
         print(f"[info] Resetting EKF for new sequence starting at {drone_img}")
 
-    print(f"[info] Processing drone image: {drone_img}")
     DRONE_IMG = DRONE_IMG_CLEAN / str(drone_img)
     OUT_DIR = OUT_DIR_CLEAN / str(drone_img)
     OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -910,7 +903,7 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
 
     # -------------------- EKF search area (2,-sigma ellipse) --------------------
     # create search area using Predicted covariance P:
-    P_pred = ekf.P # TODO are this the same as we use in the visualisation???? becouse that one seem to be based on measurements
+    P_pred = ekf.P 
     sigma = P_pred[:2, :2]  # position covariance 2x2
     k = math.sqrt(chi2.ppf(0.85, df=2)) # TODO confidence scaling for 2D ellipse. so how conservative we are. the df is 2 since 2D.
     
@@ -975,52 +968,57 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
         else:
             raise ValueError("Unsupported feature type in rotated-drone branch.")
 
+        # -------------------- Extract features Drone --------------------
         with torch.inference_mode():
             img_t = load_image(str(DRONE_IMG_FOR_VIZ)).to(device)
-            feats0_batched = extractor_local.extract(img_t)
-            feats0_r = rbd(feats0_batched)
+            feats_drone_b = extractor_local.extract(img_t)
+            feats_drone_r = rbd(feats_drone_b)
 
         hR, wR = bgr_rot.shape[:2]
         drone_rot_size = (wR, hR)
         
-    # -------------------- Pass 1: score all tiles (does not compute performance, just finds best match) --------------------   
+    # -------------------- Pass 1: score all tiles --------------------   
     if not selected_tiles:
         raise FileNotFoundError(f"No PNG tiles in {SAT_DIR}")
 
     scores_small = []
+    H_best = None
+    best_conf = 0.0
     with torch.inference_mode():
         for i, p in enumerate(selected_tiles):
-            num_inliers = 0
+            num_inliers = 0; 
             avg_conf = float("nan")
             median_err = float("inf")   
             K = 0
             H = None
             inlier_mask = None
             print(f"Scoring tile {i+1}/{len(selected_tiles)}")
+
             tile_pt = make_feature_pt_path_for(p)
+
+            # -------------------- Load / extract features for tile --------------------
             if tile_pt.exists():
-                feats1_b, feats1_r = load_feats_pt_batched(tile_pt, device if feat != "sift" else "cpu")
-            else:
+                feats_tile_b, feats_tile_r = load_feats_pt_batched(tile_pt, device if feat != "sift" else "cpu")
+            else: # if none saved, extract on the fly
                 if extractor is None:
                     raise FileNotFoundError(f"Missing {tile_pt} and no extractor available.")
                 img1_t  = load_image(str(p)).to(device if feat != "sift" else "cpu")
-                feats1_b = extractor.extract(img1_t)
-                feats1_r = rbd(feats1_b) # TODO save the features from drone imge for future runs
+                feats_tile_b = extractor.extract(img1_t)
+                feats_tile_r = rbd(feats_tile_b) # TODO save the features from drone imge for future runs
 
-            matches01 = matcher({"image0": feats0_batched, "image1": feats1_b})
+            # -------------------- Match features --------------------
+            matches01 = matcher({"image0": feats_drone_b, "image1": feats_tile_b})
             matches01_r = rbd(matches01)
 
             matches = matches01_r.get("matches", None)
             K = int(matches.shape[0]) if (matches is not None and matches.numel() > 0) else 0
 
-            num_inliers = 0
-            avg_conf    = float("nan")
             if K >= 4:
-                pts0_np = feats0_r["keypoints"][matches[:, 0]].detach().cpu().numpy()
-                pts1_np = feats1_r["keypoints"][matches[:, 1]].detach().cpu().numpy()
+                pts_drone_np = feats_drone_r["keypoints"][matches[:, 0]].detach().cpu().numpy()
+                pts_tile_np = feats_tile_r["keypoints"][matches[:, 1]].detach().cpu().numpy()
 
                 H, mask = cv2.findHomography(
-                    pts0_np, pts1_np, method=cv2.USAC_MAGSAC,
+                    pts_drone_np, pts_tile_np, method=cv2.USAC_MAGSAC,
                     ransacReprojThreshold=3.0, confidence=0.999
                 ) 
                 if mask is not None:
@@ -1034,22 +1032,26 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
                 
                 #using DLT on inliers for better accuracy
                 if H is not None and num_inliers >= 4:
-                    H, _ = cv2.findHomography(pts0_np[inlier_mask], pts1_np[inlier_mask], method=0)
-                    # TODO: save the top match H for later use
+                    H, _ = cv2.findHomography(pts_drone_np[inlier_mask], pts_tile_np[inlier_mask], method=0)
 
                 if H is not None:
-                    _, _, median_err = geometric_confidence(H, pts0_np, pts1_np, inlier_mask) #TODO clean up add overall_confidence
+                    median_projection_err = get_median_projection_error(H, pts_drone_np, pts_tile_np, inlier_mask)
+                    overall_conf = absolute_confidence(num_inliers, avg_conf, median_projection_err)
+                    if overall_conf > best_conf: # keep best H
+                        H_best = H
+                        best_conf = overall_conf
 
             scores_small.append({
                 "tile": p,
                 "inliers": num_inliers,
                 "total_matches": K,
                 "avg_conf": avg_conf,
-                "median_err": median_err,  # describes quality of inliers based on 
-                "sort_key": (num_inliers, - median_err), # prioritize inliers, then lower error  # TODO schould overall confidence be used here?
+                "median_err": median_projection_err,  
+                "overall_conf": overall_conf,
+                "sort_key": (overall_conf, num_inliers), # prioritize overall confidence, then inliers
             })
 
-            del feats1_b, feats1_r, matches01, matches01_r
+            del feats_tile_b, feats_tile_r, matches01, matches01_r
             if 'img1_t' in locals():
                 del img1_t
             gc.collect()
@@ -1060,23 +1062,20 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
     scores_small.sort(key=lambda d: d["sort_key"], reverse=True)
     with open(CSV_RESULT_PATH, "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["tile", "total_matches", "inliers", "avg_confidence", "median_reproj_error"
+        w.writerow(["tile", "total_matches", "inliers", "avg_confidence", "median_reproj_error", "overall_conf"
                     ])
         for r in scores_small:
             w.writerow([r["tile"].name, 
                         r["total_matches"],
                         r["inliers"],
                         "" if math.isnan(r["avg_conf"]) else f"{r['avg_conf']:.4f}", 
-                        "" if math.isnan(r["median_err"]) else f"{r['median_err']:.4f}"
+                        "" if math.isnan(r["median_err"]) else f"{r['median_err']:.4f}", 
+                        "" if math.isnan(r["overall_conf"]) else f"{r['overall_conf']:.4f}"
                         ])
 
     #### OBS this decides how many top tiles to visualize in detail ####
     top1 = scores_small[:1] # top-1 only. if you want to visualise for more than the top 1, change here
     rank_colors = [(0,255,0)]  # Green for top-1
-
-    if visualisations_enabled:
-        top1 = scores_small[:1]  # top-3 for visualizations TODO
-        rank_colors = [(0,255,0), (255,0,0), (0,0,255)]  # Green, Red, Blue for top -1,2,3
 
 
     ########################################################################################################
@@ -1095,67 +1094,15 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
         # first step is to extract/load features for the tile and compute H for candidate tile
         tile_name = r["tile"]  # read tile name
         color = rank_colors[rank-1] # set color
-
-        with torch.inference_mode(): # extracting precomputed features  # TODO is it faster to save H from earlier?
-            tile_pt = make_feature_pt_path_for(tile_name)
-            if tile_pt.exists():
-                # use precomputed features instead of extracting on the fly
-                feats1_b, feats1_r = load_feats_pt_batched(tile_pt, device if feat != "sift" else "cpu") 
-            else: # no precomputed features extract on the fly
-                img1_t  = load_image(str(tile_name)).to(device if feat != "sift" else "cpu")
-                feats1_b = extractor.extract(img1_t)
-                feats1_r = rbd(feats1_b)
-
-            #call LightGlue matcher to get matches
-            matches01 = matcher({"image0": feats0_batched, "image1": feats1_b}) 
-            m_r = rbd(matches01) #Lightglue utility to make dimensions nice (possability of batches are removed)
-            matches = m_r.get("matches", None)
-
-            inlier_mask = None #initialise
-            pts0_np = np.empty((0,2), np.float32) # initialise
-            pts1_np = np.empty((0,2), np.float32) # initialise
-            H_rot2tile = None   #initialise
-
-            # Estimate homography using RANSAC + DLT refinement
-            if matches is not None and matches.numel() > 0:
-                pts0_np = feats0_r["keypoints"][matches[:, 0]].detach().cpu().numpy()
-                pts1_np = feats1_r["keypoints"][matches[:, 1]].detach().cpu().numpy()
-                if len(pts0_np) >= 4:
-                    H_rot2tile, mask = cv2.findHomography(
-                        pts0_np, pts1_np,
-                        method=cv2.USAC_MAGSAC,
-                        ransacReprojThreshold=3.0,
-                        confidence=0.999 # TODO adjust confidence level
-                    )  # TODO check convexity
-                    if mask is not None:
-                        inlier_mask = mask.ravel().astype(bool)
-
-                    #using DLT on inliers for better accuracy
-                    if H_rot2tile is not None and inlier_mask is not None and inlier_mask.sum() >= 4:
-                        H_rot2tile, _ = cv2.findHomography(pts0_np[inlier_mask], pts1_np[inlier_mask], method=0)
-                        # TODO: check convexity of projected drone corners in tile frame?
-        # Now we have H_rot2tile mapping FROM ROTATED drone frame TO TILE frame
-
-        # If homography is not reliable, skip overlay and error metrics TODO We schould still do EKF update?
-        if H_rot2tile is None or inlier_mask is None or inlier_mask.sum() < 4:
-            print(f"[warn] Homography not reliable for {tile_name.name}; skipping overlay.")
-            # TODO: Implement EKF update even if overlay is skipped
-
-            del feats1_b, feats1_r, matches01, m_r
-            if 'img1_t' in locals():
-                del img1_t
-            gc.collect()
-            if device == "cuda":
-                torch.cuda.empty_cache()
-            continue # EKFupdate schould be made
         
         # Compute H from ORIGINAL drone frame to TILE frame
+        H_rot2tile = H_best # the best match
         H_orig2tile = H_rot2tile @ R_orig2rot      
 
         # -------------------- Visualizations: plotting the matches side-by-side --------------------
         if visualisations_enabled:
             out_match_png = OUT_DIR / f"top{rank:02d}_{tile_name.stem}_matches.png"
-            visualize_inliers(DRONE_IMG_FOR_VIZ, tile_name, pts0_np, pts1_np, inlier_mask, str(out_match_png))
+            visualize_inliers(DRONE_IMG_FOR_VIZ, tile_name, pts_drone_np, pts_tile_np, inlier_mask, str(out_match_png))
 
         # -------------------- Get visualisation parameters --------------------
         x_off, y_off = tile_offset_from_name(tile_name) # Project ORIGINAL drone corners/center (for overlays & error)
@@ -1163,14 +1110,13 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
 
         ####################################### EKF + metrics for only top candidate #######################################
         if rank == 1:  # top-1 candidate
-            # compute overall_confidence:
             with open(CSV_RESULT_PATH, newline="") as f:
                 reader = csv.DictReader(f)
                 first_row = next(reader)  # skip the overview line
                 num_inliers = int(first_row["inliers"])
                 avg_confidence = float(first_row["avg_confidence"])
                 median_err_px = float(first_row["median_reproj_error"])
-            overall_confidence = absolute_confidence(num_inliers, avg_confidence, median_err_px) # TODO just get from earlier?
+                overall_confidence = float(first_row["overall_conf"])
 
             #------------- extended kalman filter update step ------------
         
@@ -1187,7 +1133,7 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
 
             # EKF update with measurement (OBS: phi is in rad and in image representation!!! )
             # NOTE: the update function expects input heading in radians and image frame convention!
-            x_updated, P_estimated = ekf.update_pos_heading([meas_x_px, meas_y_px, np.deg2rad(compass_to_img(meas_phi_deg))], R) 
+            x_updated, _ = ekf.update_pos_heading([meas_x_px, meas_y_px, np.deg2rad(compass_to_img(meas_phi_deg))], R) 
 
             # To get phi estimated back to compass representation and degrees:
             x_updated[3] = img_to_compass(np.rad2deg(x_updated[3]))  # convert back to degrees for logging
@@ -1245,7 +1191,7 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
                     draw_point(sat_individual, center_measurement, color=color[3], r=2)
                     draw_point(sat_individual, center_ekf, color=color[2], r=2)
                     draw_point(sat_individual, center_gt, color=color[1], r=2)
-                    draw_ellipse(sat_individual, center_measurement, P_estimated[:2, :2], k_sigma=k, color=color[0], thickness=1)
+                    draw_ellipse(sat_individual, center_pred, P_pred[:2, :2], k_sigma=k, color=color[0], thickness=1)
 
                     cv2.imwrite(str(out_overlay), sat_individual)
             
@@ -1270,11 +1216,3 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
                     # f"{time_total:.4f}",
                     # f"{time_total_ekf:.4f}",
                 ])
-
-        # empty memory
-        del feats1_b, feats1_r, matches01, m_r
-        if 'img1_t' in locals():
-            del img1_t
-        gc.collect()
-        if device == "cuda":
-            torch.cuda.empty_cache()
