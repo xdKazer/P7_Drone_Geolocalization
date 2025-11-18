@@ -17,27 +17,29 @@ from lightglue.utils import load_image, rbd
 
 from datetime import datetime # to determine dt from csv
 
+from get_metrics_from_csv import get_metrics
+
 # -------------------- Config --------------------
 FEATURES = "superpoint"       # 'superpoint' | 'disk' | 'sift' | 'aliked'
 DISPLAY_LONG_SIDE = 1200      # only for visualization
-MAX_KPTS = None                  # max keypoints to load from .pt files (None = all)
+MAX_KPTS = None               # max keypoints to load from .pt files (None = all) (This controls memory usage) TODO also controls speed
+MAX_BATCH_TILES = 10          # max number of tiles to process in one batch for common-K trimming
 
 sat_number = "03"
-visualisations_enabled = True
+visualisations_enabled = False
 # --- EKF globals (top of file, before the big for-loop) ---
 ekf = None
 t_last = None   # timestamp of previous processed frame
 x_updated = None # needed for rotation of drone img
 starting_drone_images = ["03_0001.JPG", "03_0097.JPG", "03_0193.JPG", "03_0289.JPG", "03_0385.JPG", "03_0481.JPG", "03_0577.JPG", "03_0673.JPG", ] # the names of the drone images that starts a run
 
-
 BASE = Path(__file__).parent.resolve()
 DATASET_DIR = BASE / "UAV_VisLoc_dataset"
 SAT_LONG_LAT_INFO_DIR = DATASET_DIR / "satellite_coordinates_range.csv"
 DRONE_INFO_DIR = DATASET_DIR / sat_number / f"{sat_number}.csv"
 DRONE_IMG_CLEAN = DATASET_DIR / sat_number / "drone"  
-SAT_DIR   = DATASET_DIR / sat_number / "sat_tiles_overlap" 
-OUT_DIR_CLEAN   = BASE / "outputs" / sat_number 
+SAT_DIR   = DATASET_DIR / sat_number / "sat_tiles_overlap_scaled" 
+OUT_DIR_CLEAN   = BASE / "outputs" / sat_number
 
 # delete folder if exists
 folder = OUT_DIR_CLEAN
@@ -46,18 +48,33 @@ if folder.exists() and folder.is_dir():
     shutil.rmtree(folder)
 
 OUT_DIR_CLEAN.mkdir(parents=True, exist_ok=True)
-CSV_FINAL_RESULT_PATH = BASE / "outputs" / sat_number / f"results_{sat_number}.csv"
+CSV_FINAL_RESULT_PATH = OUT_DIR_CLEAN / f"results_{sat_number}.csv"
 TILE_PT_DIR = DATASET_DIR / sat_number / f"{FEATURES}_features" / sat_number
 SAT_DISPLAY_IMG  = DATASET_DIR / sat_number / "satellite03_small.png"
 SAT_DISPLAY_META = SAT_DISPLAY_IMG.with_suffix(SAT_DISPLAY_IMG.suffix + ".json")  # {"scale": s, "original_size_hw":[H,W],...}
-TILE_WH_DIR = DATASET_DIR / sat_number / "sat_tiles_overlap" / "a_tile_size.txt"  # optional, not used here
+TILE_WH_DIR = SAT_DIR / "a_tile_size.txt"  
 
-# Tile geometry (ORIGINAL satellite pixel units)
+
+############################ Read tile information ############################
+# a_tile_size.txt format:
+#   stride_h stride_w tile_h_sat tile_w_sat H_drone W_drone scale_sat_to_drone
 with open(TILE_WH_DIR) as f:
-    w_str, h_str = f.read().strip().split()
-    TILE_W, TILE_H = int(w_str), int(h_str)
-STRIDE_X = TILE_W // 2
-STRIDE_Y = TILE_H // 2
+    sh_str, sw_str, h_sat_str, w_sat_str, h_drone_str, w_drone_str, scale_str = f.read().strip().split()
+
+STRIDE_Y = int(sh_str)         # stride in ORIGINAL sat px (vertical)
+STRIDE_X = int(sw_str)         # stride in ORIGINAL sat px (horizontal)
+
+TILE_H_ORIGINAL  = int(h_sat_str)       # tile height in ORIGINAL sat px
+TILE_W_ORIGINAL  = int(w_sat_str)       # tile width  in ORIGINAL sat px
+
+TILE_H_RESCALED = int(h_drone_str)  # expected drone / resized-tile height
+TILE_W_RESCALED = int(w_drone_str)  # expected drone / resized-tile width
+
+SCALE_SAT_TILE_ORG_TO_RESCALED = float(scale_str)  # tile_px = sat_original_px * SCALE_SAT_TILE_ORG_TO_RESCALED
+
+########################################################################################
+# --------------------- Helpers and EKF Class -------------------------------------------
+########################################################################################
 
 # -------------- Kalman Filter Class --------------
 class EKF_ConstantVelHeading:
@@ -69,67 +86,42 @@ class EKF_ConstantVelHeading:
       - v     : speed (units/second)
       - phi   : heading in radians (image coords: +x right, +y down)
         b_phi : bias in heading
-
-    Motion model over dt:
-        x_{k+1}   = x_k + v_k * cos(phi_k) * dt
-        y_{k+1}   = y_k + v_k * sin(phi_k) * dt
-        v_{k+1}   = v_k + w_v          (random-walk on speed)
-        phi_{k+1} = phi_k + w_phi      (random-walk on heading, then wrapped)
-        b_phi{k+1}= b_phi + w_b_phi    (random-walk on bias)
     """
 
     def __init__(
         self,
         x0, P0, Q0):
-        """
-        Initialize the filter.
-
-        Args:
-          x0: (5,) initial state [x, y, v, phi, bias_phi]
-          P0: (5,5) initial covariance
-          sigma_*: process noise hyperparameters (tunable)
-        """
         self.x = np.array(x0, dtype=float).reshape(-1)
-        self.x[3] = _wrap_pi(self.x[3])              # keep phi in [-pi, pi]
+        self.x[3] = _wrap_pi(self.x[3])
         self.P = np.array(P0, dtype=float).reshape(5, 5)
 
-        # Process noise scales (hyperparameters you tune)
+        # Process noise scales
         self.sigma_pos_proc = Q0[0][0]
         self.sigma_speed    = Q0[1][1]
         self.sigma_phi      = Q0[2][2]
         self.sigma_b_phi    = Q0[3][3]
 
-    # -------- PREDICT HELPERS USED BY predict() --------
     def _f(self, x, dt):
-        """Nonlinear motion model f(x, dt): propagates the state mean."""
         X, Y, V, PHI, B = x
         c, s = np.cos(PHI), np.sin(PHI)
         Xn = X + V * c * dt
         Yn = Y + V * s * dt
-        Vn = V                                   # random walk handled via Q
-        PHIn = _wrap_pi(PHI)                     # random walk handled via Q
-        Bn = B                                  # random walk handled via Q
+        Vn = V
+        PHIn = _wrap_pi(PHI)
+        Bn = B
         return np.array([Xn, Yn, Vn, PHIn, Bn], dtype=float)
 
     def _F_jac(self, x, dt):
-        """Jacobian F = ∂f/∂x at current state; propagates covariance."""
         _, _, V, PHI, _ = x
         c, s = np.cos(PHI), np.sin(PHI)
         F = np.eye(5)
-        F[0, 2] = c * dt           # dX/dV
-        F[0, 3] = -V * s * dt      # dX/dPHI
-        F[1, 2] = s * dt           # dY/dV
-        F[1, 3] =  V * c * dt      # dY/dPHI
-        # rows for V, PHI, B are identity (random-walks handled via Q)
+        F[0, 2] = c * dt
+        F[0, 3] = -V * s * dt
+        F[1, 2] = s * dt
+        F[1, 3] =  V * c * dt
         return F
 
     def _Q_proc(self, dt):
-        """
-        Process noise covariance (how uncertainty grows during predict).
-        - x,y get a small baseline diffusion: (sigma_pos_proc * sqrt(dt))^2
-        - v    random-walk per step:         (sigma_speed           )^2
-        - phi  random-walk:                   (sigma_phi * sqrt(dt) )^2
-        """
         qx = (self.sigma_pos_proc * np.sqrt(dt))**2
         qy = (self.sigma_pos_proc * np.sqrt(dt))**2
         qv = (self.sigma_speed)**2
@@ -137,50 +129,32 @@ class EKF_ConstantVelHeading:
         qb = (self.sigma_b_phi * np.sqrt(dt))**2
         return np.diag([qx, qy, qv, qf, qb])
 
-    # -------------------- PREDICT (called every frame) --------------------
     def predict(self, dt):
-        """
-        Time update (a.k.a. 'predict'):
-          1) propagate the state mean with the motion model over dt
-          2) propagate covariance with the Jacobian and process noise
-
-        Call this once per frame BEFORE any measurement updates for that frame.
-        """
-        dt = float(max(1e-6, dt))                 # guard tiny/zero dt
-        # propagate mean
+        dt = float(max(1e-6, dt))
         self.x = self._f(self.x, dt)
         self.x[3] = _wrap_pi(self.x[3])
 
-        # propagate covariance
         F = self._F_jac(self.x, dt)
         Q = self._Q_proc(dt)
         self.P = F @ self.P @ F.T + Q
 
         return self.x.copy(), self.P.copy()
     
-    #----------------- UPDATE (called when measurement is available) --------------------
     def update_pos_heading(self, z_xyphi, R_xyphi):
-        """
-        OBS: PHI must be in pixel heading and radians (image coords: +x right, +y down).
-        Measurement update with z = [x_meas, y_meas, phi_meas].
-        R_xyphi is 3x3 diag([var_x, var_y, var_phi]).
-        """
         z = np.asarray(z_xyphi, dtype=float).reshape(3)
-        # H maps state -> measurement: [x, y, phi]
         H = np.array([[1,0,0,0, 0],
-                    [0,1,0,0, 0],
-                    [0,0,0,1, 1]], dtype=float) # we want to measure phi + b_phi
+                      [0,1,0,0, 0],
+                      [0,0,0,1, 1]], dtype=float)
 
         z_pred = np.array([self.x[0], self.x[1], _wrap_pi(self.x[3] + self.x[4])], dtype=float)
         y = z - z_pred
-        # wrap the heading innovation
         y[2] = _wrap_pi(y[2])
 
         S = H @ self.P @ H.T + R_xyphi
         K = self.P @ H.T @ np.linalg.inv(S)
 
         self.x = self.x + K @ y
-        self.x[3] = _wrap_pi(self.x[3]) # obs in rad and in image beskrivelse
+        self.x[3] = _wrap_pi(self.x[3])
 
         I = np.eye(5)
         self.P = (I - K @ H) @ self.P
@@ -188,41 +162,32 @@ class EKF_ConstantVelHeading:
 
     @staticmethod
     def R_from_conf(pos_base_std, heading_base_std_rad, overall_conf,
-                    min_scale=0.3, max_scale=2.0): 
-        """
-        Build measurement covariance from a confidence in [0,1].
-        Higher confidence -> smaller variance (clamped by min/max scale).
-        """
-        # liniar mapping from confidence to scale between min and max scale
-        scale = np.interp(np.clip(overall_conf, 0.0, 1.0), [0.0, 1.0], [max_scale, min_scale]) 
-        Rx = (pos_base_std * scale)**2
-        Ry = (pos_base_std * scale)**2
-        Rphi = (heading_base_std_rad * scale)**2
+                    pos_min_scale, pos_max_scale,
+                    heading_min_scale, heading_max_scale ): 
+        overall_conf = float(np.clip(overall_conf, 0.0, 1.0))
+        scale_pose = np.interp(overall_conf, [0.0, 1.0], [pos_max_scale, pos_min_scale]) 
+        scale_heading = np.interp(overall_conf, [0.0, 1.0], [heading_max_scale, heading_min_scale]) 
+        Rx = (pos_base_std * scale_pose)**2
+        Ry = (pos_base_std * scale_pose)**2
+        Rphi = (heading_base_std_rad * scale_heading)**2
         return np.diag([Rx, Ry, Rphi]).astype(float)
 
 
-
 # -------------------- Angle wrapping --------------------
-def wrap_deg(a): # this is used to get between -180 and 180 which is used in campass based heading
-    """Wrap degrees to [-180, 180)."""
+def wrap_deg(a):
     return ((a + 180.0) % 360.0) - 180.0
 
-def img_to_compass(phi_img_deg): # 
-    """Convert image angle -> compass heading."""
-    # Check: φ_img= -90 (North) -> ψ = 0 ; φ_img=0 (East) -> ψ=90
-    return wrap_deg(phi_img_deg + 90.0) # to make sure its between -180 and 180
+def img_to_compass(phi_img_deg):
+    return wrap_deg(phi_img_deg + 90.0)
 
 def compass_to_img(psi_deg):
-    """Convert compass heading -> image angle."""
-    # Check: ψ=0 (North) -> φ_img=-90 ; ψ=90 (East) -> φ_img=0
-    return wrap_deg(psi_deg - 90.0) # to make sure its between -180 and 180
+    return wrap_deg(psi_deg - 90.0)
 
 def _wrap_pi(a: float) -> float:
-    """Wrap angle to [-pi, pi]. Use anywhere you touch headings."""
     return (a + np.pi) % (2*np.pi) - np.pi
+
 # -------------------- Helpers --------------------
 def get_median_projection_error(H, pts0, pts1, inlier_mask):
-    """ Compute median projection error confidence based on reprojection error of inliers."""
     if H is None or inlier_mask is None or not inlier_mask.any():
         return 0.0
 
@@ -244,46 +209,39 @@ def get_location_in_sat_img(drone_img_centre, SAT_LONG_LAT_INFO_DIR, sat_number,
     with open(SAT_LONG_LAT_INFO_DIR, newline="") as f:
         for r in csv.DictReader(f):
             if r["mapname"] == f"satellite{sat_number}.tif":
-                LT_lat = np.float128(r["LT_lat_map"])
-                LT_lon = np.float128(r["LT_lon_map"])
-                RB_lat = np.float128(r["RB_lat_map"])
-                RB_lon = np.float128(r["RB_lon_map"])
+                LT_lat = np.float64(r["LT_lat_map"])
+                LT_lon = np.float64(r["LT_lon_map"])
+                RB_lat = np.float64(r["RB_lat_map"])
+                RB_lon = np.float64(r["RB_lon_map"])
                 break
         else:
             raise FileNotFoundError(f"Bounds for satellite{sat_number}.tif not found")
 
-    u, v = np.float128(drone_img_centre)
+    u, v = np.float64(drone_img_centre)
     lon = LT_lon + (u / sat_W) * (RB_lon - LT_lon)
     lat = LT_lat + (v / sat_H) * (RB_lat - LT_lat)
     return (lat, lon)
 
 def determine_pos_error(pose, heading_deg, DRONE_INFO_DIR, drone_img):
-    """ Compute position error in meters between estimated pose and GT from CSV.
-    pose: (lat, lon) as float128
-    heading_deg: float (compass heading in degrees)
-    output: total_error_m, dx, dy, dphi, gt_pose_px
-    """
-    pose = np.array(pose, dtype=np.float128)
+    pose = np.array(pose, dtype=np.float64)
 
     gt_lat = gt_lon = None
     with open(DRONE_INFO_DIR, newline="") as f:
         for r in csv.DictReader(f):
             if r["filename"] == f"{drone_img}":
-                gt_lat = np.float128(r["lat"])
-                gt_lon = np.float128(r["lon"])
-                gt_heading = np.float128(r["Phi1"]) 
+                gt_lat = np.float64(r["lat"])
+                gt_lon = np.float64(r["lon"])
+                gt_heading = np.float64(r["Phi1"]) 
                 break
     if gt_lat is None or gt_lon is None:
         raise ValueError(f"GT lat/lon not found for {drone_img}")
     
-    # for debugging GT values
     gt_pose_px = latlon_to_orig_xy(gt_lat, gt_lon, SAT_LONG_LAT_INFO_DIR, sat_number, SAT_DISPLAY_META)  
-    #print(f"GT values for {drone_img}: x={gt_pose_px[0]}, y={gt_pose_px[1]}, phi={get_phi_deg(DRONE_INFO_DIR, drone_img)}")
 
-    difference = pose - np.array([gt_lat, gt_lon], dtype=np.float128)
-    mean_lat = np.radians((pose[0] + gt_lat) / np.float128(2.0))
+    difference = pose - np.array([gt_lat, gt_lon], dtype=np.float64)
+    mean_lat = np.radians((pose[0] + gt_lat) / np.float64(2.0))
 
-    meters_per_degree_lat = np.float128(111_320.0)
+    meters_per_degree_lat = np.float64(111_320.0)
     meters_per_degree_lon = meters_per_degree_lat * np.cos(mean_lat)
 
     dy = difference[0] * meters_per_degree_lat
@@ -303,7 +261,6 @@ def get_R_rotated_by_phi1(phi_rad: float, W_orig: int, H_orig: int) -> np.ndarra
     return T_back @ R @ T_to
 
 def get_phi_deg(DRONE_INFO_DIR, drone_img,):
-    """ Read Φ heading (deg) for this frame. Returns float or raises."""
     with open(DRONE_INFO_DIR, newline="") as f:
         for r in csv.DictReader(f):
             if r["filename"] == f"{drone_img}":
@@ -314,7 +271,6 @@ def get_phi_deg(DRONE_INFO_DIR, drone_img,):
     raise FileNotFoundError(f"{drone_img} not found in {DRONE_INFO_DIR}")
 
 def latlon_to_orig_xy(lat, lon, SAT_LONG_LAT_INFO_DIR, sat_number, SAT_DISPLAY_META):
-    """(lat, lon) -> ORIGINAL satellite pixel (u, v) as float64 (no downscale)."""
     meta = json.loads(SAT_DISPLAY_META.read_text())
     if "original_size_hw" not in meta:
         raise KeyError("SAT_DISPLAY_META missing 'original_size_hw'.")
@@ -322,71 +278,54 @@ def latlon_to_orig_xy(lat, lon, SAT_LONG_LAT_INFO_DIR, sat_number, SAT_DISPLAY_M
     with open(SAT_LONG_LAT_INFO_DIR, newline="") as f:
         for r in csv.DictReader(f):
             if r["mapname"] == f"satellite{sat_number}.tif":
-                LT_lat = np.float128(r["LT_lat_map"])
-                LT_lon = np.float128(r["LT_lon_map"])
-                RB_lat = np.float128(r["RB_lat_map"])
-                RB_lon = np.float128(r["RB_lon_map"])
+                LT_lat = np.float64(r["LT_lat_map"])
+                LT_lon = np.float64(r["LT_lon_map"])
+                RB_lat = np.float64(r["RB_lat_map"])
+                RB_lon = np.float64(r["RB_lon_map"])
                 break
         else:
             raise FileNotFoundError(f"Bounds for satellite{sat_number}.tif not found")
-    u = (np.float128(lon) - LT_lon) / (RB_lon - LT_lon) * sat_W
-    v = (np.float128(lat) - LT_lat) / (RB_lat - LT_lat) * sat_H
+    u = (np.float64(lon) - LT_lon) / (RB_lon - LT_lon) * sat_W
+    v = (np.float64(lat) - LT_lat) / (RB_lat - LT_lat) * sat_H
     return u, v
 
-def get_visualisation_parameters(H_orig2tile, DRONE_ORIGINAL_W, DRONE_ORIGINAL_H, x_off, y_off):
-    """
-    H_orig2tile: homography from ORIGINAL drone frame to TILE coords (ORIGINAL sat pixels).
-    Drone image size: DRONE_ORIGINAL_W, DRONE_ORIGINAL_H (original drone frame size).
-    Get center and forward points in TILE coordinates (ORIGINAL sat pixels).
-    Get heading unit vector from homography (in image orientation)
-    output: center_global, corners_global, forward_global, heading_unitvector_measurement
-    """
-    w0, h0 = float(DRONE_ORIGINAL_W), float(DRONE_ORIGINAL_H) # drone image size
-    
-    # --- 1. reference points in drone image ---
+def get_visualisation_parameters(H_orig2tile, TILE_SCALE, DRONE_ORIGINAL_W, DRONE_ORIGINAL_H, x_off, y_off):
+    w0, h0 = float(DRONE_ORIGINAL_W), float(DRONE_ORIGINAL_H)
+
     center0  = np.array([[w0/2.0, h0/2.0]], dtype=np.float32)
     forward0 = np.array([[w0/2.0, h0/2.0 - max(20.0, 0.10*h0)]], dtype=np.float32)
 
-    # --- 2. project both points into TILE coords via homography ---
-    center_tile  = project_pts(H_orig2tile, center0)[0].astype(np.float64)
-    forward_tile = project_pts(H_orig2tile, forward0)[0].astype(np.float64)
+    center_tile_px  = project_pts(H_orig2tile, center0)[0].astype(np.float64)
+    forward_tile_px = project_pts(H_orig2tile, forward0)[0].astype(np.float64)
 
-    # --- 3. lift to ORIGINAL satellite pixel coords using tile offsets ---
-    center_global = center_tile  + np.array([x_off, y_off], dtype=np.float64)
-    forward_global = forward_tile + np.array([x_off, y_off], dtype=np.float64)
+    center_original_tile  = center_tile_px  / TILE_SCALE
+    forward_original_tile = forward_tile_px / TILE_SCALE
 
-    # --- 4. compute heading vector in ORIGINAL sat coordinates ---
+    offset = np.array([x_off, y_off], dtype=np.float64)
+    center_global  = center_original_tile  + offset
+    forward_global = forward_original_tile + offset
+
     v_pred = forward_global - center_global
-    norm = float(np.hypot(v_pred[0], v_pred[1])) or 1.0
-    heading_unitvector_measurement = (v_pred / norm).astype(np.float64)
+    norm   = np.hypot(v_pred[0], v_pred[1]) or 1.0
+    heading_unitvec_meas = v_pred / norm
 
     corners0 = np.array([[0,0],[w0,0],[w0,h0],[0,h0]], dtype=np.float32)
-    center0  = np.array([[w0/2, h0/2]], dtype=np.float32)
+    center0c = np.array([[w0/2, h0/2]], dtype=np.float32)
 
-    # project to TILE frame for visualization
-    corners_tile = project_pts(H_orig2tile, corners0)
-    center_tile  = project_pts(H_orig2tile, center0)[0]
+    corners_tile_px = project_pts(H_orig2tile, corners0)
+    center_tile_px2 = project_pts(H_orig2tile, center0c)[0]
 
-    # get tile offsets from name to get GLOBAL sat coords
-    corners_global = corners_tile + np.array([x_off, y_off], np.float32)
-    center_global  = center_tile  + np.array([x_off, y_off], np.float32)
-            
+    corners_local = corners_tile_px / TILE_SCALE
+    corners_global = corners_local + offset
 
-    return center_global, corners_global, heading_unitvector_measurement
+    return center_global, corners_global, heading_unitvec_meas
 
 
 def get_measurements(center_global, heading_unitvector_from_homography):
-    """
-    Drone image size: DRONE_INPUT_W, DRONE_INPUT_H (original drone frame size).
-    Get measurements: (meas_phi_rad, meas_phi_deg, (meas_x, meas_y)) in ORIGINAL satellite pixel coords.
-
-    """
-    # ---  extract position & angle ---
     meas_x, meas_y = float(center_global[0]), float(center_global[1])
     meas_phi_rad = float(np.arctan2(heading_unitvector_from_homography[1], heading_unitvector_from_homography[0]))
     meas_phi_deg = float(np.degrees(meas_phi_rad))
-    meas_phi_deg = img_to_compass(meas_phi_deg)  # convert to compass heading
-
+    meas_phi_deg = img_to_compass(meas_phi_deg)
     return meas_phi_deg, (meas_x, meas_y)
 
 def load_sat_display_and_scale():
@@ -427,24 +366,10 @@ def label_point(
     img, pt, text, color,
     offset=(20, -10), font_scale=0.5, thickness=1
 ):
-    """
-    Draw text near a point with a line connecting them.
-
-    Args:
-        img: target image (BGR)
-        pt: (x, y) coordinates of the point
-        text: label string
-        color: (B, G, R)
-        offset: (dx, dy) offset of text from the point
-        font_scale: text size
-        thickness: text thickness
-        line_thickness: thickness of the connector line
-    """
     x, y = int(pt[0]), int(pt[1])
     ox, oy = offset
     tx, ty = x + ox, y + oy
 
-    # draw the text label
     cv2.putText(
         img, text, (tx, ty),
         cv2.FONT_HERSHEY_SIMPLEX,
@@ -488,8 +413,8 @@ def make_segments(p0, p1, x_offset):
 def visualize_inliers(drone_path: Path, tile_path: Path, pts0, pts1, inlier_mask, out_png):
     I0 = to_numpy_image(load_image(str(drone_path)))
     I1 = to_numpy_image(load_image(str(tile_path)))
-    I0d, s0 = resize_for_display(I0)
-    I1d, s1 = resize_for_display(I1)
+    I0d, s0 = resize_for_display(np.clip(I0, 0.0, 1.0))
+    I1d, s1 = resize_for_display(np.clip(I1, 0.0, 1.0))
     p0d = pts0 * s0
     p1d = pts1 * s1
 
@@ -520,9 +445,6 @@ def visualize_inliers(drone_path: Path, tile_path: Path, pts0, pts1, inlier_mask
     plt.tight_layout(); plt.savefig(out_png, dpi=150); plt.close()
 
 def make_feature_pt_path_for(image_path: Path) -> Path:
-    """
-    returns path for feature file for image (.pt) files
-    """
     folder = TILE_PT_DIR if TILE_PT_DIR is not None else image_path.parent
     return folder / (image_path.stem + ".pt")
 
@@ -544,120 +466,19 @@ def load_feats_pt_batched(pt_path: Path, device: str):
     feats_r = rbd(feats_b)
     return feats_b, feats_r
 
-def absolute_confidence(num_inliers, avg_conf, median_err_px,
-                        s_inl=50.0, s_err=2.5, w=(0.50, 0.15, 0.35)): # TODO tune if needed (LightGlue score pulls the avg down!!!)
-    """
-    Compute an absolute confidence score in [0,1] based on:
-    - num_inliers: number of inlier matches
-    - avg_conf: average matching confidence [0,1]
-    - median_err_px: median reprojection error in pixels
-
-    s_inl: scaling factor for inliers. higher = more inliers needed for high score.
-    s_err: scaling factor for reproj error. higher = more error tolerated for high score.
-    w: weights for (inliers, avg_conf, err_score)
-    """
+def get_confidence_meas(num_inliers, avg_conf, median_err_px,
+                        s_err=3, w=(0.5, 0.5)):
     if avg_conf <= 0 or num_inliers <= 0 or not np.isfinite(median_err_px):
         return 0.0
-    inlier_score = 1.0 - np.exp(-num_inliers / s_inl)
     err_score    = np.exp(- (median_err_px / s_err)**2)
-    w_inl, w_avg_c, w_err = w
-    return float(np.clip(w_inl*inlier_score + w_avg_c*avg_conf + w_err*err_score, 0.0, 1.0))
-
-def trim_tiles_to_common_k(feats_tile_b_list, feats_tile_r_list):
-    """
-    Given lists of tile features (batched and rbd) for one batch,
-    trim all tiles so they have the same number of keypoints = min K in the batch.
-    We drop the lowest-confidence keypoints based on 'keypoint_scores'.
-    """
-    if not feats_tile_b_list:
-        return feats_tile_b_list, feats_tile_r_list
-
-    # how many keypoints each tile has (from keypoints: [1, K, 2])
-    Ks = [fb["keypoints"].shape[1] for fb in feats_tile_b_list]
-    K_common = min(Ks)
-
-    trimmed_b = []
-    trimmed_r = []
-
-    for fb, fr in zip(feats_tile_b_list, feats_tile_r_list):
-        K = fb["keypoints"].shape[1]
-        if K == K_common:
-            # nothing to do for this tile
-            trimmed_b.append(fb)
-            trimmed_r.append(fr)
-            continue
-
-        # scores: [1, K] -> [K]
-        scores = fb["keypoint_scores"][0]  # [K]
-        top_vals, top_idx = torch.topk(scores, K_common, largest=True, sorted=False)
-        top_idx = top_idx.to(fb["keypoints"].device)
-
-        new_fb = dict(fb)
-
-        # ---- keypoints: [1, K, 2] -> [1, Kc, 2] ----
-        new_fb["keypoints"] = fb["keypoints"][:, top_idx, :]
-
-        # ---- descriptors: handle both layouts [1, C, K] and [1, K, C] ----
-        desc = fb["descriptors"]
-        if desc.ndim != 3:
-            raise ValueError(f"Unexpected descriptors shape: {desc.shape}")
-
-        B, A, C = desc.shape  # could be [1, K, D] or [1, D, K]
-
-        if A == K:
-            # layout [1, K, D] -> index dim=1
-            new_desc = desc[:, top_idx, :]
-        elif C == K:
-            # layout [1, D, K] -> index dim=2
-            new_desc = desc[:, :, top_idx]
-        else:
-            raise ValueError(
-                f"Descriptors shape {desc.shape} does not match keypoints K={K}"
-            )
-
-        new_fb["descriptors"] = new_desc
-
-        # ---- keypoint_scores: [1, K] -> [1, Kc] ----
-        new_fb["keypoint_scores"] = fb["keypoint_scores"][:, top_idx]
-
-        # (Optional: if there is a 'scores' field with per-kpt values, trim it too)
-        if "scores" in fb and fb["scores"].shape[1] == K:
-            new_fb["scores"] = fb["scores"][:, top_idx]
-
-        trimmed_b.append(new_fb)
-
-        # ---- rbd features: at minimum we must trim keypoints to keep indices consistent ----
-        new_fr = dict(fr)
-        idx_r = top_idx.to(fr["keypoints"].device)
-        new_fr["keypoints"] = fr["keypoints"][idx_r, :]  # [Kc, 2]
-
-        # If you want, you could also trim descriptors/scores inside fr the same way,
-        # but for your code you only use fr["keypoints"], so this is enough.
-        trimmed_r.append(new_fr)
-
-    return trimmed_b, trimmed_r
-
+    w_avg_c, w_err = w
+    return float(np.clip(w_avg_c*avg_conf + w_err*err_score, 0.0, 1.0))
 
 # ---------------------- homography convexity check ----------------------
-
 def is_homography_convex(H, img_w, img_h):
-    """
-    Check if the homography H maps the drone image (0..w, 0..h) corners
-    to a convex quadrilateral in the target (tile) image.
-
-    Args:
-        H: 3x3 homography (drone -> tile)
-        img_w, img_h: width and height of the drone image that H is defined for
-
-    Returns:
-        (is_convex: bool, warped_corners: np.ndarray of shape (4, 2))
-
-        warped_corners are in the target (tile) coordinate system.
-    """
     if H is None:
         return False
     
-    # 4 corners of the drone image
     corners0 = np.array([
         [0,      0     ],
         [img_w,  0     ],
@@ -665,42 +486,35 @@ def is_homography_convex(H, img_w, img_h):
         [0,      img_h ],
     ], dtype=np.float32)
 
-    # warp them with your existing helper
-    corners_warped = project_pts(H, corners0)  # (4, 2)
+    corners_warped = project_pts(H, corners0)
 
-    # finite check (avoid NaNs / infs)
     if not np.isfinite(corners_warped).all():
         return False
 
-    # use OpenCV convexity test
     cnt = corners_warped.reshape(-1, 1, 2).astype(np.float32)
     is_convex = bool(cv2.isContourConvex(cnt))
 
     return is_convex
 
-# ------------------------ LightGLue Batch
-
-
 
 # ---------------------- search region ----------------------
 def ellipse_from_cov(mu_xy, Sigma_xy, k=2.0):
-    # mu_xy: (2,) ; Sigma_xy: (2,2)
-    vals, vecs = np.linalg.eigh(Sigma_xy)       # vals ascending
-    a = k * np.sqrt(vals[1])                    # major axis length
-    b = k * np.sqrt(vals[0])                    # minor axis length
-    angle_rad = np.arctan2(vecs[1,1], vecs[0,1])  # angle of major axis
+    vals, vecs = np.linalg.eigh(Sigma_xy)
+    a = k * np.sqrt(vals[1])
+    b = k * np.sqrt(vals[0])
+    angle_rad = np.arctan2(vecs[1,1], vecs[0,1])
     return a, b, angle_rad, mu_xy
 
-def ellipse_bbox(mu_xy, Sigma_xy, k=2.0, n=72): # n is number of points to sample
+def ellipse_bbox(mu_xy, Sigma_xy, k=2.0, n=72):
     a,b,theta,mu = ellipse_from_cov(mu_xy, Sigma_xy, k)
     t = np.linspace(0, 2*np.pi, n, endpoint=False)
-    pts = np.stack([a*np.cos(t), b*np.sin(t)], axis=0)  # 2×n
+    pts = np.stack([a*np.cos(t), b*np.sin(t)], axis=0)
     R = np.array([[np.cos(theta), -np.sin(theta)],
                   [np.sin(theta),  np.cos(theta)]])
     pts_world = (R @ pts).T + mu[None,:]
     x0,y0 = pts_world.min(axis=0)
     x1,y1 = pts_world.max(axis=0)
-    return (x0,y0,x1,y1)  # bbox in ORIGINAL sat px
+    return (x0,y0,x1,y1)
 
 def tiles_in_bbox(bbox, TILE_W, TILE_H, all_tile_names):
     x_min, y_min, x_max, y_max = bbox
@@ -708,87 +522,91 @@ def tiles_in_bbox(bbox, TILE_W, TILE_H, all_tile_names):
     for tile_path in all_tile_names:
         x_off, y_off = tile_offset_from_name(tile_path)
         tile_bbox = (x_off, y_off, x_off + TILE_W, y_off + TILE_H)
-        # check intersection
         if not (tile_bbox[2] < x_min or tile_bbox[0] > x_max or
                 tile_bbox[3] < y_min or tile_bbox[1] > y_max):
             selected_tiles.append(tile_path)
     return selected_tiles 
+
+###################################################################################################
+# --------- helper: trim TILE features to K_common by removing lowest-confidence keypoints -------
+###################################################################################################
+def trim_single_feats_to_K(feats_b, K_keep: int):
+    """
+    Trim TILE features to K_keep keypoints (top by keypoint_scores).
+
+    feats_b: dict with keys
+        'keypoints'       [1, K, 2]
+        'descriptors'     [1, K, D]  OR  [1, D, K]
+        'keypoint_scores' [1, K]
+        'image_size'      [1, 2]
+
+    We NEVER touch the drone features, only tiles.
+    """
+    scores = feats_b["keypoint_scores"]  # [1, K]
+    B, K_full = scores.shape
+    if K_keep >= K_full:
+        # nothing to trim
+        return {
+            "keypoints":       feats_b["keypoints"].clone(),
+            "descriptors":     feats_b["descriptors"].clone(),
+            "keypoint_scores": feats_b["keypoint_scores"].clone(),
+            "image_size":      feats_b["image_size"].clone(),
+        }
+
+    # top-K_keep by score (largest = best)
+    # scores: [1, K_full]  -> idx: [1, K_keep]
+    vals, idx = torch.topk(scores, k=K_keep, dim=1, largest=True, sorted=False)
+
+    # ---- keypoints: [1, K, 2] -> gather along dim=1 ----
+    keypoints = feats_b["keypoints"].gather(
+        1, idx.unsqueeze(-1).expand(-1, -1, 2)
+    )  # [1, K_keep, 2]
+
+    # ---- descriptors: can be [1, K, D] OR [1, D, K] ----
+    desc = feats_b["descriptors"]
+    if desc.dim() != 3:
+        raise ValueError(f"Unexpected descriptors shape: {desc.shape}")
+
+    # case 1: [1, K, D]
+    if desc.shape[1] == K_full:
+        D = desc.shape[2]
+        # gather along dim=1 (keypoint dim)
+        descriptors = desc.gather(
+            1, idx.unsqueeze(-1).expand(-1, -1, D)
+        )  # [1, K_keep, D]
+
+    # case 2: [1, D, K]
+    elif desc.shape[2] == K_full:
+        D = desc.shape[1]
+        # gather along dim=2 (keypoint dim)
+        descriptors = desc.gather(
+            2, idx.unsqueeze(1).expand(-1, D, -1)
+        )  # [1, D, K_keep]
+
+    else:
+        raise ValueError(
+            f"Descriptors shape {desc.shape} not compatible with scores shape {scores.shape}"
+        )
+
+    keypoint_scores = vals  # [1, K_keep]
+
+    return {
+        "keypoints":       keypoints,
+        "descriptors":     descriptors,
+        "keypoint_scores": keypoint_scores,
+        "image_size":      feats_b["image_size"].clone(),
+    }
+
 ###################################################################################################
 
-################################## EKF Tuning parameters ##################################
-"""
-P0: initial state covariance matrix before we start
-    Set it to the initial uncertainty in (x, y, phi, bias)
-    This one converges over time
-    Big P0 = you are open to being corrected quickly by the first good measurements.
-    Small P0 = you start “confident” and resist early corrections.
-
-    P: P carries our total uncertainty of the different states over timesteps.
-
-Q: process noise covariance matrix (model uncertainty) (this one is defined in the EKF initialization)
-    how much we trust our motion model
-    high Q = we expect the state to change a lot between steps (less trust in model)
-    low Q  = we expect the state to change little between steps (more trust in model
-
-EKF initialization:
-    state vector: [x, y, v, phi, bias_phi]
-
-    P0 = diag([sigma_x0^2, sigma_y0^2, sigma_v0^2, sigma_phi0^2, sigma_b_phi0^2])
-
-    sigma_pos_proc (px/√s): baseline random diffusion in (x,y).
-        Bigger → looser ellipse / faster expansion of search; more responsive to measurements; noisier track.
-
-    sigma_speed (px/√s in your code it is used as absolute per step, i.e., Q uses (sigma_speed)**2): how much speed can wander.
-        Bigger → speed adapts quickly; smaller → speed is sticky (constant-velocity).
-
-    sigma_phi (rad/√s): how much true heading can meander per second.
-        Bigger → allows turns/heading jitter; smaller → straight-line assumption.
-
-    sigma_b_phi (rad/√s): how much heading bias can drift per second.
-        Smaller → bias is nearly constant (good if offset is truly fixed).
-        Bigger → bias can change quickly (good if offset drifts with time/conditions).
-
-R: measurement noise covariance matrix (sensor noise)
-    how much we trust our measurements
-    Higher R → trust measurements less (updates are small).
-    Lower R → trust measurements more (updates are big).
-    This is controlled by our measurement confidence!!! We set some sigma values for the mean expected uncertainty
-
-R AND Q WILL DEFINE HOW MUCH WE TRUST MEASUREMENTS VS MODEL PREDICTIONS, SO TUNING IS IMPORTANT. IF ONE IS VERY HIGH THE OTHER IS TRUSTED MORE!!
-
-
-################################### Kalman steps #############################################
-
-When using the kalman filter, we need to initialize it. We need known starting position, delta time and velocity.
-We need to track dt between frames for the process model.
-
-This is done by giving the following to the ekf class:
-    dt: time difference between frames in seconds
-    vel0: initial speed estimate in px/s
-    phi0: initial heading estimate in rad
-    initial_state (x0): [x0, y0, v0, phi0, bias_phi]
-    initial_P (P0): covariance matrix for initial state
-    process_noise_cov (Q): covariance matrix for process noise
-
-For each step we call ekf.predict(dt) followed by ekf.update(measurement, R). R has to be set each run as it uses measurement confidence. 
-
-
-#################### Bias #####################
-P0 bias just let it converge.
-If after convergence you still see bias hopping. either sigma_b_phi is too large (Q keeps re-inflating the bias uncertainty each predict), or
-R_phi is too small (you are over-trusting noisy heading measurements).
-"""
-###################################################################################################
 # -------------------- Device & models --------------------
 device = "cuda" if torch.cuda.is_available() else "cpu"
-print(f"[info] device: {device}. Extracting features using {FEATURES}.")
-# -------------------- Feature extractor & matcher --------------------
+print(f"Using device: {device} for feature extraction and matching using {FEATURES}.")
 
 feat = FEATURES.lower()
 if feat not in ("superpoint", "disk", "sift", "aliked"):
     raise ValueError("FEATURES must be 'superpoint', 'disk', 'sift', or 'aliked'.")
 
-# Extractor as fallback when tile .pt is missing
 extractor = None
 if feat == "superpoint":
     extractor = SuperPoint(max_num_keypoints=MAX_KPTS).eval().to(device)
@@ -802,104 +620,88 @@ elif feat == "aliked":
 matcher = LightGlue(features=feat).eval().to(device)
 
 with open(CSV_FINAL_RESULT_PATH, "a", newline="") as f:
-                w = csv.writer(f)
-                w.writerow(["drone_image", "tile", "total_matches", "inliers", "avg_confidence", 
-                            "median_reproj_error_px", "overall_confidence", 
-                            "x_meas", "y_meas", "phi_meas_deg",
-                            "x_ekf", "y_ekf", "phi_ekf_deg",
-                            "dx", "dy", 
-                            "dx_ekf", "dy_ekf",
-                            "error", "ekf_error", 
-                            "heading_diff", "ekf_heading_diff", 
-                            "time_s", "ekf_time_s"])
+    w = csv.writer(f)
+    w.writerow(["drone_image", "tile", "total_matches", "search_tiles", "inliers", "avg_confidence", 
+                "median_reproj_error_px", "overall_confidence", 
+                "x_meas", "y_meas", "phi_meas_deg",
+                "x_ekf", "y_ekf", "phi_ekf_deg",
+                "dx", "dy", 
+                "dx_ekf", "dy_ekf",
+                "error", "ekf_error", 
+                "heading_diff", "ekf_heading_diff", 
+                "time_s", "ekf_time_s"])
 
 # -------------------- Preload satellite tiles --------------------              
 all_tile_names = [p for p in SAT_DIR.iterdir() if p.is_file() and p.suffix.lower() == ".png"]
-# -------------------- Confidence scaling for ellipse --------------------
-k = math.sqrt(chi2.ppf(0.99, df=2)) # TODO confidence scaling for 2D ellipse. so how conservative we are. the df is 2 since 2D.
-#initialize satellite display
+
+k = math.sqrt(chi2.ppf(0.99, df=2))
 sat_vis, SX, SY = load_sat_display_and_scale()
 
-# -------------------- Load drone features --------------------
+# -------------------- Main loop over drone images --------------------
 for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
     if img_path.suffix.lower() not in [".jpg", ".png", ".jpeg"]:
         continue
-    print("---")
     drone_img = img_path.name
 
-    if drone_img in starting_drone_images: # this indicates a new sequence so ekf reset
-        meas_phi_deg = None #for rotation consistency check
+    if drone_img in starting_drone_images:
+        meas_phi_deg = None
         ekf = None
         t_last = None
-        print(f"[info] Resetting EKF for new sequence starting at {drone_img}")
 
     DRONE_IMG = DRONE_IMG_CLEAN / str(drone_img)
-    OUT_DIR = OUT_DIR_CLEAN / str(drone_img)
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
-    CSV_RESULT_PATH  = OUT_DIR / "results.csv" 
+    if visualisations_enabled:
+        OUT_DIR = OUT_DIR_CLEAN / str(drone_img)
+        OUT_DIR.mkdir(parents=True, exist_ok=True)
+        CSV_RESULT_PATH  = OUT_DIR / "results.csv" 
     if not DRONE_IMG.exists():
         raise FileNotFoundError(f"Missing drone image: {DRONE_IMG}")
     
-    # -------------------- EKF initialisation--------------------
-    if ekf is None: # first frame is skipped for EKF initialization
-        # -------------------- EKF initialization (global across frames) --------------------
-        #read CSV to get starting lat lon and velocity estimate
+    # --------------- EKF initialisation -----------------
+    if ekf is None:
         with open(DRONE_INFO_DIR, "r", newline="") as f:
             r = csv.DictReader(f)
             for row in r:
                 if row["filename"] == str(drone_img):
-                    starting_position_latlon = (np.float128(row["lat"]), np.float128(row["lon"]))
+                    starting_position_latlon = (np.float64(row["lat"]), np.float64(row["lon"]))
                     starting_position_xy = latlon_to_orig_xy(starting_position_latlon[0], starting_position_latlon[1], SAT_LONG_LAT_INFO_DIR, sat_number, SAT_DISPLAY_META)
                     t_current = datetime.fromisoformat(row["date"])
-                    t_last = t_current  # needed for next frame
+                    t_last = t_current
 
-                    # get phi
                     phi_deg0 = np.float64(row["Phi1"])
-                    phi0 = np.deg2rad(phi_deg0)
-                    phi0_rad = np.deg2rad(compass_to_img(phi_deg0)) # convert to image frame and rad
+                    phi0_rad = np.deg2rad(compass_to_img(phi_deg0))
 
-                    # try reading the very next row in the file to get velocity estimate
                     next_row = next(r)
                     lat1 = float(next_row["lat"])
                     lon1 = float(next_row["lon"])
                     k1_position_xy = latlon_to_orig_xy(lat1, lon1, SAT_LONG_LAT_INFO_DIR, sat_number, SAT_DISPLAY_META)
 
-                    # find dt between the two rows
                     t1 = datetime.fromisoformat(next_row["date"])
                     dt = (t1 - t_current).total_seconds()
-                    if dt > 0 and not None:
+                    if dt > 0:
                         vel_x = (k1_position_xy[0] - starting_position_xy[0]) / dt
                         vel_y = (k1_position_xy[1] - starting_position_xy[1]) / dt
                         vel0 = np.sqrt(vel_x**2 + vel_y**2)
-                        #print(f"[info] Initial velocity estimate from CSV: {vel0:.2f} px/s over dt={dt:.2f}s")
                     else:
                         vel0 = 50.0
-                        #print(f"[warning] Non-positive dt={dt:.2f}s between first two rows in CSV. Using default initial vel={vel0:.2f} px/s")
                     break
 
-        # initial state: (x, y, v, phi, bias_phi) OBS: must be in image representation and phi:rad!!!
-        x0 = np.array([starting_position_xy[0], starting_position_xy[1], vel0, phi0_rad, np.deg2rad(0.0)], dtype=np.float64)  # x,y in ORIGINAL sat pixels
+        x0 = np.array([starting_position_xy[0], starting_position_xy[1], vel0, phi0_rad, np.deg2rad(0.0)], dtype=np.float64)
 
-        # P is the initial covariance for measurement uncertainty
-        P0 = np.diag([(50.0)**2,            # σx = 50 px
-                    (50.0)**2,              # σy = 50 px
-                    (3.0)**2,               # σv = 3 px/s (since we have a rough estimate)
-                    np.deg2rad(9.0)**2,     # σφ = 1° deg/s
-                    np.deg2rad(9.0)**2      # at t0 we are unsure with around σbias_φ = 10.0 deg (This only affect us at start untill convergence)
-                    ])  # this is something we only set for this first run it will be updated by EKF later. 
-        
-        # Process noise covariance Q (model uncertainty) Tune when ekf trust model to much or too little (high values=less trust in model)
-        Q0 = np.diag([2.0,                  # px/√s : baseline diffusion on x,y
-                      0.7,                  # px/√s : how much v can wander
-                      np.deg2rad(3.0),      # rad/√s : how much phi can wander pr second. # we fly straight so expect small changes
-                      np.deg2rad(0.005)     # rad/√s : how much bias_phi can wander pr second
-                    ])  # this is something we only set for this first run it will be updated by EKF later. 
+        P0 = np.diag([(50.0)**2,
+                      (50.0)**2,
+                      (3.0)**2,
+                      np.deg2rad(9.0)**2,
+                      np.deg2rad(9.0)**2])
 
-        ekf = EKF_ConstantVelHeading(x0, P0, Q0) # initialize EKF
-        continue # next drone image
+        Q0 = np.diag([3.0,
+                      0.5,
+                      np.deg2rad(1),
+                      np.deg2rad(0.0025)])
 
-    # ---------------------------- EKF prediction + ellipse for search area ---------------
-    #determine dt for model prediction: 
+        ekf = EKF_ConstantVelHeading(x0, P0, Q0)
+        continue
+
+    # ---------------------------- EKF prediction + ellipse -------------------
     with open(DRONE_INFO_DIR, "r", newline="") as f:
         r = csv.DictReader(f)
         for row in r:
@@ -907,55 +709,44 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
                 t_current = datetime.fromisoformat(row["date"])
                 if t_last is not None:
                     dt = (t_current - t_last).total_seconds()
-                    #print(f"dt between frames: {dt} seconds")
                 t_last = t_current
 
-    # -------------------- EKF predict step --------------------
     x_pred, _ = ekf.predict(dt)
     x_pred[3] = img_to_compass(np.rad2deg(x_pred[3]))
-    #print(f"[Predict-only] Predicted position: ({x_pred[0]:.2f}, {x_pred[1]:.2f}) px, heading={x_pred[3]:.2f}°, Bias_phi={np.rad2deg(x_pred[4]):.2f}°")
 
-    # -------------------- EKF search area (2,-sigma ellipse) --------------------
-    # create search area using Predicted covariance P:
     P_pred = ekf.P
-    sigma = P_pred[:2, :2]  # position covariance 2x2
-    
-    ellipse_bbox_coords = ellipse_bbox(x_pred[:2], sigma, k=k, n=72) # this uses SVD to determine viedest axes and orienation of ellipse to get bbx
+    sigma = P_pred[:2, :2]
+    ellipse_bbox_coords = ellipse_bbox(x_pred[:2], sigma, k=k, n=72)
 
-    # -------------------- Determine tiles in search area --------------------
-    selected_tiles = tiles_in_bbox(ellipse_bbox_coords, TILE_W, TILE_H, all_tile_names)
+    selected_tiles = tiles_in_bbox(ellipse_bbox_coords, TILE_W_ORIGINAL, TILE_H_ORIGINAL, all_tile_names)
 
-    # -------------------- Rotate drone image & extract features --------------------
+    # -------------------- Rotate drone & extract features (drone untouched later) -----------
     if feat == "sift":
         R_orig2rot = np.eye(3, dtype=np.float64)
         with torch.inference_mode():
             img0_t = load_image(str(DRONE_IMG)).to("cpu")
-            feats0_batched = extractor.extract(img0_t)
-            feats0_r = rbd(feats0_batched)
-        _bgr = cv2.imread(str(DRONE_IMG), cv2.IMREAD_COLOR)
-        drone_rot_size = (_bgr.shape[1], _bgr.shape[0])  # (W,H)
+            feats_drone_b = extractor.extract(img0_t)
+            feats_drone_r = rbd(feats_drone_b)
+        bgr_rot = cv2.imread(str(DRONE_IMG), cv2.IMREAD_COLOR)
+        drone_rot_size = (bgr_rot.shape[1], bgr_rot.shape[0])
         DRONE_IMG_FOR_VIZ = DRONE_IMG
     else:
-        # -------------------- additionally rotate drone image by csv heading --------------------
-        # SuperPoint / DISK: rotate according to heading from CSV
         if meas_phi_deg is None:
             phi_deg_flip = get_phi_deg(DRONE_INFO_DIR, drone_img)
         else:
             phi_deg_flip = meas_phi_deg
 
-        # Arbitrary-angle rotation with padding; save the exact affine
         img = cv2.imread(str(DRONE_IMG), cv2.IMREAD_COLOR)
-        H, W = img.shape[:2]
+        H_img, W_img = img.shape[:2]
         a = -phi_deg_flip
-        r = math.radians(a)
-        c, s = abs(math.cos(r)), abs(math.sin(r))
-        newW = int(math.ceil(W*c + H*s))
-        newH = int(math.ceil(W*s + H*c))
+        r_ang = math.radians(a)
+        c, s = abs(math.cos(r_ang)), abs(math.sin(r_ang))
+        newW = int(math.ceil(W_img*c + H_img*s))
+        newH = int(math.ceil(W_img*s + H_img*c))
 
-        M = cv2.getRotationMatrix2D((W/2.0, H/2.0), a, 1.0)
-        # shift so the rotated content is centered in the padded canvas
-        M[0, 2] += (newW - W) / 2.0
-        M[1, 2] += (newH - H) / 2.0
+        M = cv2.getRotationMatrix2D((W_img/2.0, H_img/2.0), a, 1.0)
+        M[0, 2] += (newW - W_img) / 2.0
+        M[1, 2] += (newH - H_img) / 2.0
 
         bgr_rot = cv2.warpAffine(img, M, (newW, newH), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
 
@@ -964,184 +755,109 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
 
         hR, wR = bgr_rot.shape[:2]
         drone_rot_size = (wR, hR)
-        DRONE_IMG_ROT_PATH = OUT_DIR / f"drone_rot_{a}.png"
-        DRONE_IMG_FOR_VIZ = DRONE_IMG_ROT_PATH
-        cv2.imwrite(str(DRONE_IMG_ROT_PATH), bgr_rot)
-
-        # -------------------- Extract features from rotated drone image --------------------
+        if visualisations_enabled:
+            DRONE_IMG_ROT_PATH = OUT_DIR / f"drone_rot_{a}.png"
+            DRONE_IMG_FOR_VIZ = DRONE_IMG_ROT_PATH
+            cv2.imwrite(str(DRONE_IMG_ROT_PATH), bgr_rot)
 
         with torch.inference_mode():
-            img_t = load_image(str(DRONE_IMG_FOR_VIZ)).to(device)
+            rgb = cv2.cvtColor(bgr_rot, cv2.COLOR_BGR2RGB)
+            img_np = rgb.astype(np.float32) / 255.0
+            img_t = torch.from_numpy(img_np).permute(2, 0, 1).unsqueeze(0).to(device)
+
             feats_drone_b = extractor.extract(img_t)
             feats_drone_r = rbd(feats_drone_b)
 
         hR, wR = bgr_rot.shape[:2]
         drone_rot_size = (wR, hR)
-        
-    # -------------------- Pass 1: score all tiles (BATCHED) --------------------   
+
     if not selected_tiles:
         raise FileNotFoundError(f"No PNG tiles in {SAT_DIR}")
 
     scores_small = []
     H_best = None
     best_conf = 0.0
-
-    BATCH_SIZE = 8  # you typically have 3–8 tiles; this lets you process them all in one go
+    best_pts_drone_np = None
+    best_pts_tile_np = None
+    best_inlier_mask = None
 
     with torch.inference_mode():
-        print(f"[info] Evaluating {len(selected_tiles)} tiles in search area (batched)...")
+        # preload tile features
+        tile_feats_list = []
+        for p in selected_tiles:
+            tile_pt = make_feature_pt_path_for(p)
 
-        # go over tiles in batches
-        for batch_start in range(0, len(selected_tiles), BATCH_SIZE):
-            batch_tiles = selected_tiles[batch_start: batch_start + BATCH_SIZE]
+            if tile_pt.exists():
+                feats_tile_b, feats_tile_r = load_feats_pt_batched(tile_pt, device if feat != "sift" else "cpu")
+            else:
+                if extractor is None:
+                    raise FileNotFoundError(f"Missing {tile_pt} and no extractor available.")
+                img1_t  = load_image(str(p)).to(device if feat != "sift" else "cpu")
+                feats_tile_b = extractor.extract(img1_t)
+                feats_tile_r = rbd(feats_tile_b)
 
-            # ----- 1) load / extract features for all tiles in this batch -----
-            feats_tile_b_list = []   # LightGlue-format batched dicts
-            feats_tile_r_list = []   # reduced / rbd versions (for numpy keypoints)
-            tile_paths_batch   = []  # tiles that actually go into LightGlue
+            tile_feats_list.append((p, feats_tile_b, feats_tile_r))
 
-            for p in batch_tiles:
-                tile_pt = make_feature_pt_path_for(p)
+        # process tiles in batches for K_common (only tiles; drone untouched)
+        for batch_start in range(0, len(tile_feats_list), MAX_BATCH_TILES):
+            batch = tile_feats_list[batch_start:batch_start + MAX_BATCH_TILES]
 
-                if tile_pt.exists():
-                    feats_tile_b, feats_tile_r = load_feats_pt_batched(
-                        tile_pt,
-                        device if feat != "sift" else "cpu"
-                    )
-                else:
-                    if extractor is None:
-                        raise FileNotFoundError(f"Missing {tile_pt} and no extractor available.")
-                    img1_t = load_image(str(p)).to(device if feat != "sift" else "cpu")
-                    feats_tile_b = extractor.extract(img1_t)
-                    # ensure we have keypoint_scores
-                    if "keypoint_scores" not in feats_tile_b and "scores" in feats_tile_b:
-                        feats_tile_b["keypoint_scores"] = feats_tile_b["scores"]
-                    feats_tile_r = rbd(feats_tile_b)
+            # find K_common over tiles in this batch
+            K_values = [fb["keypoints"].shape[1] for (_, fb, _) in batch]
+            K_common = int(min(K_values))
 
-                # number of keypoints in this tile
-                Ki = feats_tile_b["keypoints"].shape[1]
-
-                # If a tile has too few keypoints, we can't estimate a homography anyway.
-                # Mark it as zero-score and skip it from the batched matcher.
-                if Ki < 4:
-                    scores_small.append({
-                        "tile": p,
-                        "inliers": 0,
-                        "total_matches": 0,
-                        "avg_conf": float("nan"),
-                        "median_err": float("inf"),
-                        "overall_conf": 0.0,
-                        "sort_key": (0.0, 0),
-                    })
-                    continue
-
-                feats_tile_b_list.append(feats_tile_b)
-                feats_tile_r_list.append(feats_tile_r)
-                tile_paths_batch.append(p)
-
-            # nothing to match in this batch
-            if not feats_tile_b_list:
-                continue
-
-            # ----- 2) trim all tiles in this batch to same K = min(K_i), keeping highest-score kpts -----
-            feats_tile_b_list, feats_tile_r_list = trim_tiles_to_common_k(
-                feats_tile_b_list, feats_tile_r_list
-            )
-
-            # batch size = number of tiles that entered the matcher
-            bsz = len(feats_tile_b_list)
-
-            # ----- 3) build a single batched dict for image1 (tiles) -----
-            keys = feats_tile_b_list[0].keys()
-            feats_tiles_batched = {}
-            for k in keys:
-                feats_tiles_batched[k] = torch.cat(
-                    [f[k] for f in feats_tile_b_list], dim=0
-                )  # shape: [B, N_k, ...] or [B, 2] for image_size
-
-            # ----- 4) repeat the drone features so we match 1→many in one call -----
-            feats_drone_batched = {}
-            for k, v in feats_drone_b.items():
-                feats_drone_batched[k] = v.repeat(bsz, *([1] * (v.ndim - 1)))
-
-            # ----- 4) run LightGlue once on this batch -----
-            matches01 = matcher({"image0": feats_drone_batched, "image1": feats_tiles_batched})
-            matches01_r = rbd(matches01)
-
-            # After rbd, matches01_r["matches"] has shape [B, M_i, 2] (variable M_i per tile, padded or ragged)
-            matches_batched = matches01_r.get("matches", None)
-            scores_batched  = matches01_r.get("scores", None)
-
-            # Sanity check: if no matches at all, just register empty scores for each tile
-            if matches_batched is None:
-                for p in tile_paths_batch:
-                    scores_small.append({
-                        "tile": p,
-                        "inliers": 0,
-                        "total_matches": 0,
-                        "avg_conf": float("nan"),
-                        "median_err": float("inf"),
-                        "overall_conf": 0.0,
-                        "sort_key": (0.0, 0),
-                    })
-                continue
-
-            # ----- 5) process each tile in this batch independently -----
-            for b_idx, p in enumerate(tile_paths_batch):
+            for (p, feats_tile_b, feats_tile_r) in batch:
                 num_inliers = 0
                 avg_conf = float("nan")
-                median_projection_err = float("inf")
+                median_projection_err = float("inf")   
                 overall_conf = 0.0
-                K = 0
+                K_matches = 0
                 H = None
                 H_ransac = None
                 H_dlt = None
                 inlier_mask = None
 
-                feats_tile_r = feats_tile_r_list[b_idx]
+                # trim TILE only
+                feats_tile_b_trim = trim_single_feats_to_K(feats_tile_b, K_common)
+                feats_tile_r_trim = rbd(feats_tile_b_trim)
 
-                # get matches for this tile
-                matches_tile = matches_batched[b_idx]
-                if matches_tile is None or matches_tile.numel() == 0:
-                    # no matches for this tile
+                # match single pair (drone untouched)
+                matches01 = matcher({"image0": feats_drone_b, "image1": feats_tile_b_trim})
+                matches01_r = rbd(matches01)
+
+                matches = matches01_r.get("matches", None)
+                if matches is not None and matches.numel() > 0:
+                    K_matches = int(matches.shape[0])
+                else:
                     scores_small.append({
                         "tile": p,
                         "inliers": 0,
                         "total_matches": 0,
                         "avg_conf": float("nan"),
-                        "median_err": float("inf"),
+                        "median_err": float("inf"),  
                         "overall_conf": 0.0,
                         "sort_key": (0.0, 0),
                     })
                     continue
 
-                # matches_tile: [K, 2]
-                matches_tile = matches_tile.detach().cpu()
-                K = int(matches_tile.shape[0])
-
-                if K >= 4:
-                    # keypoints for drone (same across batch)
-                    pts_drone_np = feats_drone_r["keypoints"][matches_tile[:, 0]].detach().cpu().numpy()
-                    # keypoints for THIS tile
-                    pts_tile_np = feats_tile_r["keypoints"][matches_tile[:, 1]].detach().cpu().numpy()
+                if K_matches >= 4:
+                    pts_drone_np = feats_drone_r["keypoints"][matches[:, 0]].detach().cpu().numpy()
+                    pts_tile_np = feats_tile_r_trim["keypoints"][matches[:, 1]].detach().cpu().numpy()
 
                     H_ransac, mask = cv2.findHomography(
-                        pts_drone_np, pts_tile_np,
-                        method=cv2.USAC_MAGSAC,
-                        ransacReprojThreshold=3.0,
-                        confidence=0.999
-                    )
+                        pts_drone_np, pts_tile_np, method=cv2.USAC_MAGSAC,
+                        ransacReprojThreshold=3.0, confidence=0.999
+                    ) 
 
-                    # convexity check
-                    if H_ransac is None or not is_homography_convex(H_ransac, drone_rot_size[0], drone_rot_size[1]):
+                    if not is_homography_convex(H_ransac, drone_rot_size[0], drone_rot_size[1]):
                         scores_small.append({
                             "tile": p,
                             "inliers": 0,
-                            "total_matches": K,
+                            "total_matches": K_matches,
                             "avg_conf": float("nan"),
-                            "median_err": float("inf"),
+                            "median_err": float("inf"),  
                             "overall_conf": 0.0,
-                            "sort_key": (0.0, K),
+                            "sort_key": (0.0, 0),
                         })
                         continue
 
@@ -1149,24 +865,17 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
                         inlier_mask = mask.ravel().astype(bool)
                         num_inliers = int(inlier_mask.sum())
 
-                        if scores_batched is not None and num_inliers > 0:
-                            scores_tile = scores_batched[b_idx].detach().cpu().numpy()
-                            avg_conf = float(np.mean(scores_tile[inlier_mask]))
-
-                    # refine with DLT on inliers
+                        scores_t = matches01_r.get("scores", None)
+                        if scores_t is not None and num_inliers > 0:
+                            scores_np = scores_t.detach().cpu().numpy()
+                            avg_conf = float(np.mean(scores_np[inlier_mask]))
+                    
                     if H_ransac is not None and num_inliers >= 4:
-                        H_dlt, _ = cv2.findHomography(
-                            pts_drone_np[inlier_mask],
-                            pts_tile_np[inlier_mask],
-                            method=0
-                        )
-
-                    # choose H (RANSAC vs DLT) based on reprojection error
+                        H_dlt, _ = cv2.findHomography(pts_drone_np[inlier_mask], pts_tile_np[inlier_mask], method=0)
+                        
                     H_candidates = [H_ransac, H_dlt]
                     best_median_err = float("inf")
                     for H_cand in H_candidates:
-                        if H_cand is None:
-                            continue
                         median_err_cand = get_median_projection_error(H_cand, pts_drone_np, pts_tile_np, inlier_mask)
                         if median_err_cand < best_median_err:
                             best_median_err = median_err_cand
@@ -1174,195 +883,164 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
 
                     if H is not None:
                         median_projection_err = best_median_err
-                        overall_conf = absolute_confidence(num_inliers, avg_conf, median_projection_err)
-
-                        # keep global best H (top tile over ALL batches)
+                        overall_conf = get_confidence_meas(num_inliers, avg_conf if not math.isnan(avg_conf) else 0.0, median_projection_err)
                         if overall_conf > best_conf:
                             H_best = H
                             best_conf = overall_conf
                             best_pts_drone_np = pts_drone_np
                             best_pts_tile_np = pts_tile_np
                             best_inlier_mask = inlier_mask
-
-                # register per-tile scores
+                            
                 scores_small.append({
                     "tile": p,
                     "inliers": num_inliers,
-                    "total_matches": K,
+                    "total_matches": K_matches,
                     "avg_conf": avg_conf,
-                    "median_err": median_projection_err,
+                    "median_err": median_projection_err,  
                     "overall_conf": overall_conf,
                     "sort_key": (overall_conf, num_inliers),
                 })
 
-    # -------------------- Rank them and save in CSV. There is gonna be one CSV for each drone image --------------------
+    # -------------------- Rank tiles --------------------
     scores_small.sort(key=lambda d: d["sort_key"], reverse=True)
     if visualisations_enabled:
         with open(CSV_RESULT_PATH, "w", newline="") as f:
             w = csv.writer(f)
-            w.writerow(["tile", "total_matches", "inliers", "avg_confidence", "median_reproj_error", "overall_conf"
-                        ])
+            w.writerow(["tile", "total_matches", "inliers", "avg_confidence", "median_reproj_error", "overall_conf"])
             for r in scores_small:
-                w.writerow([r["tile"].name, 
-                            r["total_matches"],
-                            r["inliers"],
-                            "" if math.isnan(r["avg_conf"]) else f"{r['avg_conf']:.4f}", 
-                            "" if math.isnan(r["median_err"]) else f"{r['median_err']:.4f}", 
-                            "" if math.isnan(r["overall_conf"]) else f"{r['overall_conf']:.4f}"
-                            ])
+                w.writerow([
+                    r["tile"].name, 
+                    r["total_matches"],
+                    r["inliers"],
+                    "" if (isinstance(r["avg_conf"], float) and math.isnan(r["avg_conf"])) else f"{r['avg_conf']:.4f}", 
+                    "" if (isinstance(r["median_err"], float) and (math.isnan(r["median_err"]) or math.isinf(r["median_err"]))) else f"{r['median_err']:.4f}", 
+                    "" if (isinstance(r["overall_conf"], float) and math.isnan(r["overall_conf"])) else f"{r['overall_conf']:.4f}"
+                ])
 
-    #### OBS this decides how many top tiles to visualize in detail ####
-    top1 = scores_small[:1] # top-1 only. if you want to visualise for more than the top 1, change here
-    rank_colors = [(0,255,0)]  # Green for top-1
+    top1 = scores_small[:1]
+    rank_colors = [(0,255,0)]
 
-    ########################################################################################################
-    #- --------------------- Pass 2: Visualization and Kalman Filtering on top 1 candidate --------------------
-    ##########################################################################################################
-    #initialize satellite display
     sat_base = sat_vis.copy()
 
-    # ORIGINAL drone size (for original-frame overlays / error)
     _bgr_orig = cv2.imread(str(DRONE_IMG), cv2.IMREAD_COLOR)
     H_orig, W_orig = _bgr_orig.shape[:2]
 
-    # if no valid homography found, skip EKF update
     if H_best is None:
         pose_ekf = get_location_in_sat_img((x_pred[0], x_pred[1]), SAT_LONG_LAT_INFO_DIR, sat_number, SAT_DISPLAY_META)
         error_ekf, dx_ekf, dy_ekf, dphi_ekf, _ = determine_pos_error(pose_ekf, x_pred[3], DRONE_INFO_DIR, drone_img)
         with open(CSV_FINAL_RESULT_PATH, "a", newline="") as f:
             w = csv.writer(f)
-            w.writerow([drone_img, "N/A", "N/A", "N/A", "N/A",  # total_matches, inliers, avg_confidence
-                        "N/A", "N/A", # median_reproj_error, overall_confidence
-                        "N/A", "N/A", "N/A", # x_meas, y_meas, phi_meas_deg
-                        x_pred[0], x_pred[1], x_pred[3], # x_ekf, y_ekf, phi_ekf_deg
-                        "N/A", "N/A", # dx, dy
-                        dx_ekf, dy_ekf, # dx_ekf, dy_ekf
-                        "N/A", error_ekf, # error, ekf_error
-                        "N/A", dphi_ekf, # heading_diff, ekf_heading_diff
-                        "N/A", "N/A" # time_s, ekf_time_s
-                        ])
-        continue # next drone image
+            w.writerow([drone_img, "N/A", "N/A", len(selected_tiles), "N/A", "N/A",
+                        "N/A", "N/A",
+                        "N/A", "N/A", "N/A",
+                        x_pred[0], x_pred[1], x_pred[3],
+                        "N/A", "N/A",
+                        dx_ekf, dy_ekf,
+                        "N/A", error_ekf,
+                        "N/A", dphi_ekf,
+                        "N/A", "N/A"])
+        continue
 
-    ########## main loop in preprocessing each of the top-N tiles ##########
     for rank, r in enumerate(top1, 1): 
-        # first step is to extract/load features for the tile and compute H for candidate tile
-        tile_name = r["tile"]  # read tile name
-        color = rank_colors[rank-1] # set color
+        tile_name = r["tile"]
+        color = rank_colors[rank-1]
         
-        # Compute H from ORIGINAL drone frame to TILE frame
-        H_rot2tile = H_best # the best match
+        H_rot2tile = H_best
         H_orig2tile = H_rot2tile @ R_orig2rot      
 
-        # -------------------- Visualizations: plotting the matches side-by-side --------------------
-        if visualisations_enabled:
+        if visualisations_enabled and best_pts_drone_np is not None:
             out_match_png = OUT_DIR / f"top{rank:02d}_{tile_name.stem}_matches.png"
             visualize_inliers(DRONE_IMG_FOR_VIZ, tile_name, best_pts_drone_np, best_pts_tile_np, best_inlier_mask, str(out_match_png))
 
-        # -------------------- Get visualisation parameters --------------------
-        x_off, y_off = tile_offset_from_name(tile_name) # Project ORIGINAL drone corners/center (for overlays & error)
-        center_global, corners_global, heading_unitvector_measurement = get_visualisation_parameters(H_orig2tile, W_orig, H_orig, x_off, y_off)
+        x_off, y_off = tile_offset_from_name(tile_name)
+        center_global, corners_global, heading_unitvector_measurement = get_visualisation_parameters(
+            H_orig2tile, SCALE_SAT_TILE_ORG_TO_RESCALED, W_orig, H_orig, x_off, y_off
+        )
 
-        ####################################### EKF + metrics for only top candidate #######################################
-        if rank == 1:  # top-1 candidate
-            # read scores from scores_small top candidate
+        if rank == 1:
             num_inliers = r["inliers"]
-            K = r["total_matches"]
+            K_matches = r["total_matches"]
             avg_confidence = r["avg_conf"]
             median_reproj_error_px = r["median_err"]
             overall_confidence = r["overall_conf"]
 
-            #------------- extended kalman filter update step ------------
-        
-            # ---- Measurement covariance from confidence ---- must be computed each frame
-            R = ekf.R_from_conf(
-                    pos_base_std=50.0, # in px. we expect araound +-15 m ca= 50px error in position measurement
-                    heading_base_std_rad=np.deg2rad(10.0), # can jump due to bad matches
-                    overall_conf=overall_confidence  # between 0 and 1
-                )  # this gives us R matrix for EKF update. R tells us how ceartain we are about the measurements.
+            R_meas = ekf.R_from_conf(
+                pos_base_std=50.0,
+                heading_base_std_rad=np.deg2rad(15.0),
+                overall_conf=overall_confidence,
+                pos_min_scale=0.3,
+                pos_max_scale=2.0,
+                heading_min_scale=1,
+                heading_max_scale=4
+            )
 
-            # ---- Build measurement (x, y, phi) from homography in ORIGINAL pixels. compass heading ----
             meas_phi_deg, (meas_x_px, meas_y_px) = get_measurements(center_global, heading_unitvector_measurement)
-            #print(f"Measurement: x={meas_x_px:.2f}, y={meas_y_px:.2f}, phi={meas_phi_deg:.2f} deg")
 
-            # EKF update with measurement (OBS: phi is in rad and in image representation!!! )
-            # NOTE: the update function expects input heading in radians and image frame convention!
-            x_updated, _ = ekf.update_pos_heading([meas_x_px, meas_y_px, np.deg2rad(compass_to_img(meas_phi_deg))], R) 
+            x_updated, _ = ekf.update_pos_heading(
+                [meas_x_px, meas_y_px, np.deg2rad(compass_to_img(meas_phi_deg))],
+                R_meas
+            )
 
-            # To get phi estimated back to compass representation and degrees:
-            x_updated[3] = img_to_compass(np.rad2deg(x_updated[3]))  # convert back to degrees for logging
-            #print(f"[EKF] Updated state: x={x_updated[0]:.2f}, y={x_updated[1]:.2f}, v={x_updated[2]:.2f} px/s, phi={(x_updated[3]):.2f} deg")
-            #EKF done
+            x_updated[3] = img_to_compass(np.rad2deg(x_updated[3]))
 
-            #------------- Position error computation --------------------
-            # Error in meters (using ORIGINAL-frame center)
             lat_long_pose_estimated = get_location_in_sat_img(center_global, SAT_LONG_LAT_INFO_DIR, sat_number, SAT_DISPLAY_META)
             error, dx, dy, dphi, _ = determine_pos_error(lat_long_pose_estimated, meas_phi_deg, DRONE_INFO_DIR, drone_img)
 
             ekf_pose_lat_long = get_location_in_sat_img((x_updated[0], x_updated[1]), SAT_LONG_LAT_INFO_DIR, sat_number, SAT_DISPLAY_META)
             error_ekf, dx_ekf, dy_ekf, dphi_ekf, gt_pose_px = determine_pos_error(ekf_pose_lat_long, x_updated[3], DRONE_INFO_DIR, drone_img)
 
-            #print(f"[Metrics] Mean Error: {error}m, dx: {dx}m, dy: {dy}m")
-            #print(f"[Metrics] Mean Error (EKF): {error_ekf}m, dx: {dx_ekf}m, dy: {dy_ekf}m")
-
             if visualisations_enabled: 
-                # ------------- Overlays on SATELLITE image -------------------- 
-                # map to DOWNSCALED satellite coords for visualization
                 corners_disp = corners_global * np.array([SX, SY], np.float32)
                 center_measurement  = center_global  * np.array([SX, SY], np.float32)
                 center_ekf = np.array([x_updated[0]*SX, x_updated[1]*SY], np.float32)
                 center_gt = np.array([gt_pose_px[0]*SX, gt_pose_px[1]*SY], np.float32)
                 center_pred = np.array([x_pred[0]*SX, x_pred[1]*SY], np.float32)
 
-                for i in range(2):
-                    if i == 0: # individual overlay for this tile
+                for i_vis in range(2):
+                    if i_vis == 0:
                         sat_individual = sat_base.copy()
                         out_overlay = OUT_DIR / f"top{rank:02d}_{tile_name.stem}_overlay_on_sat.png"
-                        #BGR colors
-                        color = [(255,255,255), (255, 0, 0), (0, 255, 0), (0, 0, 255),(0,255,255)]  # Blue: GT, Green: EKF, Red: Meas, Yellow: Pred, Cyan: overall
+                        color_set = [(255,255,255), (255, 0, 0), (0, 255, 0), (0, 0, 255),(0,255,255)]
 
-                        # same center as we use color to destingish
-                        label_point(sat_individual, center_gt, "Pred", color[4], offset=(100, 40), font_scale=0.5, thickness=1)
-                        label_point(sat_individual, center_gt, "GT", color[1], offset=(100, 20), font_scale=0.5, thickness=1)
-                        label_point(sat_individual, center_gt, "EKF", color[2], offset=(100, 0), font_scale=0.5, thickness=1)
-                        label_point(sat_individual, center_gt, "Meas", color[3], offset=(100, -20), font_scale=0.5, thickness=1)
+                        label_point(sat_individual, center_gt, "Pred", color_set[4], offset=(100, 40), font_scale=0.5, thickness=1)
+                        label_point(sat_individual, center_gt, "GT", color_set[1], offset=(100, 20), font_scale=0.5, thickness=1)
+                        label_point(sat_individual, center_gt, "EKF", color_set[2], offset=(100, 0), font_scale=0.5, thickness=1)
+                        label_point(sat_individual, center_gt, "Meas", color_set[3], offset=(100, -20), font_scale=0.5, thickness=1)
                     else:
                         out_overlay = OUT_DIR.parent / f"overall_overlay_on_sat.png"
                         overlay_img = cv2.imread(str(out_overlay))
                         random_color = tuple(random.randint(128, 255) for _ in range(3))
-                        color = [random_color, (255, 0, 0), (0, 255, 0), (0, 0, 255), (0,255,255)]   # Random for image. Red: GT, Green: EKF, Blue: Meas, Yellow: Pred
+                        color_set = [random_color, (255, 0, 0), (0, 255, 0), (0, 0, 255), (0,255,255)]
 
                         if overlay_img is None:
-                            overlay_img = sat_base.copy()  # use base if file doesn't exist
-                            # make label colors clear in img by text
-                            label_point(overlay_img, [10,70], "Pred", color[4], offset=(0, 0), font_scale=3, thickness=3)
-                            label_point(overlay_img, [300,70], "GT", color[1], offset=(0, 0), font_scale=3, thickness=3)
-                            label_point(overlay_img, [450,70], "EKF", color[2], offset=(0, 0), font_scale=3, thickness=3)
-                            label_point(overlay_img, [700,70], "Meas", color[3], offset=(0, 0), font_scale=3, thickness=3)
+                            overlay_img = sat_base.copy()
+                            label_point(overlay_img, [10,70], "Pred", color_set[4], offset=(0, 0), font_scale=3, thickness=3)
+                            label_point(overlay_img, [300,70], "GT", color_set[1], offset=(0, 0), font_scale=3, thickness=3)
+                            label_point(overlay_img, [450,70], "EKF", color_set[2], offset=(0, 0), font_scale=3, thickness=3)
+                            label_point(overlay_img, [700,70], "Meas", color_set[3], offset=(0, 0), font_scale=3, thickness=3)
                             
                         sat_individual = overlay_img
 
-                    # Overlay
-                    draw_polygon(sat_individual, corners_disp, color=color[0], thickness=2)
-                    draw_point(sat_individual, center_pred, color=color[4], r=2)
-                    draw_point(sat_individual, center_measurement, color=color[3], r=2)
-                    draw_point(sat_individual, center_gt, color=color[1], r=2)
-                    draw_point(sat_individual, center_ekf, color=color[2], r=2)
-                    # P_pred is in ORIGINAL sat px, so we need to scale it for display sat px
+                    draw_polygon(sat_individual, corners_disp, color=color_set[0], thickness=2)
+                    draw_point(sat_individual, center_pred, color=color_set[4], r=2)
+                    draw_point(sat_individual, center_measurement, color=color_set[3], r=2)
+                    draw_point(sat_individual, center_gt, color=color_set[1], r=2)
+                    draw_point(sat_individual, center_ekf, color=color_set[2], r=2)
+
                     Sigma_orig = P_pred[:2, :2]
-                    J = np.diag([SX, SY])            # linear scale transform
+                    J = np.diag([SX, SY])
                     Sigma_disp = J @ Sigma_orig @ J.T
-                    draw_ellipse(sat_individual, center_pred, Sigma_disp, k_sigma=k, color=color[0], thickness=1)
+                    draw_ellipse(sat_individual, center_pred, Sigma_disp, k_sigma=k, color=color_set[0], thickness=1)
 
                     cv2.imwrite(str(out_overlay), sat_individual)
             
-            #------------- save final results to overall CSV file --------------------
-            # add to the bottom of results_{sat_number}.csv file:
             with open(CSV_FINAL_RESULT_PATH, "a", newline="") as f:
                 w = csv.writer(f)
                 w.writerow([
                     drone_img,
                     r["tile"].name,
-                    K,
+                    K_matches,
+                    len(selected_tiles),
                     num_inliers,
                     avg_confidence,
                     f"{median_reproj_error_px:.4f}",
@@ -1373,6 +1051,9 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
                     f"{dx_ekf:.4f}", f"{dy_ekf:.4f}",
                     f"{error:.4f}", f"{error_ekf:.4f}",
                     f"{dphi:.4f}", f"{dphi_ekf:.4f}",
-                    "N/A",# f"{time_total:.4f}",
-                    "N/A"# f"{time_total_ekf:.4f}",
+                    "N/A",
+                    "N/A",
                 ])
+
+results = get_metrics(CSV_FINAL_RESULT_PATH)
+print(results)

@@ -774,9 +774,10 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
         #print(f"[info] Resetting EKF for new sequence starting at {drone_img}")
 
     DRONE_IMG = DRONE_IMG_CLEAN / str(drone_img)
-    OUT_DIR = OUT_DIR_CLEAN / str(drone_img)
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
-    CSV_RESULT_PATH  = OUT_DIR / "results.csv" 
+    if visualisations_enabled:
+        OUT_DIR = OUT_DIR_CLEAN / str(drone_img)
+        OUT_DIR.mkdir(parents=True, exist_ok=True)
+        CSV_RESULT_PATH  = OUT_DIR / "results.csv" 
     if not DRONE_IMG.exists():
         raise FileNotFoundError(f"Missing drone image: {DRONE_IMG}")
     
@@ -904,9 +905,9 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
 
         hR, wR = bgr_rot.shape[:2]
         drone_rot_size = (wR, hR)
-        DRONE_IMG_ROT_PATH = OUT_DIR / f"drone_rot_{a}.png"
-        DRONE_IMG_FOR_VIZ = DRONE_IMG_ROT_PATH
-        if visualisations_enabled:
+        if visualisations_enabled: 
+            DRONE_IMG_ROT_PATH = OUT_DIR / f"drone_rot_{a}.png"
+            DRONE_IMG_FOR_VIZ = DRONE_IMG_ROT_PATH
             cv2.imwrite(str(DRONE_IMG_ROT_PATH), bgr_rot)
 
         # -------------------- Extract features from rotated drone image --------------------
