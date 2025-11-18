@@ -5,11 +5,11 @@ from lightglue import SuperPoint
 from lightglue.utils import load_image, rbd
 
 Base_dir = Path(__file__).parent.resolve() 
-SAT_DIR   = Base_dir / "UAV_VisLoc_dataset/03/sat_tiles_overlap"
-output_dir = Base_dir / "UAV_VisLoc_dataset/03/SuperPoint_features/03"
+SAT_DIR   = Base_dir / "UAV_VisLoc_dataset/03/sat_tiles_overlap_scaled"
+output_dir = Base_dir / "UAV_VisLoc_dataset/03/superpoint_features/03"
 
 
-MAX_KPTS = 8000
+MAX_KPTS = None  # max keypoints to extract (None = all)
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 def save_feats(img_path: Path):
