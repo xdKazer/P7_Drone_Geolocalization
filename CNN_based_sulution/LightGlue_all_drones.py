@@ -17,13 +17,15 @@ from lightglue.utils import load_image, rbd
 
 from datetime import datetime # to determine dt from csv
 
+from get_metrics_from_csv import get_metrics
+
 # -------------------- Config --------------------
 FEATURES = "superpoint"       # 'superpoint' | 'disk' | 'sift' | 'aliked'
 DISPLAY_LONG_SIDE = 1200      # only for visualization
 MAX_KPTS = None               # max keypoints to load from .pt files (None = all) (This controls memory usage) TODO also controls speed
 
 sat_number = "03"
-visualisations_enabled = True
+visualisations_enabled = False
 # --- EKF globals (top of file, before the big for-loop) ---
 ekf = None
 t_last = None   # timestamp of previous processed frame
@@ -36,7 +38,7 @@ SAT_LONG_LAT_INFO_DIR = DATASET_DIR / "satellite_coordinates_range.csv"
 DRONE_INFO_DIR = DATASET_DIR / sat_number / f"{sat_number}.csv"
 DRONE_IMG_CLEAN = DATASET_DIR / sat_number / "drone"  
 SAT_DIR   = DATASET_DIR / sat_number / "sat_tiles_overlap_scaled" 
-OUT_DIR_CLEAN   = BASE / "outputs" / sat_number 
+OUT_DIR_CLEAN   = BASE / "outputs" / sat_number
 
 # delete folder if exists
 folder = OUT_DIR_CLEAN
@@ -45,7 +47,7 @@ if folder.exists() and folder.is_dir():
     shutil.rmtree(folder)
 
 OUT_DIR_CLEAN.mkdir(parents=True, exist_ok=True)
-CSV_FINAL_RESULT_PATH = BASE / "outputs" / sat_number / f"results_{sat_number}.csv"
+CSV_FINAL_RESULT_PATH = OUT_DIR_CLEAN / f"results_{sat_number}.csv"
 TILE_PT_DIR = DATASET_DIR / sat_number / f"{FEATURES}_features" / sat_number
 SAT_DISPLAY_IMG  = DATASET_DIR / sat_number / "satellite03_small.png"
 SAT_DISPLAY_META = SAT_DISPLAY_IMG.with_suffix(SAT_DISPLAY_IMG.suffix + ".json")  # {"scale": s, "original_size_hw":[H,W],...}
@@ -507,8 +509,8 @@ def make_segments(p0, p1, x_offset):
 def visualize_inliers(drone_path: Path, tile_path: Path, pts0, pts1, inlier_mask, out_png):
     I0 = to_numpy_image(load_image(str(drone_path)))
     I1 = to_numpy_image(load_image(str(tile_path)))
-    I0d, s0 = np.clip(resize_for_display(I0), 0.0, 1.0)
-    I1d, s1 = np.clip(resize_for_display(I1), 0.0, 1.0)
+    I0d, s0 = resize_for_display(np.clip(I0, 0.0, 1.0))
+    I1d, s1 = resize_for_display(np.clip(I1, 0.0, 1.0))
     p0d = pts0 * s0
     p1d = pts1 * s1
 
@@ -564,7 +566,7 @@ def load_feats_pt_batched(pt_path: Path, device: str):
     return feats_b, feats_r
 
 def get_confidence_meas(num_inliers, avg_conf, median_err_px,
-                        s_err=2.5, w=(0.5, 0.5)): # TODO tune if needed (LightGlue score pulls the avg down!!!)
+                        s_err=3, w=(0.5, 0.5)): # TODO tune if needed (LightGlue score pulls the avg down!!!)
     """
     Compute an absolute confidence score in [0,1] based on:
     - num_inliers: number of inlier matches
@@ -720,7 +722,7 @@ R_phi is too small (you are over-trusting noisy heading measurements).
 ###################################################################################################
 # -------------------- Device & models --------------------
 device = "cuda" if torch.cuda.is_available() else "cpu"
-print(f"[info] device: {device}. Extracting features using {FEATURES}.")
+#print(f"[info] device: {device}. Extracting features using {FEATURES}.")
 # -------------------- Feature extractor & matcher --------------------
 
 feat = FEATURES.lower()
@@ -742,7 +744,7 @@ matcher = LightGlue(features=feat).eval().to(device)
 
 with open(CSV_FINAL_RESULT_PATH, "a", newline="") as f:
                 w = csv.writer(f)
-                w.writerow(["drone_image", "tile", "total_matches", "inliers", "avg_confidence", 
+                w.writerow(["drone_image", "tile", "total_matches", "search_tiles", "inliers", "avg_confidence", 
                             "median_reproj_error_px", "overall_confidence", 
                             "x_meas", "y_meas", "phi_meas_deg",
                             "x_ekf", "y_ekf", "phi_ekf_deg",
@@ -763,14 +765,13 @@ sat_vis, SX, SY = load_sat_display_and_scale()
 for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
     if img_path.suffix.lower() not in [".jpg", ".png", ".jpeg"]:
         continue
-    print("---")
     drone_img = img_path.name
 
     if drone_img in starting_drone_images: # this indicates a new sequence so ekf reset
         meas_phi_deg = None #for rotation consistency check
         ekf = None
         t_last = None
-        print(f"[info] Resetting EKF for new sequence starting at {drone_img}")
+        #print(f"[info] Resetting EKF for new sequence starting at {drone_img}")
 
     DRONE_IMG = DRONE_IMG_CLEAN / str(drone_img)
     OUT_DIR = OUT_DIR_CLEAN / str(drone_img)
@@ -828,9 +829,9 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
                     ])  # this is something we only set for this first run it will be updated by EKF later. 
         
         # Process noise covariance Q (model uncertainty) Tune when ekf trust model to much or too little (high values=less trust in model)
-        Q0 = np.diag([2.0,                  # px/√s : baseline diffusion on x,y
+        Q0 = np.diag([3.0,                  # px/√s : baseline diffusion on x,y
                       0.5,                  # px/√s : how much v can wander
-                      np.deg2rad(3.0),      # rad/√s : how much phi can wander pr second. # we fly straight so expect small changes
+                      np.deg2rad(1),      # rad/√s : how much phi can wander pr second. # we fly straight so expect small changes
                       np.deg2rad(0.0025)     # rad/√s : how much bias_phi can wander pr second
                     ])  # this is something we only set for this first run it will be updated by EKF later. 
 
@@ -869,10 +870,10 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
         R_orig2rot = np.eye(3, dtype=np.float64)
         with torch.inference_mode():
             img0_t = load_image(str(DRONE_IMG)).to("cpu")
-            feats0_batched = extractor.extract(img0_t)
-            feats0_r = rbd(feats0_batched)
-        _bgr = cv2.imread(str(DRONE_IMG), cv2.IMREAD_COLOR)
-        drone_rot_size = (_bgr.shape[1], _bgr.shape[0])  # (W,H)
+            feats_drone_b = extractor.extract(img0_t)
+            feats_drone_r = rbd(feats_drone_b)
+        bgr_rot = cv2.imread(str(DRONE_IMG), cv2.IMREAD_COLOR)
+        drone_rot_size = (bgr_rot.shape[1], bgr_rot.shape[0])  # (W,H)
         DRONE_IMG_FOR_VIZ = DRONE_IMG
     else:
         # -------------------- additionally rotate drone image by csv heading --------------------
@@ -905,12 +906,19 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
         drone_rot_size = (wR, hR)
         DRONE_IMG_ROT_PATH = OUT_DIR / f"drone_rot_{a}.png"
         DRONE_IMG_FOR_VIZ = DRONE_IMG_ROT_PATH
-        cv2.imwrite(str(DRONE_IMG_ROT_PATH), bgr_rot)
+        if visualisations_enabled:
+            cv2.imwrite(str(DRONE_IMG_ROT_PATH), bgr_rot)
 
         # -------------------- Extract features from rotated drone image --------------------
 
         with torch.inference_mode():
-            img_t = load_image(str(DRONE_IMG_FOR_VIZ)).to(device)
+            # Convert BGR → RGB
+            rgb = cv2.cvtColor(bgr_rot, cv2.COLOR_BGR2RGB)
+            # Convert to float32 normalized [0,1]
+            img_np = rgb.astype(np.float32) / 255.0
+            # Convert to torch tensor: HWC → CHW → BCHW
+            img_t = torch.from_numpy(img_np).permute(2, 0, 1).unsqueeze(0).to(device)
+
             feats_drone_b = extractor.extract(img_t)
             feats_drone_r = rbd(feats_drone_b)
 
@@ -925,7 +933,6 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
     H_best = None
     best_conf = 0.0
     with torch.inference_mode():
-        print(f"[info] Evaluating {len(selected_tiles)} tiles in search area...")
         for i, p in enumerate(selected_tiles):
             num_inliers = 0; 
             avg_conf = "N/A"
@@ -1049,7 +1056,7 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
         error_ekf, dx_ekf, dy_ekf, dphi_ekf, _ = determine_pos_error(pose_ekf, x_pred[3], DRONE_INFO_DIR, drone_img)
         with open(CSV_FINAL_RESULT_PATH, "a", newline="") as f:
             w = csv.writer(f)
-            w.writerow([drone_img, "N/A", "N/A", "N/A", "N/A",  # total_matches, inliers, avg_confidence
+            w.writerow([drone_img, "N/A", "N/A", len(selected_tiles), "N/A", "N/A",   #"drone_image", "tile", "total_matches", "search_tiles", "inliers", "avg_confidence", 
                         "N/A", "N/A", # median_reproj_error, overall_confidence
                         "N/A", "N/A", "N/A", # x_meas, y_meas, phi_meas_deg
                         x_pred[0], x_pred[1], x_pred[3], # x_ekf, y_ekf, phi_ekf_deg
@@ -1098,8 +1105,8 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
                     overall_conf=overall_confidence,  # between 0 and 1
                     pos_min_scale=0.3, # controls how much we trust low confidence measurements
                     pos_max_scale=2.0,  # controls how much we trust high confidence measurements
-                    heading_min_scale=0.5, # same for heading
-                    heading_max_scale=1.5  # same for heading
+                    heading_min_scale=1, # same for heading
+                    heading_max_scale=4  # same for heading
                 )  # this gives us R matrix for EKF update. R tells us how ceartain we are about the measurements.
 
             # ---- Build measurement (x, y, phi) from homography in ORIGINAL pixels. compass heading ----
@@ -1185,6 +1192,7 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
                     drone_img,
                     r["tile"].name,
                     K,
+                    len(selected_tiles),
                     num_inliers,
                     avg_confidence,
                     f"{median_reproj_error_px:.4f}",
@@ -1198,3 +1206,6 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
                     "N/A",# f"{time_total:.4f}",
                     "N/A"# f"{time_total_ekf:.4f}",
                 ])
+
+results = get_metrics(CSV_FINAL_RESULT_PATH)
+print(results)
