@@ -10,8 +10,9 @@ import numpy as np
 # =========================
 # CONFIG (edit these)
 # =========================
-INPUT_TIF         = Path("UAV_VisLoc_dataset/03/satellite03.tif")
-OUTPUT_IMAGE      = Path("UAV_VisLoc_dataset/03/satellite03_small.png")  # .png or .jpg
+BASE_PATH         = Path(__file__).parent.resolve()
+INPUT_TIF         = BASE_PATH / "UAV_VisLoc_dataset/03/satellite03.tif"
+OUTPUT_IMAGE      = BASE_PATH / "UAV_VisLoc_dataset/03/satellite03_small.png"
 TARGET_LONG_SIDE  = 3000     # pixels for the longest side of the output (e.g., 3000)
 CONVERT_TO_UINT8  = False     # Set True if your TIF is 16-bit/float and you want smaller files
 UINT8_P_LOW       = 1.0       # Percentile low for contrast stretch when converting to 8-bit

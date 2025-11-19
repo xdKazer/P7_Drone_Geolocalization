@@ -26,7 +26,7 @@ MAX_KPTS = None               # max keypoints to load from .pt files (None = all
 MAX_BATCH_TILES = 10          # max number of tiles to process in one batch for common-K trimming
 
 sat_number = "03"
-visualisations_enabled = False
+visualisations_enabled = True
 # --- EKF globals (top of file, before the big for-loop) ---
 ekf = None
 t_last = None   # timestamp of previous processed frame
@@ -423,6 +423,7 @@ def visualize_inliers(drone_path: Path, tile_path: Path, pts0, pts1, inlier_mask
     canvas = np.ones((max(H0, H1), W0 + W1, 3), dtype=I0d.dtype)
     canvas[:H0, :W0] = I0d
     canvas[:H1, W0:W0 + W1] = I1d
+    canvas = np.clip(canvas, 0.0, 1.0)
 
     if inlier_mask is None or not inlier_mask.any():
         plt.figure(figsize=(14, 7))
@@ -1042,7 +1043,7 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
                     K_matches,
                     len(selected_tiles),
                     num_inliers,
-                    avg_confidence,
+                    f"{avg_confidence:.4f}",
                     f"{median_reproj_error_px:.4f}",
                     f"{overall_confidence:.4f}",
                     f"{meas_x_px:.4f}", f"{meas_y_px:.4f}", f"{meas_phi_deg:.4f}",

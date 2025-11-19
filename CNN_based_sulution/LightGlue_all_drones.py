@@ -25,7 +25,7 @@ DISPLAY_LONG_SIDE = 1200      # only for visualization
 MAX_KPTS = None               # max keypoints to load from .pt files (None = all) (This controls memory usage) TODO also controls speed
 
 sat_number = "03"
-visualisations_enabled = False
+visualisations_enabled = True
 # --- EKF globals (top of file, before the big for-loop) ---
 ekf = None
 t_last = None   # timestamp of previous processed frame
@@ -39,6 +39,7 @@ DRONE_INFO_DIR = DATASET_DIR / sat_number / f"{sat_number}.csv"
 DRONE_IMG_CLEAN = DATASET_DIR / sat_number / "drone"  
 SAT_DIR   = DATASET_DIR / sat_number / "sat_tiles_overlap_scaled" 
 OUT_DIR_CLEAN   = BASE / "outputs" / sat_number
+OUT_OVERALL_SAT_VIS_PATH = OUT_DIR_CLEAN / f"overall_overlay_on_sat.png"
 
 # delete folder if exists
 folder = OUT_DIR_CLEAN
@@ -548,7 +549,7 @@ def make_feature_pt_path_for(image_path: Path) -> Path:
     return folder / (image_path.stem + ".pt")
 
 def load_feats_pt_batched(pt_path: Path, device: str):
-    d = torch.load(str(pt_path), map_location="cpu")
+    d = torch.load(str(pt_path), map_location="cpu", weights_only=True)
     for k in ("keypoints", "descriptors", "keypoint_scores", "image_size"):
         if k not in d:
             raise KeyError(f"{pt_path} missing key '{k}'")
@@ -771,7 +772,16 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
         meas_phi_deg = None #for rotation consistency check
         ekf = None
         t_last = None
-        #print(f"[info] Resetting EKF for new sequence starting at {drone_img}")
+
+        # clean cuda cache to avoid OOM on new sequences
+        if device == "cuda":
+            torch.cuda.empty_cache()
+        
+        if visualisations_enabled:
+            # also reset global overlay for this satellite sequence
+            OUT_OVERALL_SAT_VIS_PATH = OUT_DIR_CLEAN / f"overall_overlay_on_sat{drone_img}.png"
+            overall_overlay = sat_vis.copy()
+            cv2.imwrite(str(OUT_OVERALL_SAT_VIS_PATH), overall_overlay)
 
     DRONE_IMG = DRONE_IMG_CLEAN / str(drone_img)
     if visualisations_enabled:
@@ -808,7 +818,7 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
                     # find dt between the two rows
                     t1 = datetime.fromisoformat(next_row["date"])
                     dt = (t1 - t_current).total_seconds()
-                    if dt > 0 and not None:
+                    if dt > 0:
                         vel_x = (k1_position_xy[0] - starting_position_xy[0]) / dt
                         vel_y = (k1_position_xy[1] - starting_position_xy[1]) / dt
                         vel0 = np.sqrt(vel_x**2 + vel_y**2)
@@ -837,6 +847,15 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
                     ])  # this is something we only set for this first run it will be updated by EKF later. 
 
         ekf = EKF_ConstantVelHeading(x0, P0, Q0) # initialize EKF
+        # draw starting point on overall sat visualisation
+        if visualisations_enabled:  
+            overlay_img = cv2.imread(str(OUT_OVERALL_SAT_VIS_PATH), cv2.IMREAD_COLOR)
+            start_x, start_y = x0[0], x0[1]
+            draw_point(overlay_img, (start_x / SX, start_y / SY), color=(0,0,255), r=6)
+            label_point(overlay_img, (start_x / SX, start_y / SY), f"Start {drone_img}", color=(0,0,255),
+                        offset=(10,-10), font_scale=0.5, thickness=1)
+            draw_ellipse(overlay_img, (start_x / SX, start_y / SY), ekf.P[:2, :2] / (SX*SY), k_sigma=k, color=(255,0,0), thickness=2)
+            cv2.imwrite(str(OUT_OVERALL_SAT_VIS_PATH), overlay_img)
         continue # next drone image
 
     # ---------------------------- EKF prediction + ellipse for search area ---------------
@@ -936,9 +955,9 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
     with torch.inference_mode():
         for i, p in enumerate(selected_tiles):
             num_inliers = 0; 
-            avg_conf = "N/A"
+            avg_conf = float("nan")
             median_projection_err = float("inf")   
-            overall_conf = "N/A"
+            overall_conf = float("-inf")   
             K = 0
             H = None
             H_ransac = None
@@ -1009,8 +1028,6 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
                         best_pts_tile_np = pts_tile_np
                         best_inlier_mask = inlier_mask
                         
-                 
-
             scores_small.append({
                 "tile": p,
                 "inliers": num_inliers,
@@ -1018,7 +1035,7 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
                 "avg_conf": avg_conf,
                 "median_err": median_projection_err,  
                 "overall_conf": overall_conf,
-                "sort_key": (overall_conf, num_inliers), # prioritize overall confidence, then inliers
+                "sort_key": (overall_conf, - median_projection_err), # prioritize overall confidence, then lower reproj error
             })
 
     # -------------------- Rank them and save in CSV. There is gonna be one CSV for each drone image --------------------
@@ -1029,13 +1046,17 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
             w.writerow(["tile", "total_matches", "inliers", "avg_confidence", "median_reproj_error", "overall_conf"
                         ])
             for r in scores_small:
-                w.writerow([r["tile"].name, 
-                            r["total_matches"],
-                            r["inliers"],
-                            "" if math.isnan(r["avg_conf"]) else f"{r['avg_conf']:.4f}", 
-                            "" if math.isnan(r["median_err"]) else f"{r['median_err']:.4f}", 
-                            "" if math.isnan(r["overall_conf"]) else f"{r['overall_conf']:.4f}"
-                            ])
+                w.writerow([
+                    r["tile"].name,
+                    r["total_matches"],
+                    r["inliers"],
+                    "" if not math.isfinite(r["avg_conf"]) else f"{r['avg_conf']:.4f}",
+                    "" if not math.isfinite(r["median_err"]) else f"{r['median_err']:.4f}",
+                    "" if not math.isfinite(r["overall_conf"]) else f"{r['overall_conf']:.4f}"
+                ])
+
+
+
 
     #### OBS this decides how many top tiles to visualize in detail ####
     top1 = scores_small[:1] # top-1 only. if you want to visualise for more than the top 1, change here
@@ -1067,6 +1088,16 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
                         "N/A", dphi_ekf, # heading_diff, ekf_heading_diff
                         "N/A", "N/A" # time_s, ekf_time_s
                         ])
+        # visualize search area on satellite and predicted position
+        if visualisations_enabled:
+            overlay_img = cv2.imread(str(OUT_OVERALL_SAT_VIS_PATH), cv2.IMREAD_COLOR)
+            # draw predicted point
+            pred_x, pred_y = x_pred[0], x_pred[1]
+            draw_point(overlay_img, (pred_x / SX, pred_y / SY), color=(0,255,255), r=6)
+            label_point(overlay_img, (pred_x / SX, pred_y / SY), f"Pred {drone_img}", color=(0,255,255),
+                        offset=(10,-10), font_scale=0.5, thickness=1)
+            draw_ellipse(overlay_img, (pred_x / SX, pred_y / SY), ekf.P[:2, :2] / (SX*SY), k_sigma=k, color=(255,0,0), thickness=2)
+            cv2.imwrite(str(OUT_OVERALL_SAT_VIS_PATH), overlay_img)
         continue # next drone image
 
     ########## main loop in preprocessing each of the top-N tiles ##########
@@ -1156,7 +1187,7 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
                         label_point(sat_individual, center_gt, "EKF", color[2], offset=(100, 0), font_scale=0.5, thickness=1)
                         label_point(sat_individual, center_gt, "Meas", color[3], offset=(100, -20), font_scale=0.5, thickness=1)
                     else:
-                        out_overlay = OUT_DIR.parent / f"overall_overlay_on_sat.png"
+                        out_overlay = OUT_OVERALL_SAT_VIS_PATH
                         overlay_img = cv2.imread(str(out_overlay))
                         random_color = tuple(random.randint(128, 255) for _ in range(3))
                         color = [random_color, (255, 0, 0), (0, 255, 0), (0, 0, 255), (0,255,255)]   # Random for image. Red: GT, Green: EKF, Blue: Meas, Yellow: Pred

@@ -7,8 +7,11 @@ import numpy as np
 This code makes sure that each pixel in the drone images corresponds to approximately the same
 real-world distance as each pixel in the satellite tiles. It does this by calculating the ground
 sampling distance (GSD) of the satellite image using geo-coordinates, then rescaling the satellite
-tiles to match the drone image GSD. The tiles are generated with overlap to ensure full coverage.   
+tiles to match the drone image GSD.
 
+Tiles are generated with overlap to ensure full coverage. Here we choose the tile size in the
+rescaled (drone-scale) space to be at least the DRONE DIAGONAL so that, in principle, a single tile
+can contain the full drone footprint at any rotation.
 """
 
 # ---- Paths ----
@@ -22,17 +25,18 @@ out_dir.mkdir(parents=True, exist_ok=True)
 
 # ---- Read images ----
 sat = cv2.imread(str(tif_path), cv2.IMREAD_UNCHANGED)
-drone = cv2.imread(str(dataset_path / sat_number / "drone" / f"{sat_number}_0738.JPG"),
-                   cv2.IMREAD_UNCHANGED)
+drone = cv2.imread(
+    str(dataset_path / sat_number / "drone" / f"{sat_number}_0738.JPG"),
+    cv2.IMREAD_UNCHANGED
+)
 if sat is None:
     raise FileNotFoundError(tif_path)
 if drone is None:
     raise FileNotFoundError(dataset_path / sat_number / "drone" / f"{sat_number}_0738.JPG")
 
 # ---- Dataset / geo information ----
-# from UAV-VisLoc dataset description
-drone_altityde_m = 466        # not directly used here, but kept for completeness
-drone_m_px       = 0.125       # meters per pixel at given altitude
+drone_altityde_m = 466      # not used directly, kept for completeness
+drone_m_px       = 0.125    # meters per pixel at given altitude
 
 # (lat_min, lon_min), (lat_max, lon_max)
 coordinate_range_lat_long_sat_map = [
@@ -79,7 +83,7 @@ print(f"Satellite GSD (m/px): vertical={sat_m_per_px_h:.4f}, "
 print(f"Drone GSD (m/px): {drone_m_px:.4f}")
 
 # ---- Scale factor from satellite to drone ----
-# (how much you must upscale satellite pixels so they match drone resolution)
+# how much to SCALE satellite pixels so that 1 sat px ≈ 1 drone px (in meters)
 scale_sat_to_drone = sat_m_per_px / drone_m_px
 print(f"Scale factor sat -> drone: {scale_sat_to_drone:.4f}")
 
@@ -87,16 +91,26 @@ print(f"Scale factor sat -> drone: {scale_sat_to_drone:.4f}")
 H_sat, W_sat = sat.shape[:2]
 H_drone, W_drone = drone.shape[:2]
 
-# Tile size in ORIGINAL satellite image, before upscaling
-tile_h_sat = int(round(H_drone / scale_sat_to_drone))
-tile_w_sat = int(round(W_drone / scale_sat_to_drone))
+# Diagonal of the drone image (in pixels, original drone frame)
+drone_diag = math.hypot(H_drone, W_drone)
+# We choose the RESCALED tile side (at drone scale) to be at least this diagonal.
+tile_rescaled_side = int(math.ceil(drone_diag))
 
-# Safety in case of extreme rounding
-tile_h_sat = max(1, min(tile_h_sat, H_sat))
-tile_w_sat = max(1, min(tile_w_sat, W_sat))
+print(f"Drone image size: {H_drone} x {W_drone}")
+print(f"Drone diagonal (px): {drone_diag:.2f}")
+print(f"Rescaled tile side (px, drone scale): {tile_rescaled_side}")
+
+# Tile size in ORIGINAL satellite pixels, BEFORE upscaling.
+# We invert the scale_sat_to_drone factor.
+tile_side_sat = int(round(tile_rescaled_side / scale_sat_to_drone))
+
+# Safety clamp in case of extreme values
+tile_side_sat = max(1, min(tile_side_sat, min(H_sat, W_sat)))
+
+tile_h_sat = tile_side_sat
+tile_w_sat = tile_side_sat
 
 print(f"Satellite image size: {H_sat} x {W_sat}")
-print(f"Drone image size:     {H_drone} x {W_drone}")
 print(f"Satellite tile size (pre-resize): {tile_h_sat} x {tile_w_sat}")
 
 # ---- Overlap / strides (based on satellite tile size) ----
@@ -108,8 +122,7 @@ xs = build_starts(W_sat, tile_w_sat, stride_w)
 
 print(f"rows: {len(ys)}  cols: {len(xs)}  -> total tiles: {len(ys) * len(xs)}")
 
-
-# ---- Generate tiles: crop from original sat, then upscale to drone size ----
+# ---- Generate tiles: crop from original sat, then upscale to tile_rescaled_side ----
 count = 0
 for y0 in ys:
     y1 = min(y0 + tile_h_sat, H_sat)
@@ -119,10 +132,10 @@ for y0 in ys:
         if tile.size == 0:
             continue
 
-        # Resize each tile to the drone image size before feature extraction
+        # Resize each tile to the chosen RESCALED size (square, side = drone_diag)
         tile_rescaled = cv2.resize(
             tile,
-            (W_drone, H_drone),
+            (tile_rescaled_side, tile_rescaled_side),
             interpolation=cv2.INTER_LINEAR,
         )
 
@@ -131,10 +144,17 @@ for y0 in ys:
         cv2.imwrite(str(out_path), tile_rescaled)
         count += 1
 
-
 print(f"Wrote {count} overlapping, rescaled tiles to: {out_dir}")
 
-# Save the *rescaled* tile size (what downstream code will see)
+# Save the tile and scaling info.
+# Format:
+#   stride_h stride_w tile_h_sat tile_w_sat tile_h_rescaled tile_w_rescaled scale_sat_to_drone
 with open(out_dir / "a_tile_size.txt", "w") as f:
-    f.write(f"{stride_h} {stride_w} {tile_h_sat} {tile_w_sat} {H_drone} {W_drone} {np.float64(scale_sat_to_drone)}\n")
-print(f"Wrote rescaled tile size to: {out_dir / 'a_tile_size.txt'}")
+    f.write(
+        f"{stride_h} {stride_w} "
+        f"{tile_h_sat} {tile_w_sat} "
+        f"{tile_rescaled_side} {tile_rescaled_side} "
+        f"{np.float64(scale_sat_to_drone)}\n"
+    )
+
+print(f"Wrote tile size info to: {out_dir / 'a_tile_size.txt'}")
