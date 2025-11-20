@@ -5,7 +5,7 @@ from lightglue import SuperPoint
 from lightglue.utils import load_image, rbd
 
 Base_dir = Path(__file__).parent.resolve() 
-SAT_DIR   = Base_dir / "UAV_VisLoc_dataset/03/sat_tiles_overlap_scaled"
+SAT_DIR   = Base_dir / "UAV_VisLoc_dataset/03/sat_tiles_overlap"
 output_dir = Base_dir / "UAV_VisLoc_dataset/03/superpoint_features/03"
 
 

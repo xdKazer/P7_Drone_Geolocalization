@@ -37,7 +37,7 @@ DATASET_DIR = BASE / "UAV_VisLoc_dataset"
 SAT_LONG_LAT_INFO_DIR = DATASET_DIR / "satellite_coordinates_range.csv"
 DRONE_INFO_DIR = DATASET_DIR / sat_number / f"{sat_number}.csv"
 DRONE_IMG_CLEAN = DATASET_DIR / sat_number / "drone"  
-SAT_DIR   = DATASET_DIR / sat_number / "sat_tiles_overlap_scaled" 
+SAT_DIR   = DATASET_DIR / sat_number / "sat_tiles_overlap" 
 OUT_DIR_CLEAN   = BASE / "outputs" / sat_number
 OUT_OVERALL_SAT_VIS_PATH = OUT_DIR_CLEAN / f"overall_overlay_on_sat.png"
 
@@ -59,18 +59,15 @@ TILE_WH_DIR = SAT_DIR / "a_tile_size.txt"
 # a_tile_size.txt format:
 #   stride_h stride_w tile_h_sat tile_w_sat H_drone W_drone scale_sat_to_drone
 with open(TILE_WH_DIR) as f:
-    sh_str, sw_str, h_sat_str, w_sat_str, h_drone_str, w_drone_str, scale_str = f.read().strip().split()
+    stride_h_str, stride_w_str, tile_h_str, tile_w_str, scale_str = f.read().strip().split()
 
-STRIDE_Y = int(sh_str)         # stride in ORIGINAL sat px (vertical)
-STRIDE_X = int(sw_str)         # stride in ORIGINAL sat px (horizontal)
+Stride_H  = int(stride_h_str)       
+Stride_W  = int(stride_w_str)  
+TILE_H = int(tile_h_str)     
+TILE_W = int(tile_w_str)
 
-TILE_H_ORIGINAL  = int(h_sat_str)       # tile height in ORIGINAL sat px
-TILE_W_ORIGINAL  = int(w_sat_str)       # tile width  in ORIGINAL sat px
-
-TILE_H_RESCALED = int(h_drone_str)  # expected drone / resized-tile height
-TILE_W_RESCALED = int(w_drone_str)  # expected drone / resized-tile width
-
-SCALE_SAT_TILE_ORG_TO_RESCALED = float(scale_str)  # tile_px = sat_original_px * SCALE_SAT_TILE_ORG_TO_RESCALED
+SCALE_TILE_TO_DRONE = float(scale_str)   #How many drone-pixels correspond to one satellite pixel. 
+# This is needed for downsampling of drone img
 
 ########################################################################################
 # --------------------- Helpers and EKF Class -------------------------------------------
@@ -352,7 +349,7 @@ def latlon_to_orig_xy(lat, lon, SAT_LONG_LAT_INFO_DIR, sat_number, SAT_DISPLAY_M
     v = (np.float64(lat) - LT_lat) / (RB_lat - LT_lat) * sat_H
     return u, v
 
-def get_visualisation_parameters(H_orig2tile, TILE_SCALE, DRONE_ORIGINAL_W, DRONE_ORIGINAL_H, x_off, y_off):
+def get_visualisation_parameters(H_orig2tile, DRONE_ORIGINAL_W, DRONE_ORIGINAL_H, x_off, y_off):
     """
     Given homography from original drone image to UPSCALED tile pixels (H_orig2tile), tile scale, original drone image size, 
     and tile offsets (x_off, y_off) in ORIGINAL satellite pixels, compute:
@@ -370,14 +367,10 @@ def get_visualisation_parameters(H_orig2tile, TILE_SCALE, DRONE_ORIGINAL_W, DRON
     center_tile_px  = project_pts(H_orig2tile, center0)[0].astype(np.float64)
     forward_tile_px = project_pts(H_orig2tile, forward0)[0].astype(np.float64)
 
-    # 3) Convert TILE → LOCAL ORIGINAL SATELLITE
-    center_original_tile  = center_tile_px  / TILE_SCALE
-    forward_original_tile = forward_tile_px / TILE_SCALE
-
     # 4) LOCAL → GLOBAL ORIGINAL SATELLITE using tile offset
     offset = np.array([x_off, y_off], dtype=np.float64)
-    center_global  = center_original_tile  + offset
-    forward_global = forward_original_tile + offset
+    center_global  = center_tile_px  + offset
+    forward_global = forward_tile_px + offset
 
     # 5) Heading vector
     v_pred = forward_global - center_global
@@ -386,13 +379,10 @@ def get_visualisation_parameters(H_orig2tile, TILE_SCALE, DRONE_ORIGINAL_W, DRON
 
     # 6) Corners for visualization
     corners0 = np.array([[0,0],[w0,0],[w0,h0],[0,h0]], dtype=np.float32)
-    center0c = np.array([[w0/2, h0/2]], dtype=np.float32)
 
     corners_tile_px = project_pts(H_orig2tile, corners0)
-    center_tile_px2 = project_pts(H_orig2tile, center0c)[0]
 
-    corners_local = corners_tile_px / TILE_SCALE
-    corners_global = corners_local + offset
+    corners_global = corners_tile_px + offset
 
     return center_global, corners_global, heading_unitvec_meas
 
@@ -566,73 +556,57 @@ def load_feats_pt_batched(pt_path: Path, device: str):
     feats_r = rbd(feats_b)
     return feats_b, feats_r
 
-def get_confidence_meas(num_inliers,
-                        avg_conf,
-                        median_err_px,
-                        shape_conf,
-                        s_err=2.5,   # reproj error scaling
-                        n_min=10,   # below this, ignore reproj error
-                        n_opt=35,   # above this, reproj error at max weight
-                        alpha_max=0.7,  # max weight of reproj error
-                        beta_min=0.2,   # min weight of shape vs LG
-                        beta_max=0.6):  # max weight of shape vs LG
+def get_confidence_meas(
+    num_inliers,
+    avg_conf,
+    median_err_px,
+    shape_conf,
+    s_err=2.5,      # reproj error scaling
+    n_err_min=60,   # only use reprojection error if inliers >= this
+    alpha_err=0.2   # fixed weight for reprojection error when used
+):
     """
-    Combined confidence:
-      - avg_conf: LightGlue confidence in [0,1]
-      - median_err_px: median reprojection error (px)
-      - shape_conf: shape confidence score [0,1] (convexity + side lengths)
-      - num_inliers: inlier count
+    Confidence with:
+      - ALWAYS equal weight between LightGlue and shape:
+            c_prior = 0.5 * c_lg + 0.5 * c_shape
+      - OPTIONAL small influence from reprojection error c_err
+        when num_inliers >= n_err_min.
 
-    Design:
-      1) Combine LightGlue + shape into a "prior" confidence:
-           c_prior = (1 - beta)*c_lg + beta*c_shape
-         where beta grows with num_inliers (we trust shape more when H is well supported).
+    Inputs:
+      num_inliers   : number of inliers
+      avg_conf      : LightGlue avg confidence (0..1)
+      median_err_px : median reprojection error in pixels
+      shape_conf    : shape/scale score (0..1)
 
-      2) Mix this prior with reprojection error, controlled by alpha(num_inliers):
-           conf = (1 - alpha)*c_prior + alpha*c_err
-
-      alpha behavior:
-        * N < n_min  -> alpha = 0   (ignore reprojection error)
-        * n_min..n_opt -> ramp alpha from 0 .. alpha_max
-        * N >= n_opt -> alpha = alpha_max
-
-      beta behavior:
-        * N small -> beta ~ beta_min (shape has some influence but LG dominates)
-        * N large -> beta ~ beta_max (shape and LG more balanced)
+    Behavior:
+      - If avg_conf <= 0 or num_inliers <= 0 -> return 0.
+      - Base confidence:
+            c_prior = 0.5 * c_lg + 0.5 * c_shape
+      - If num_inliers < n_err_min or median_err_px is not finite:
+            conf = c_prior
+      - Else:
+            c_err = exp(-(median_err_px / s_err)^2)
+            conf  = (1 - alpha_err) * c_prior + alpha_err * c_err
     """
+
     # basic guards
-    if avg_conf <= 0 or num_inliers <= 0 or not np.isfinite(median_err_px):
+    if avg_conf <= 0 or num_inliers <= 0:
         return 0.0
 
-    # --- base confidences (clipped to [0,1]) ---
     c_lg    = float(np.clip(avg_conf, 0.0, 1.0))
     c_shape = float(np.clip(shape_conf if np.isfinite(shape_conf) else 0.0, 0.0, 1.0))
-    c_err   = float(np.exp(- (median_err_px / s_err) ** 2))  # in [0,1]
 
-    # --- inlier-dependent ramp variable t in [0,1] ---
-    if n_opt <= n_min:
-        t = 1.0  # safety fallback
-    else:
-        t = (num_inliers - n_min) / float(n_opt - n_min)
-        t = max(0.0, min(1.0, t))
+    # --- always 50/50 LG & shape ---
+    c_prior = 0.5 * c_lg + 0.5 * c_shape
 
-    # --- alpha: weight on reprojection error ---
-    if num_inliers < n_min:
-        alpha = 0.0            # ignore reprojection error when we barely have a model
-    else:
-        alpha = alpha_max * t  # ramp up to alpha_max
+    # --- if not enough inliers or bad error -> ignore reprojection term ---
+    if num_inliers < n_err_min or not np.isfinite(median_err_px):
+        return float(np.clip(c_prior, 0.0, 1.0))
 
-    # --- beta: weight for shape vs LightGlue in the prior ---
-    # small N => shape still used but LG dominates
-    # large N => shape has more influence (we trust H geometry more)
-    beta = beta_min + (beta_max - beta_min) * t
-    beta = float(np.clip(beta, 0.0, 1.0))
+    # --- small reprojection-error term as a nudge, not a dictator ---
+    c_err = float(np.exp(- (median_err_px / s_err) ** 2))  # 0..1
 
-    # --- prior confidence from LG + shape ---
-    c_prior = (1.0 - beta) * c_lg + beta * c_shape
-
-    # --- final convex combination with reprojection error ---
-    conf = (1.0 - alpha) * c_prior + alpha * c_err
+    conf = (1.0 - alpha_err) * c_prior + alpha_err * c_err
     return float(np.clip(conf, 0.0, 1.0))
 
 # ---------------------- homography convexity check ----------------------
@@ -980,15 +954,15 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
     ellipse_bbox_coords = ellipse_bbox(x_pred[:2], sigma, k=k, n=72) # this uses SVD to determine viedest axes and orienation of ellipse to get bbx
 
     # -------------------- Determine tiles in search area --------------------
-    selected_tiles = tiles_in_bbox(ellipse_bbox_coords, TILE_W_ORIGINAL, TILE_H_ORIGINAL, all_tile_names)
+    selected_tiles = tiles_in_bbox(ellipse_bbox_coords, TILE_W, TILE_H, all_tile_names)
 
     # -------------------- Rotate drone image & extract features --------------------
     if feat == "sift":
         R_orig2rot = np.eye(3, dtype=np.float64)
         with torch.inference_mode():
             img0_t = load_image(str(DRONE_IMG)).to("cpu")
-            feats_drone_b = extractor.extract(img0_t)
-            feats_drone_r = rbd(feats_drone_b)
+            feats_drone_b_scaled = extractor.extract(img0_t)
+            feats_drone_r_scaled = rbd(feats_drone_b_scaled)
         bgr_rot = cv2.imread(str(DRONE_IMG), cv2.IMREAD_COLOR)
         drone_rot_size = (bgr_rot.shape[1], bgr_rot.shape[0])  # (W,H)
         DRONE_IMG_FOR_VIZ = DRONE_IMG
@@ -1029,15 +1003,23 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
         # -------------------- Extract features from rotated drone image --------------------
 
         with torch.inference_mode():
+            # SCALE drone img to match sat tiles
+            scale_drone_image = 1.0 / SCALE_TILE_TO_DRONE   # sat_px_per_drone_px
+            bgr_rot_small = cv2.resize(
+                            bgr_rot,
+                            (int(wR * scale_drone_image), int(hR * scale_drone_image)),
+                            interpolation=cv2.INTER_AREA
+                        )
+
             # Convert BGR → RGB
-            rgb = cv2.cvtColor(bgr_rot, cv2.COLOR_BGR2RGB)
+            rgb = cv2.cvtColor(bgr_rot_small, cv2.COLOR_BGR2RGB)
             # Convert to float32 normalized [0,1]
             img_np = rgb.astype(np.float32) / 255.0
             # Convert to torch tensor: HWC → CHW → BCHW
             img_t = torch.from_numpy(img_np).permute(2, 0, 1).unsqueeze(0).to(device)
 
-            feats_drone_b = extractor.extract(img_t)
-            feats_drone_r = rbd(feats_drone_b)
+            feats_drone_b_scaled = extractor.extract(img_t)
+            feats_drone_r_scaled = rbd(feats_drone_b_scaled)
 
         hR, wR = bgr_rot.shape[:2]
         drone_rot_size = (wR, hR)
@@ -1074,9 +1056,10 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
                 img1_t  = load_image(str(p)).to(device if feat != "sift" else "cpu")
                 feats_tile_b = extractor.extract(img1_t)
                 feats_tile_r = rbd(feats_tile_b) # TODO save the features from drone imge for future runs
+                print(f"[info] Extracted features on-the-fly for tile {p.name}.")
 
             # -------------------- Match features --------------------
-            matches01 = matcher({"image0": feats_drone_b, "image1": feats_tile_b})
+            matches01 = matcher({"image0": feats_drone_b_scaled, "image1": feats_tile_b})
             matches01_r = rbd(matches01)
 
             matches = matches01_r.get("matches", None)
@@ -1084,8 +1067,12 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
 
             # -------------------- Estimate homography with RANSAC or DLT--------------------
             if K >= 4: # at least 4 matches to estimate homography 
-                pts_drone_np = feats_drone_r["keypoints"][matches[:, 0]].detach().cpu().numpy()
+                pts_drone_small_np = feats_drone_r_scaled["keypoints"][matches[:, 0]].detach().cpu().numpy()
                 pts_tile_np = feats_tile_r["keypoints"][matches[:, 1]].detach().cpu().numpy()
+
+                # scale pts_drone back to ORIGINAL drone px (IMPORTANT for homography estimation)
+                pts_drone_np = pts_drone_small_np * SCALE_TILE_TO_DRONE
+                # since small = full * scale  → full = small / scale
 
                 # RANSAC with MAGSAC
                 H_ransac, mask = cv2.findHomography(
@@ -1252,7 +1239,7 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
 
         # -------------------- Get visualisation parameters --------------------
         x_off, y_off = tile_offset_from_name(tile_name) # Project ORIGINAL drone corners/center (for overlays & error)
-        center_global, corners_global, heading_unitvector_measurement = get_visualisation_parameters(H_orig2tile, SCALE_SAT_TILE_ORG_TO_RESCALED, W_orig, H_orig, x_off, y_off)
+        center_global, corners_global, heading_unitvector_measurement = get_visualisation_parameters(H_orig2tile, W_orig, H_orig, x_off, y_off)
 
         ####################################### EKF + metrics for only top candidate #######################################
         if rank == 1:  # top-1 candidate
