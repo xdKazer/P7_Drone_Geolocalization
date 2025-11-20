@@ -18,6 +18,7 @@ can contain the full drone footprint at any rotation.
 BASE = Path(__file__).parent.resolve()
 dataset_path = BASE / "UAV_VisLoc_dataset"
 sat_number   = "03"
+size_scale = 1.2  # make the tile area larger to ensure full coverage
 
 tif_path = dataset_path / sat_number / f"satellite{sat_number}.tif"
 out_dir  = dataset_path / sat_number / "sat_tiles_overlap_scaled"
@@ -92,7 +93,7 @@ H_sat, W_sat = sat.shape[:2]
 H_drone, W_drone = drone.shape[:2]
 
 # Diagonal of the drone image (in pixels, original drone frame)
-drone_diag = math.hypot(H_drone, W_drone)
+drone_diag = math.hypot(H_drone, W_drone) * size_scale
 # We choose the RESCALED tile side (at drone scale) to be at least this diagonal.
 tile_rescaled_side = int(math.ceil(drone_diag))
 
@@ -142,6 +143,7 @@ for y0 in ys:
         # Encode original satellite pixel start indices in filename
         out_path = out_dir / f"sat_tile_y{y0}_x{x0}.png"
         cv2.imwrite(str(out_path), tile_rescaled)
+        print(f"handling number {count}: wrote tile {out_path} ")
         count += 1
 
 print(f"Wrote {count} overlapping, rescaled tiles to: {out_dir}")
@@ -158,3 +160,8 @@ with open(out_dir / "a_tile_size.txt", "w") as f:
     )
 
 print(f"Wrote tile size info to: {out_dir / 'a_tile_size.txt'}")
+effective_scale = tile_rescaled_side / tile_side_sat
+sat_m_per_px_after = sat_m_per_px / effective_scale
+print("Effective GSD after resize:", sat_m_per_px_after, "m/px")
+print("Drone GSD:", drone_m_px, "m/px")
+print("Relative error:", (sat_m_per_px_after - drone_m_px) / drone_m_px)

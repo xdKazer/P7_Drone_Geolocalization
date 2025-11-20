@@ -243,7 +243,7 @@ def _wrap_pi(a: float) -> float:
 def get_median_projection_error(H, pts0, pts1, inlier_mask):
     """ Compute median projection error confidence based on reprojection error of inliers."""
     if H is None or inlier_mask is None or not inlier_mask.any():
-        return 0.0
+        return np.inf # no homography or no inliers
 
     idx = np.where(inlier_mask)[0]
     p0 = pts0[idx].astype(np.float64)
@@ -566,48 +566,99 @@ def load_feats_pt_batched(pt_path: Path, device: str):
     feats_r = rbd(feats_b)
     return feats_b, feats_r
 
-def get_confidence_meas(num_inliers, avg_conf, median_err_px,
-                        s_err=3, w=(0.5, 0.5)): # TODO tune if needed (LightGlue score pulls the avg down!!!)
+def get_confidence_meas(num_inliers,
+                        avg_conf,
+                        median_err_px,
+                        shape_conf,
+                        s_err=2.5,   # reproj error scaling
+                        n_min=10,   # below this, ignore reproj error
+                        n_opt=35,   # above this, reproj error at max weight
+                        alpha_max=0.7,  # max weight of reproj error
+                        beta_min=0.2,   # min weight of shape vs LG
+                        beta_max=0.6):  # max weight of shape vs LG
     """
-    Compute an absolute confidence score in [0,1] based on:
-    - num_inliers: number of inlier matches
-    - avg_conf: average matching confidence [0,1]
-    - median_err_px: median reprojection error in pixels
+    Combined confidence:
+      - avg_conf: LightGlue confidence in [0,1]
+      - median_err_px: median reprojection error (px)
+      - shape_conf: shape confidence score [0,1] (convexity + side lengths)
+      - num_inliers: inlier count
 
-    s_err: scaling factor for reproj error. higher = more error tolerated for high score.
-    w: weights for (inliers, avg_conf, err_score)
+    Design:
+      1) Combine LightGlue + shape into a "prior" confidence:
+           c_prior = (1 - beta)*c_lg + beta*c_shape
+         where beta grows with num_inliers (we trust shape more when H is well supported).
+
+      2) Mix this prior with reprojection error, controlled by alpha(num_inliers):
+           conf = (1 - alpha)*c_prior + alpha*c_err
+
+      alpha behavior:
+        * N < n_min  -> alpha = 0   (ignore reprojection error)
+        * n_min..n_opt -> ramp alpha from 0 .. alpha_max
+        * N >= n_opt -> alpha = alpha_max
+
+      beta behavior:
+        * N small -> beta ~ beta_min (shape has some influence but LG dominates)
+        * N large -> beta ~ beta_max (shape and LG more balanced)
     """
+    # basic guards
     if avg_conf <= 0 or num_inliers <= 0 or not np.isfinite(median_err_px):
         return 0.0
-    err_score    = np.exp(- (median_err_px / s_err)**2)
-    w_avg_c, w_err = w
-    return float(np.clip(w_avg_c*avg_conf + w_err*err_score, 0.0, 1.0))
+
+    # --- base confidences (clipped to [0,1]) ---
+    c_lg    = float(np.clip(avg_conf, 0.0, 1.0))
+    c_shape = float(np.clip(shape_conf if np.isfinite(shape_conf) else 0.0, 0.0, 1.0))
+    c_err   = float(np.exp(- (median_err_px / s_err) ** 2))  # in [0,1]
+
+    # --- inlier-dependent ramp variable t in [0,1] ---
+    if n_opt <= n_min:
+        t = 1.0  # safety fallback
+    else:
+        t = (num_inliers - n_min) / float(n_opt - n_min)
+        t = max(0.0, min(1.0, t))
+
+    # --- alpha: weight on reprojection error ---
+    if num_inliers < n_min:
+        alpha = 0.0            # ignore reprojection error when we barely have a model
+    else:
+        alpha = alpha_max * t  # ramp up to alpha_max
+
+    # --- beta: weight for shape vs LightGlue in the prior ---
+    # small N => shape still used but LG dominates
+    # large N => shape has more influence (we trust H geometry more)
+    beta = beta_min + (beta_max - beta_min) * t
+    beta = float(np.clip(beta, 0.0, 1.0))
+
+    # --- prior confidence from LG + shape ---
+    c_prior = (1.0 - beta) * c_lg + beta * c_shape
+
+    # --- final convex combination with reprojection error ---
+    conf = (1.0 - alpha) * c_prior + alpha * c_err
+    return float(np.clip(conf, 0.0, 1.0))
 
 # ---------------------- homography convexity check ----------------------
 
-def is_homography_convex(H, img_w, img_h):
+def is_homography_convex_and_side_lenghts(H, img_w, img_h):
     """
     Check if the homography H maps the drone image (0..w, 0..h) corners
-    to a convex quadrilateral in the target (tile) image.
+    to a convex quadrilateral in the target (tile) image. Also compute side lengths.
 
     Args:
         H: 3x3 homography (drone -> tile)
         img_w, img_h: width and height of the drone image that H is defined for
 
     Returns:
-        (is_convex: bool, warped_corners: np.ndarray of shape (4, 2))
-
-        warped_corners are in the target (tile) coordinate system.
+        is_convex: bool, 
+        sides: (4,) array of side lengths (top, right, bottom, left)
     """
     if H is None:
-        return False
+        return False, None
     
     # 4 corners of the drone image
     corners0 = np.array([
-        [0,      0     ],
-        [img_w,  0     ],
-        [img_w,  img_h ],
-        [0,      img_h ],
+        [0,      0     ], # top-left
+        [img_w,  0     ], # top-right
+        [img_w,  img_h ], # bottom-right
+        [0,      img_h ], # bottom-left
     ], dtype=np.float32)
 
     # warp them with your existing helper
@@ -615,13 +666,59 @@ def is_homography_convex(H, img_w, img_h):
 
     # finite check (avoid NaNs / infs)
     if not np.isfinite(corners_warped).all():
-        return False
+        return False, None
+    
+    sides = np.array([
+        np.linalg.norm(corners_warped[1] - corners_warped[0]),
+        np.linalg.norm(corners_warped[2] - corners_warped[1]),
+        np.linalg.norm(corners_warped[3] - corners_warped[2]),
+        np.linalg.norm(corners_warped[0] - corners_warped[3]),
+    ])
 
     # use OpenCV convexity test
     cnt = corners_warped.reshape(-1, 1, 2).astype(np.float32)
     is_convex = bool(cv2.isContourConvex(cnt))
 
-    return is_convex
+    return is_convex, sides
+
+def get_homography_shape_score(sides, img_w, img_h,
+                               tau_pair=0.2, tau_ar=0.2): # TODO tune these parameters (trial and error)
+    # tau_pair: tolerance for opposite side length consistency
+    # tau_ar: tolerance for aspect ratio consistency
+    """
+    Score in [0,1] telling how rectangle-like the warped drone image is,
+    based on side lengths and known drone aspect ratio.
+
+    sides: array-like [top, right, bottom, left]
+    """
+    if sides is None:
+        return 0.0
+
+    sides = np.asarray(sides, dtype=np.float64)
+    if sides.shape[0] != 4 or np.any(sides < 1e-3) or not np.isfinite(sides).all():
+        return 0.0
+
+    lT, lR, lB, lL = sides  # top, right, bottom, left
+
+    # 1) Opposite side consistency
+    d_w = abs(lT - lB) / (lT + lB + 1e-6)  # top vs bottom
+    d_h = abs(lR - lL) / (lR + lL + 1e-6)  # right vs left
+    s_w = float(np.exp(- (d_w / tau_pair) ** 2))
+    s_h = float(np.exp(- (d_h / tau_pair) ** 2))
+
+    # 2) Aspect ratio consistency
+    w_est = 0.5 * (lT + lB)
+    h_est = 0.5 * (lR + lL)
+
+    r_est = w_est / (h_est + 1e-6)
+    r0    = img_w / float(img_h)
+
+    ratio_err = np.log(r_est / (r0 + 1e-6))  # 0 if equal
+    s_ar = float(np.exp(- (ratio_err / tau_ar) ** 2))
+
+    # 3) Final shape score
+    shape_score = (s_w + s_h + s_ar) / 3.0
+    return float(np.clip(shape_score, 0.0, 1.0))
 
 
 # ---------------------- search region ----------------------
@@ -746,7 +843,7 @@ matcher = LightGlue(features=feat).eval().to(device)
 with open(CSV_FINAL_RESULT_PATH, "a", newline="") as f:
                 w = csv.writer(f)
                 w.writerow(["drone_image", "tile", "total_matches", "search_tiles", "inliers", "avg_confidence", 
-                            "median_reproj_error_px", "overall_confidence", 
+                            "median_reproj_error_px",  "shape_score", "overall_confidence", 
                             "x_meas", "y_meas", "phi_meas_deg",
                             "x_ekf", "y_ekf", "phi_ekf_deg",
                             "dx", "dy", 
@@ -851,8 +948,8 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
         if visualisations_enabled:  
             overlay_img = cv2.imread(str(OUT_OVERALL_SAT_VIS_PATH), cv2.IMREAD_COLOR)
             start_x, start_y = x0[0], x0[1]
-            draw_point(overlay_img, (start_x / SX, start_y / SY), color=(0,0,255), r=6)
-            label_point(overlay_img, (start_x / SX, start_y / SY), f"Start {drone_img}", color=(0,0,255),
+            draw_point(overlay_img, (start_x / SX, start_y / SY), color=(155,155,155), r=6) # light grey
+            label_point(overlay_img, (start_x / SX, start_y / SY), f"Start {drone_img}", color=(155,155,155),
                         offset=(10,-10), font_scale=0.5, thickness=1)
             draw_ellipse(overlay_img, (start_x / SX, start_y / SY), ekf.P[:2, :2] / (SX*SY), k_sigma=k, color=(255,0,0), thickness=2)
             cv2.imwrite(str(OUT_OVERALL_SAT_VIS_PATH), overlay_img)
@@ -960,6 +1057,8 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
             overall_conf = float("-inf")   
             K = 0
             H = None
+            is_convex_dlt = False
+            shape_conf = 0.0
             H_ransac = None
             H_dlt = None
             inlier_mask = None
@@ -983,18 +1082,21 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
             matches = matches01_r.get("matches", None)
             K = int(matches.shape[0]) if (matches is not None and matches.numel() > 0) else 0
 
-            if K >= 4:
+            # -------------------- Estimate homography with RANSAC or DLT--------------------
+            if K >= 4: # at least 4 matches to estimate homography 
                 pts_drone_np = feats_drone_r["keypoints"][matches[:, 0]].detach().cpu().numpy()
                 pts_tile_np = feats_tile_r["keypoints"][matches[:, 1]].detach().cpu().numpy()
 
+                # RANSAC with MAGSAC
                 H_ransac, mask = cv2.findHomography(
                     pts_drone_np, pts_tile_np, method=cv2.USAC_MAGSAC,
                     ransacReprojThreshold=3.0, confidence=0.999
                 ) 
                 # check for convexity of H_ransac
-                if is_homography_convex(H_ransac, drone_rot_size[0], drone_rot_size[1]) == False:
+                is_convex, sides_ransac =is_homography_convex_and_side_lenghts(H_ransac, drone_rot_size[0], drone_rot_size[1]) #original drone size for convexity check
+                if is_convex == False:
                     continue # skip non-convex homographies
-
+                # get inlier count and avg confidence from LG
                 if mask is not None:
                     inlier_mask = mask.ravel().astype(bool)
                     num_inliers = int(inlier_mask.sum())
@@ -1003,37 +1105,69 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
                     if scores_t is not None and num_inliers > 0:
                         scores_np = scores_t.detach().cpu().numpy()
                         avg_conf = float(np.mean(scores_np[inlier_mask]))
-                
-                #using DLT on inliers for better accuracy
-                if H_ransac is not None and num_inliers >= 4:
-                    H_dlt, _ = cv2.findHomography(pts_drone_np[inlier_mask], pts_tile_np[inlier_mask], method=0)
-                    
-                # check which gives the best reprojection error
-                H_candidates = [H_ransac, H_dlt]
-                best_median_err = float("inf")
-                for H_cand in H_candidates:
-                    median_err_cand = get_median_projection_error(H_cand, pts_drone_np, pts_tile_np, inlier_mask)
-                    if median_err_cand < best_median_err:
-                        best_median_err = median_err_cand
-                        H = H_cand
 
+                # compute shape score and median reprojection error for RANSAC H
+                shape_ransac = get_homography_shape_score(sides_ransac, drone_rot_size[0], drone_rot_size[1])
+                median_projection_err_ransac = get_median_projection_error(
+                        H_ransac, pts_drone_np, pts_tile_np, inlier_mask
+                    )
+
+            
+                
+                #--------------- Optional DLT refinement ---------------
+                if H_ransac is not None and num_inliers >= 8: # at least 8 inliers to use DLT otherwise unstable
+                    H_dlt, _ = cv2.findHomography(pts_drone_np[inlier_mask], pts_tile_np[inlier_mask], method=0)
+                    is_convex_dlt, sides_dlt = is_homography_convex_and_side_lenghts(H_dlt, drone_rot_size[0], drone_rot_size[1])
+
+                # ---------- Decide between RANSAC and DLT ----------------------
+                #   We use both reprojection error and shape score to decide which one to keep.
+                #   Reprojection error will always be better for DLT but if we have a good RANSAC
+                if is_convex_dlt == False: # if DLT is not convex, use RANSAC
+                    H = H_ransac
+                    shape_conf = shape_ransac
+                    median_projection_err = median_projection_err_ransac
+                    print(f"[info] RANSAC used, shape score RANSAC {shape_ransac:.4f}, on tile {p.name} with {num_inliers} inliers.")
+                   
+                else:
+                    # compute shape score for DLT
+                    shape_dlt = get_homography_shape_score(sides_dlt, drone_rot_size[0], drone_rot_size[1])
+                    median_projection_err_dlt = get_median_projection_error(
+                        H_dlt, pts_drone_np, pts_tile_np, inlier_mask
+                    )
+                    # both exist, enough inliers: use DLT only if better in shape
+                    if shape_dlt > shape_ransac: 
+                        H = H_dlt
+                        shape_conf = shape_dlt
+                        median_projection_err = median_projection_err_dlt
+                        print(f"[info] DLT used, shape score RANSAC {shape_ransac:.4f}, DLT: {shape_dlt:.4f} on tile {p.name} with {num_inliers} inliers.")
+                    else: # keep RANSAC
+                        H = H_ransac
+                        shape_conf = shape_ransac
+                        median_projection_err = median_projection_err_ransac
+                        print(f"[info] RANSAC used, shape score RANSAC {shape_ransac:.4f}, DLT: {shape_dlt:.4f} on tile {p.name} with {num_inliers} inliers.")
+
+                # ---------- Overall Confidence ----------
                 if H is not None:
-                    median_projection_err = best_median_err
-                    overall_conf = get_confidence_meas(num_inliers, avg_conf, median_projection_err)
-                    if overall_conf > best_conf: # keep best H
+                    overall_conf = get_confidence_meas(
+                        num_inliers, avg_conf, median_projection_err, shape_conf
+                    )
+
+                    # ---------- Keep best homography across tiles ----------
+                    if overall_conf > best_conf:  
                         H_best = H
                         best_conf = overall_conf
-                        # we need to save these for visualizations later
                         best_pts_drone_np = pts_drone_np
                         best_pts_tile_np = pts_tile_np
                         best_inlier_mask = inlier_mask
-                        
+
+            # -------------------- Save per-tile score --------------------           
             scores_small.append({
                 "tile": p,
                 "inliers": num_inliers,
                 "total_matches": K,
                 "avg_conf": avg_conf,
                 "median_err": median_projection_err,  
+                "shape_score": shape_conf,
                 "overall_conf": overall_conf,
                 "sort_key": (overall_conf, - median_projection_err), # prioritize overall confidence, then lower reproj error
             })
@@ -1043,7 +1177,7 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
     if visualisations_enabled:
         with open(CSV_RESULT_PATH, "w", newline="") as f:
             w = csv.writer(f)
-            w.writerow(["tile", "total_matches", "inliers", "avg_confidence", "median_reproj_error", "overall_conf"
+            w.writerow(["tile", "total_matches", "inliers", "avg_confidence", "median_reproj_error", "shape_score", "overall_conf"
                         ])
             for r in scores_small:
                 w.writerow([
@@ -1052,6 +1186,7 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
                     r["inliers"],
                     "" if not math.isfinite(r["avg_conf"]) else f"{r['avg_conf']:.4f}",
                     "" if not math.isfinite(r["median_err"]) else f"{r['median_err']:.4f}",
+                    "" if not math.isfinite(r["shape_score"]) else f"{r['shape_score']:.4f}",
                     "" if not math.isfinite(r["overall_conf"]) else f"{r['overall_conf']:.4f}"
                 ])
 
@@ -1228,6 +1363,7 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
                     num_inliers,
                     avg_confidence,
                     f"{median_reproj_error_px:.4f}",
+                    f"{shape_conf:.4f}",
                     f"{overall_confidence:.4f}",
                     f"{meas_x_px:.4f}", f"{meas_y_px:.4f}", f"{meas_phi_deg:.4f}",
                     f"{x_updated[0]:.4f}", f"{x_updated[1]:.4f}", f"{x_updated[3]:.4f}",
