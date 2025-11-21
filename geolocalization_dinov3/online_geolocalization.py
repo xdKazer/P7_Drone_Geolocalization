@@ -307,7 +307,7 @@ def locate_drone_position(
     fine_kernel_size,
     device='cuda'
 ):
-    # Normalize drone features
+# Normalize drone features
     drone_features = F.normalize(drone_features.to(device), dim=-1)
 
     num_tiles_rows = len(sat_features)
@@ -324,6 +324,14 @@ def locate_drone_position(
     best_score = -float('inf')
     best_pos = None
 
+    # Build a coordinate grid matching feature_grid indices
+    coord_grid = []
+    for yi, y in enumerate(ys):
+        row_coords = []
+        for xi, x in enumerate(xs):
+            row_coords.append((x, y))
+        coord_grid.append(row_coords)
+
     # Coarse search over feature_grid
     for row in range(valid_rows):
         for col in range(valid_cols):
@@ -332,16 +340,16 @@ def locate_drone_position(
                 for c in range(col, col + kernel_size):
                     tile_feat = torch.cat([b.to(device) for b in sat_features[r][c]], dim=0)
                     kernel_tiles.append(tile_feat)
-            kernel_features = torch.cat(kernel_tiles, dim=0)
+            kernel_features = torch.cat(kernel_tiles, dim=0).to(device)
             kernel_features = F.normalize(kernel_features, dim=-1)
 
             similarity = torch.matmul(drone_features, kernel_features.T)
-            top_k = max(1, kernel_features.shape[0] // 1000) # top 0.1% matches
-            mean_topk = similarity.flatten().topk(top_k)[0].mean().item()
-            heatmap[row, col] = mean_topk
+            sim_weights = torch.softmax(similarity.flatten()/0.0001, dim=0)
+            score = (similarity.flatten() * sim_weights).sum().item()
+            heatmap[row, col] = score
 
-            if mean_topk > best_score:
-                best_score = mean_topk
+            if score > best_score:
+                best_score = score
                 best_pos = (row, col)
 
             del kernel_features, similarity
@@ -351,62 +359,52 @@ def locate_drone_position(
     row, col = best_pos
     crop_left   = col * tile_width
     crop_right  = (col + kernel_size) * tile_width
-    crop_top    = (num_tiles_rows - (row + kernel_size)) * tile_height
-    crop_bottom = crop_top + kernel_size * tile_height
+    crop_top    = row * tile_height
+    crop_bottom = (row + kernel_size) * tile_height
 
     # NOTE: winner_x / winner_y should be passed in from metadata if available
-    winner_y = ys[row]
-    winner_x = xs[col]
+    winner_x, winner_y = coord_grid[row][col]
 
-    patch = Image.fromarray(sat_patches[crop_top:crop_bottom, crop_left:crop_right, :])
+    print(f"Best coarse match at tile grid ({row}, {col})")
+    print(coord_grid)
 
-    # -----------------------------
-    # Fine-grained processing
-    # -----------------------------
+    features_to_load = "tile_y{}_x{}.pt".format(winner_y, winner_x)
+    path_to_features = Path("geolocalization_dinov3/tile_features") / features_to_load
 
-    # Reconstruct true coarse patch grid from tiles
-    tile_feature_blocks = []
-    for r in range(row, row + kernel_size):
-        row_blocks = []
-        for c in range(col, col + kernel_size):
-            tile_feat_list = sat_features[r][c]
-            # Concatenate all feature blocks
-            tile_feat = torch.cat([b.to(device) for b in tile_feat_list], dim=0)
-            h_patch = int(np.sqrt(tile_feat.shape[0]))
-            w_patch = tile_feat.shape[0] // h_patch
-            D = tile_feat.shape[1]
-            tile_grid = tile_feat[:h_patch*w_patch].view(h_patch, w_patch, D)
-            row_blocks.append(tile_grid)
-        # Concatenate tiles horizontally
-        row_grid = torch.cat(row_blocks, dim=1)
-        tile_feature_blocks.append(row_grid)
-    # Concatenate rows vertically
-    coarse_patch_grid = torch.cat(tile_feature_blocks, dim=0)  # shape: (Hbig, Wbig, D)
+    tile_feat_list = torch.load(path_to_features, map_location=device, weights_only=True)  # shape: (N, D)
+    tile_feat = torch.cat(tile_feat_list, dim=0)
 
-    # Split coarse_patch_grid into fine tiles
-    patch_width, patch_height = patch.size
-    num_tiles_width  = 4 * 4
-    num_tiles_height = 3 * 4
-    Hbig, Wbig, D = coarse_patch_grid.shape
-    h_step = Hbig // num_tiles_height
-    w_step = Wbig // num_tiles_width
+    # Determine fine-grained grid
+    D = tile_feat.shape[1]
+    Hbig = 32
+    Wbig = 37
+    tile_feat = tile_feat[:Hbig*Wbig]
+    tile_grid = tile_feat.view(Hbig, Wbig, D)
+
+    # Split into fine tiles
+    num_tiles_width = Wbig
+    num_tiles_height = Hbig
 
     patch_features_list = []
-    for i in range(num_tiles_height):
-        h_start = i * h_step
-        h_end = (i+1)*h_step if i < num_tiles_height-1 else Hbig
-        for j in range(num_tiles_width):
-            w_start = j * w_step
-            w_end = (j+1)*w_step if j < num_tiles_width-1 else Wbig
-            tile_feat = coarse_patch_grid[h_start:h_end, w_start:w_end, :].reshape(-1, D)
-            patch_features_list.append(tile_feat)
+    h_step = Hbig / num_tiles_height
+    w_step = Wbig / num_tiles_width
 
-    # Fine-grained heatmap
+    for i in range(num_tiles_height):
+        h_start = int(round(i * h_step))
+        h_end   = int(round((i+1) * h_step))
+        h_end = min(h_end, Hbig)  # ensure no overflow
+        for j in range(num_tiles_width):
+            w_start = int(round(j * w_step))
+            w_end   = int(round((j+1) * w_step))
+            w_end = min(w_end, Wbig)
+            patch_features_list.append(tile_grid[h_start:h_end, w_start:w_end, :].reshape(-1, D))
+
+    # Fine-grained search
     heatmap_fine = np.full((num_tiles_height - fine_kernel_size + 1,
                             num_tiles_width - fine_kernel_size + 1), -np.inf, dtype=float)
-    best_score_fine = -float('inf')
-    best_kernel_features_fine = None
-    best_pos_fine = None
+    # Initialize a min-heap of size 3 for top similarities
+    top_k = 3
+    best_scores_fine = [(-float('inf'), None)] * top_k  # [(score, (row, col)), ...]
     cosine_conf_map = np.zeros_like(heatmap_fine)
 
     for row in range(heatmap_fine.shape[0]):
@@ -419,37 +417,54 @@ def locate_drone_position(
             kernel_features = F.normalize(kernel_features, dim=-1)
 
             similarity = torch.matmul(drone_features, kernel_features.T)
-            top_k = max(1, kernel_features.shape[0] // 100) # top 1% matches
-            mean_topk = similarity.flatten().topk(top_k)[0].mean().item()
-            heatmap_fine[row, col] = mean_topk
+            sim_weights = torch.softmax(similarity.flatten()/1, dim=0)
+            sim_score = (similarity.flatten() * sim_weights).sum().item()
+            heatmap_fine[row, col] = sim_score
 
             # Normalize to [0,1] for EKF confidence
-            cosine_conf = (mean_topk + 1) / 2
+            cosine_conf = (sim_score + 1) / 2
             cosine_conf_map[row, col] = cosine_conf
 
-            if mean_topk > best_score_fine:
-                best_score_fine = mean_topk
-                best_kernel_features_fine = kernel_features.clone()
-                best_pos_fine = (row, col)
+            # Maintain top 3 scores
+            if sim_score > best_scores_fine[0][0]:
+                best_scores_fine[0] = (sim_score, (row, col))
+                best_scores_fine.sort()  # Keep smallest at index 0
                 best_cosine_conf_fine = cosine_conf
 
             del kernel_features, similarity
             torch.cuda.empty_cache()
 
-    # Map fine kernel to pixel coordinates
-    row, col = best_pos_fine
+    # Sort top 3 in descending order
+    top_scores = sorted(best_scores_fine, key=lambda x: x[0], reverse=True)
+
+    #plt.figure(figsize=(8,6))
+    #plt.imshow(heatmap_fine, cmap='hot', interpolation='nearest')
+    #plt.colorbar()
+    #plt.show()
+
+    # Crop all top 3 patches
+    coarse_patch = sat_patches[crop_top:crop_bottom, crop_left:crop_right, :]
+    patch_height, patch_width = coarse_patch.shape[:2]
     fine_tile_h = patch_height // num_tiles_height
     fine_tile_w = patch_width  // num_tiles_width
-    center_y = row * fine_tile_h + (fine_kernel_size * fine_tile_h) // 2
-    center_x = col * fine_tile_w  + (fine_kernel_size * fine_tile_w)  // 2
 
-    crop_top_fine    = max(0, center_y - (fine_kernel_size * fine_tile_h) // 2)
-    crop_left_fine   = max(0, center_x - (fine_kernel_size * fine_tile_w)  // 2)
-    crop_bottom_fine = min(patch.height, crop_top_fine + fine_kernel_size * fine_tile_h)
-    crop_right_fine  = min(patch.width,  crop_left_fine + fine_kernel_size * fine_tile_w)
+    top_patches_with_coords = []
+    for score, (row, col) in top_scores:
+        center_y = row * fine_tile_h + (fine_kernel_size * fine_tile_h) // 2
+        center_x = col * fine_tile_w  + (fine_kernel_size * fine_tile_w)  // 2
 
-    best_patch = patch.crop((crop_left_fine, crop_top_fine, crop_right_fine, crop_bottom_fine))
-    return best_patch, heatmap_fine, best_kernel_features_fine, crop_left_fine, crop_top_fine, winner_x, winner_y, [kernel_size, 4, 3, fine_kernel_size, num_tiles_height, num_tiles_width], best_cosine_conf_fine
+        crop_top_fine    = max(0, center_y - (fine_kernel_size * fine_tile_h) // 2)
+        crop_left_fine   = max(0, center_x - (fine_kernel_size * fine_tile_w)  // 2)
+        crop_bottom_fine = min(patch_height, crop_top_fine + fine_kernel_size * fine_tile_h)
+        crop_right_fine  = min(patch_width,  crop_left_fine + fine_kernel_size * fine_tile_w)
+
+        patch = Image.fromarray(coarse_patch[crop_top_fine:crop_bottom_fine,
+                                            crop_left_fine:crop_right_fine, :])
+        # Store as (patch, crop_left, crop_top)
+        top_patches_with_coords.append((patch, crop_left_fine, crop_top_fine))
+
+    # Return all top 3 patches with coordinates
+    return top_patches_with_coords, heatmap_fine, winner_x, winner_y, [kernel_size, 3, 3, fine_kernel_size, num_tiles_height, num_tiles_width], best_cosine_conf_fine
 
 
 def drone_position_homography(drone_img: Image.Image, sat_patch: Image.Image, drone_heading: float, kernel_info: list):
@@ -459,13 +474,13 @@ def drone_position_homography(drone_img: Image.Image, sat_patch: Image.Image, dr
     # The drone was reported to have a resolution of 0.1-0.2m per pixel, 0.15m per pixel seems to provide the right scale
     scale_hor =  2.167/0.15 * (kernel_info[0] / kernel_info[1]) * (kernel_info[3] / kernel_info[4])
     scale_ver =  2.234/0.15 * (kernel_info[0] / kernel_info[2]) * (kernel_info[3] / kernel_info[5])
-    print("Resizing satellite patch by factors: ", scale_hor, scale_ver)
+    #print("Resizing satellite patch by factors: ", scale_hor, scale_ver)
     new_width = int(sat_patch.width * scale_hor)
     new_height = int(sat_patch.height * scale_ver)
 
     # Resize satellite patch without cropping:
     sat_resized = sat_patch.resize((new_width, new_height), Image.LANCZOS)
-    print("Image has been resized")
+    #print("Image has been resized")
 
     # Convert to grayscale
     sat_gray = cv2.cvtColor(np.array(sat_resized), cv2.COLOR_RGB2GRAY)
@@ -496,8 +511,7 @@ def drone_position_homography(drone_img: Image.Image, sat_patch: Image.Image, dr
     superpoint = SuperPoint().eval().to(device)
     
     # Increase preprocessing resolution
-    superpoint.preprocess_conf["resize"] = 2048  # feed higher-res images
-    superpoint.default_conf["detection_threshold"] = 0.0003  # keep more weak keypoints
+    superpoint.default_conf["max_num_keypoints"] = 4096
 
     with torch.no_grad():
         kp_sat_data = superpoint.extract(sat_tensor)
@@ -507,14 +521,10 @@ def drone_position_homography(drone_img: Image.Image, sat_patch: Image.Image, dr
         kp_sat_data_r = rbd(kp_sat_data)
         kp_drone_data_r = rbd(kp_drone_data)
 
-    print("Superpoint has finished extracting keypoints.")
+    #print("Superpoint has finished extracting keypoints.")
 
     # --- LightGlue matching ---
     lightglue = LightGlue("superpoint").eval().to(device)
-
-    # Increase pruning thresholds to consider more keypoints for matching
-    lightglue.pruning_keypoint_thresholds["cuda"] = 8192
-    lightglue.pruning_keypoint_thresholds["flash"] = 16384
 
     inputs = {
         "image0": kp_drone_data,
@@ -525,7 +535,7 @@ def drone_position_homography(drone_img: Image.Image, sat_patch: Image.Image, dr
         matches_r = lightglue(inputs)
         matches = rbd(matches_r)
 
-    print("LightGlue has finished matching keypoints.")
+    #print("LightGlue has finished matching keypoints.")
 
     matches = matches.get("matches", None)
 
@@ -537,6 +547,20 @@ def drone_position_homography(drone_img: Image.Image, sat_patch: Image.Image, dr
     #kp_drone_cv = [cv2.KeyPoint(float(x), float(y), 1.0) for x, y in kp_drone_data_r["keypoints"].detach().cpu().numpy()]
     #kp_sat_cv   = [cv2.KeyPoint(float(x), float(y), 1.0) for x, y in kp_sat_data_r["keypoints"].detach().cpu().numpy()]
     #dmatches = [cv2.DMatch(int(i), int(j), 0) for i, j in matches]
+
+    #scale = 0.3
+    #vis = cv2.drawMatches(
+        #drone_gray_rotated, kp_drone_cv,
+        #sat_gray, kp_sat_cv,
+        #dmatches, None,
+        #matchColor=(0, 255, 0),
+        #singlePointColor=(255, 0, 0),
+        #flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS
+    #)
+    #vis_resized = cv2.resize(vis, (int(vis.shape[1]*scale), int(vis.shape[0]*scale)))
+    #cv2.imshow("Feature Matches", vis_resized)
+    #cv2.waitKey(0)
+    #cv2.destroyAllWindows()
 
     H = None
     sat_corners = None
@@ -558,7 +582,7 @@ def drone_position_homography(drone_img: Image.Image, sat_patch: Image.Image, dr
         reproj_conf = np.exp(-mean_reproj_error / max_error)  # decays from 1 -> 0
         print(reproj_conf)
 
-        if len(pts_drone) < 1000: # Typically we get 3000+ for good matches
+        if len(pts_drone) < 150: # Typically we get more than this for good matches
             print("Untrustworthy reprojection confidence due to low number of matches.")
             H = None
             return H, sat_corners, drone_center, [1, 1], drone_heading, reproj_conf # Return placeholder vector and prior heading if homography fails
@@ -609,7 +633,7 @@ def drone_position_homography(drone_img: Image.Image, sat_patch: Image.Image, dr
 
         # Compute center
         drone_center = np.mean(sat_corners, axis=0)
-        print(f"Estimated drone position in satellite patch pixels: x={drone_center[0]}, y={drone_center[1]}")
+        #print(f"Estimated drone position in satellite patch pixels: x={drone_center[0]}, y={drone_center[1]}")
 
         # Compute drone heading from satellite corners
         top_center = (sat_corners[0] + sat_corners[1]) / 2
@@ -638,7 +662,7 @@ if __name__ == "__main__":
     model.eval()
 
     # Itteration variables (For testing with dataset images)
-    i = 747                # Image index to process (For full set testing, start at 1)
+    i = 1                  # Image index to process (For full set testing, start at 1)
     used_dataset = 3       # This is the dataset we are using (01, 02 ..., -> 11)
     
     # Initialize EKF variables
@@ -656,9 +680,41 @@ if __name__ == "__main__":
     # Get drone heading from CSV on 'take-off' (first image) - Approximate from homography afterwards
     curr_heading = df.loc[df['num'] == i, ['Phi1']].values[0][0]  # Drone heading from CSV
 
+    curr_position = (df.loc[df['num'] == i, ['lat', 'lon']].values[0][0],
+                    df.loc[df['num'] == i, ['lat', 'lon']].values[0][1]) # Known for first itteration -- Drone take-off
+    
+    lat_long_1 = (32.355491, 119.805926) # North, East
+    lat_long_2 = (32.290290, 119.900052) # North, East
+    geo_center = ((lat_long_1[0] + lat_long_2[0]) / 2, (lat_long_1[1] + lat_long_2[1]) / 2) # Center point
+    meters_per_degree_lat = 111320
+    meters_per_degree_lon = 111320 * np.cos(np.radians(geo_center[0]))
+    geo_span = (abs(lat_long_1[0] - lat_long_2[0]), abs(lat_long_1[1] - lat_long_2[1])) # (degrees in lat, degrees in lon) - absolute value
+    geo_span_meters = (geo_span[0] * meters_per_degree_lat, geo_span[1] * meters_per_degree_lon) #  (meters in lat, meters in lon)
+    meters_per_pixel_lat = geo_span_meters[0] / 24308 # Height of full satellite image in pixels
+    meters_per_pixel_lon = geo_span_meters[1] / 35092 # Width of full satellite image in pixels
+
+    # Covert to pixels for first itteration, afterwards each update to curr, will be in pixels
+    actual_drone_y = (lat_long_1[0] - curr_position[0]) * meters_per_degree_lat / meters_per_pixel_lat
+    actual_drone_x = (curr_position[1] - lat_long_1[1]) * meters_per_degree_lon / meters_per_pixel_lon
+    curr_position = np.array([actual_drone_x, actual_drone_y])
+
     # Loop, continuously process images from drone camera feed
-    while True: # <-- Replace with loop that runs for each image in dataset (or ROS2 image callback for full onboard drone processing)
+    while i <= 97: # <-- Replace with loop that runs for each image in dataset (or ROS2 image callback for full onboard drone processing)
         start_time = time.time()
+
+        # Due to file formatting, we need to fill in leading zeros for dataset and image index (The first drone image is 0001)
+        drone_image_path = f"geolocalization_dinov3/dataset_data/drone_images/{used_dataset:02d}/{used_dataset:02d}_{i:04d}.JPG" # NOTE: Once we move to ROS2, find image without hardcoding path
+        full_sat_image = cv2.imread("geolocalization_dinov3/full_satellite_image_small.png")
+        pil_image = Image.open(drone_image_path).convert("RGB")
+
+        # Read all relevant data from CSV for error calculation
+        actual_drone_position = (df.loc[df['num'] == i, ['lat', 'lon']].values[0][0],
+                                     df.loc[df['num'] == i, ['lat', 'lon']].values[0][1])
+        #print(f"Actual drone GPS position:    lat={actual_drone_position[0]}, lon={actual_drone_position[1]}")
+        # Compute the actual drone location in pixels for plotting
+        actual_drone_y = (lat_long_1[0] - actual_drone_position[0]) * meters_per_degree_lat / meters_per_pixel_lat
+        actual_drone_x = (actual_drone_position[1] - lat_long_1[1]) * meters_per_degree_lon / meters_per_pixel_lon
+        actual_drone_curr_position = np.array([actual_drone_x, actual_drone_y])
         
         # EKF initialisation (Only occours for first image)
         if ekf is None:
@@ -831,12 +887,6 @@ if __name__ == "__main__":
         # I have done sanity checks here, which showed the satellite image and feature stitching works correctly. (Zero tiles are black, features are correct)
         # Do note that, due to overlap, visualising the stichted image, will look weird, but don't worry, only 1 tile is used for localisation.
 
-        ## Now we need to process the drone image, to extract its features for matching.
-        # Due to file formatting, we need to fill in leading zeros for dataset and image index (The first drone image is 0001)
-        drone_image_path = f"geolocalization_dinov3/dataset_data/drone_images/{used_dataset:02d}/{used_dataset:02d}_{i:04d}.JPG" # NOTE: Once we move to ROS2, find image without hardcoding path
-        full_sat_image = cv2.imread("geolocalization_dinov3/full_satellite_image_small.png")
-        pil_image = Image.open(drone_image_path).convert("RGB")
-
         # Preprocess image - Resize and convert to tensor
         image_tensor, image_resized = preprocess_image(pil_image)
 
@@ -844,48 +894,49 @@ if __name__ == "__main__":
         features = process_image_with_dino(image_tensor, model, device)
 
         # Locate drone tile position in satellite tiles
-        patch, heatmap, patch_features, crop_left, crop_top, crop_cand_left, crop_cand_top, info, feature_conf = locate_drone_position(
+        patch, heatmap, crop_cand_left, crop_cand_top, info, feature_conf = locate_drone_position(
         drone_features=features,            # Features from drone image
         sat_patches=full_img,               # Pass the satellite images that are within ellipse
         sat_features=feature_grid,          # Point to the list of features corresponds to satellite image patches
         kernel_size=1,                      # Expands kernel from top-left tile to N x N tiles
-        fine_kernel_size=9,                 # For fine grained search within each candidate
+        fine_kernel_size=28,                # For fine grained search within each candidate
         device=device                       # Use same device as model (likely 'cuda' - GPU)
         )
 
-        # From the satellite patch and the drone image, find the drone position using feature matching and homography
-        H, sat_corners, location_in_crop, heading_vec, heading_deg, reproject_conf = drone_position_homography(
-        drone_img=pil_image,               # Drone image
-        sat_patch=patch,                   # Satellite candidate patch
-        drone_heading=curr_heading,        # Drone heading from CSV
-        kernel_info=info                   # Information about kernel and tile sizes for scaling satellite image
-        )
-        curr_heading = heading_deg  # Update current heading for next iteration
+        H = None
+        sat_corners = None
+        drone_center = None
+        heading_vec = None
+        heading_deg = None
+        winner_patch_info = None  # Store the patch info that succeeded
 
-        # Convert to lat-long using inverse of earlier conversion (From satellite_image_processing.py)
-        lat_long_1 = (32.355491, 119.805926) # North, East
-        lat_long_2 = (32.290290, 119.900052) # North, East
-        geo_center = ((lat_long_1[0] + lat_long_2[0]) / 2, (lat_long_1[1] + lat_long_2[1]) / 2) # Center point
-        meters_per_degree_lat = 111320
-        meters_per_degree_lon = 111320 * np.cos(np.radians(geo_center[0]))
-        geo_span = (abs(lat_long_1[0] - lat_long_2[0]), abs(lat_long_1[1] - lat_long_2[1])) # (degrees in lat, degrees in lon) - absolute value
-        geo_span_meters = (geo_span[0] * meters_per_degree_lat, geo_span[1] * meters_per_degree_lon) #  (meters in lat, meters in lon)
-        meters_per_pixel_lat = geo_span_meters[0] / 24308 # Height of full satellite image in pixels
-        meters_per_pixel_lon = geo_span_meters[1] / 35092 # Width of full satellite image in pixels
-        
-        # Get actual drone GPS position from CSV (Lat, long and pixel position for error calculation)
-        actual_drone_position = (df.loc[df['num'] == i, ['lat', 'lon']].values[0][0],
-                                    df.loc[df['num'] == i, ['lat', 'lon']].values[0][1])
-        print(f"Actual drone GPS position:    lat={actual_drone_position[0]}, lon={actual_drone_position[1]}")
-        actual_drone_y = (lat_long_1[0] - actual_drone_position[0]) * meters_per_degree_lat / meters_per_pixel_lat
-        actual_drone_x = (actual_drone_position[1] - lat_long_1[1]) * meters_per_degree_lon / meters_per_pixel_lon
+        for idx, (patch, crop_left, crop_top) in enumerate(patch):
+            print(f"Trying homography for patch at left={crop_left}, top={crop_top}", str(idx+1) + "/3")
+            H_candidate, corners_candidate, center_candidate, vec_candidate, deg_candidate, reproj_conf = drone_position_homography(
+                drone_img=pil_image,
+                sat_patch=patch,
+                drone_heading=curr_heading,
+                kernel_info=info
+            )
 
-        actual_drone_position_pixel = np.array([actual_drone_x, actual_drone_y])
-        print(f"Actual drone position in pixels: {actual_drone_position_pixel}")
+            if H_candidate is not None:
+                # First valid homography found
+                H = H_candidate
+                sat_corners = corners_candidate
+                drone_center = center_candidate
+                heading_vec = vec_candidate
+                heading_deg = deg_candidate
+                reproject_conf = reproj_conf
+                winner_patch_info = (patch, crop_left, crop_top)
+                print(f"Valid homography found for patch at left={crop_left}, top={crop_top}")
+                break  # stop at first successful candidate
+        else:
+            print("No valid homography found for any top candidate patches.")
 
         if H is not None:
-            drone_position_candidate = location_in_crop.astype(np.float64) + np.array([crop_left, crop_top])
-            print(crop_left, crop_top, crop_cand_left, crop_cand_top)
+            curr_heading = heading_deg  # Update current heading for next iteration
+            crop_left, crop_top = winner_patch_info[1], winner_patch_info[2]
+            drone_position_candidate = drone_center.astype(np.float64) + np.array([crop_left, crop_top])
             drone_position_world = drone_position_candidate + np.array([crop_cand_left, crop_cand_top])
 
             # Convert to lat-long
@@ -923,6 +974,7 @@ if __name__ == "__main__":
             sat_corners_pixel = sat_corners + np.array([crop_left, crop_top])
             sat_corners_pixel = sat_corners_pixel + np.array([crop_cand_left, crop_cand_top])
 
+            """""
             scale = 0.3  # same scale used when resizing full image
 
             # Scale all coordinates
@@ -959,6 +1011,7 @@ if __name__ == "__main__":
             plt.axis("off")
             plt.title("Drone Rectangle & Center on Full Satellite Image (scaled)")
             plt.show()
+            """""
 
             # Added time to end of loop - measures total time for geolocalization
             end_time = time.time()
@@ -966,13 +1019,33 @@ if __name__ == "__main__":
             # Fine grained search is likely the cause of most of the time, optimizations possible. (5.7 seconds for single candidate search)
             # Depending on DINO performance, maybe just assume candidate 1 is correct?
 
+            # Generate CSV file:
+            log_data = {
+                'image_num': i,
+                'estimated_lat': EKF_lat,
+                'estimated_lon': EKF_lon,
+                'actual_lat': actual_drone_position[0],
+                'actual_lon': actual_drone_position[1],
+                'error_meters': total_error,
+                'processing_time_sec': end_time - start_time,
+                'measurement_available': True
+            }
+            log_df = pd.DataFrame([log_data])
+            log_csv_path = f"geolocalization_dinov3/dataset_data/logs/geolocalization_EKFlog_dataset_{used_dataset:02d}.csv"
+
+            # Write to CSV file for data logging:
+            if i == 1:
+                log_df.to_csv(log_csv_path, index=False, mode='w', header=True)
+            else:
+                log_df.to_csv(log_csv_path, index=False, mode='a', header=False)
+
             i += 1  # Move to next image in dataset
+
         else:
             print("Homography could not be computed for this frame. - Skipping localisation to avoid noise")
 
             # Use predicted position as measurement
             drone_position_world = x_pred[:2]  # x_pred contains [x, y, v, heading]
-            curr_heading = np.rad2deg(x_pred[3])  # Convert heading back to degrees
             
             # Assign low measurement confidence
             overall_confidence = 0.01  # very low, so EKF mostly trusts prediction
@@ -993,8 +1066,6 @@ if __name__ == "__main__":
                 f"v={x_updated[2]:.2f} px/s, phi={(x_updated[3]):.2f} deg")
             EKF_lat = lat_long_1[0] - (x_updated[1] * meters_per_pixel_lat) / meters_per_degree_lat
             EKF_lon = lat_long_1[1] + (x_updated[0] * meters_per_pixel_lon) / meters_per_degree_lon
-
-            curr_heading = x_updated[3]  # Update current heading for next iteration # Use EKF updated heading
             
             # Compute error from actual position using EKF updated position
             error_lat = abs(actual_drone_position[0] - EKF_lat) * meters_per_degree_lat
@@ -1002,6 +1073,9 @@ if __name__ == "__main__":
             total_error = np.sqrt(error_lat**2 + error_lon**2)
             print(f"Position error: {total_error:.2f} meters (Lat error: {error_lat:.2f} m, Lon error: {error_lon:.2f} m)")
 
+            end_time = time.time()
+
+            """""
             # Draw what is avalilable on full satellite image for visualisation
             scale = 0.3 
             cv2.circle(full_sat_image, tuple((actual_drone_position_pixel * scale).astype(int)), 2, (0, 255, 0), -1) # Actual position
@@ -1025,7 +1099,26 @@ if __name__ == "__main__":
             plt.axis("off")
             plt.title("Drone Position Visualization (scaled)")
             plt.show()
+            """""
 
+            # Generate CSV file:
+            log_data = {
+                'image_num': i,
+                'estimated_lat': EKF_lat,
+                'estimated_lon': EKF_lon,
+                'actual_lat': actual_drone_position[0],
+                'actual_lon': actual_drone_position[1],
+                'error_meters': total_error,
+                'processing_time_sec': end_time - start_time,
+                'measurement_available': False
+            }
+            log_df = pd.DataFrame([log_data])
+            log_csv_path = f"geolocalization_dinov3/dataset_data/logs/geolocalization_EKFlog_dataset_{used_dataset:02d}.csv"
 
-            # Increment image index to process next image
+            # Write to CSV file for data logging:
+            if i == 1:
+                log_df.to_csv(log_csv_path, index=False, mode='w', header=True)
+            else:
+                log_df.to_csv(log_csv_path, index=False, mode='a', header=False)
+
             i += 1

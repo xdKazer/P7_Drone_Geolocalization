@@ -97,23 +97,21 @@ if __name__ == "__main__":
 
     # Loop through every image in 'tiles_png_uniform' folder
     for i in range(len(tiles)):
-        print("Currently processing image: " + str(i) + " / " + str(len(tiles)))
+        print("Currently processing image: " + str(i+1) + " / " + str(len(tiles)))
         image_path = tiles[i]
 
         pil_image = Image.open(image_path).convert("RGB")
 
         # Split image into multiple tiles to minimize compression from DINOv3
         # Compute number of tiles
-        desired_tile_height = 4; desired_tile_width = 3 # I used 5x4 for 2x2km so 4x3 should be fine for 1x1km
+        desired_tile_height = 6; desired_tile_width = 6 # I used 5x4 for 2x2km so 4x3 should be fine for 1x1km
         num_tiles_width = max(round(pil_image.width / desired_tile_width), 1)
         num_tiles_height = max(round(pil_image.height / desired_tile_height), 1)
-        print(pil_image.height, pil_image.width)
 
         # Compute actual tile size in pixels
         tile_width = max(pil_image.width // num_tiles_width, 1)
         tile_height = max(pil_image.height // num_tiles_height, 1)
-
-        print(f"Tile count for satellite patch: {tile_height}x{tile_width}") # 3 tiles left, 4 tiles down
+        print(f"Tile count for satellite patch: {tile_width}x{tile_height}") # 3 x 3
         print(f"Size of tiles pixels: {num_tiles_width}x{num_tiles_height}")
 
         sat_patch_feature = []
@@ -134,7 +132,8 @@ if __name__ == "__main__":
                 features = process_image_with_dino(image_tensor, model, device)
 
                 # Add individually processed features to shared array.
-                sat_patch_feature.append(features.cpu())
+                h_patches = image_resized.shape[1] // PATCH_SIZE; w_patches = image_resized.shape[2] // PATCH_SIZE # 32 x 37
+                sat_patch_feature.append((features.cpu()))
 
         # Figure out both x and y values for current satellite patch
         name = image_path.stem

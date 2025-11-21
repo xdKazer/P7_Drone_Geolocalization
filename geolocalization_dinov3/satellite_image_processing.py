@@ -66,10 +66,6 @@ with rasterio.open(input_file) as src:
     ys = build_starts_with_fractional_overlap(src.height, tile_height_px, 0.1)
     xs = build_starts_with_fractional_overlap(src.width, tile_width_px, 0.1)
 
-    overlap_x = int(tile_width_px * 0.1)
-    overlap_y = int(tile_height_px * 0.1)
-    print(f"Tile overlap: {overlap_y} pixels (height), {overlap_x} pixels (width)")
-
     print(f"rows: {len(ys)}  cols: {len(xs)}  -> total tiles: {len(ys) * len(xs)}")
 
     count = 0
