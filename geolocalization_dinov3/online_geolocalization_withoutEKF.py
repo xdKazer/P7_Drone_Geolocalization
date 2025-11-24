@@ -477,6 +477,7 @@ if __name__ == "__main__":
     i = 1                  # Image index to process (For full set testing, start at 1)
     used_dataset = 3       # This is the dataset we are using (01, 02 ..., -> 11)
     failed_detections = 1  # Count failed homography detections - starts at 1 to avoid multi by zero
+    starting_drone_images = ["03_0001.JPG", "03_0097.JPG", "03_0193.JPG", "03_0289.JPG", "03_0385.JPG", "03_0481.JPG", "03_0577.JPG", "03_0673.JPG", ] # the names of the drone images that starts a run
 
     # Initilize directories and paths
     sat_feature_dir = "geolocalization_dinov3/tile_features"
@@ -486,12 +487,7 @@ if __name__ == "__main__":
     df = pd.read_csv(csv_file_path)
     # Structed as: num, filename, date, lat, lon, height, Omega, Kappa, Phi1, Phi2 (Phi1 is drone heading)
 
-    # Get drone heading from CSV on 'take-off' (first image) - Approximate from homography afterwards
-    curr_heading = df.loc[df['num'] == i, ['Phi1']].values[0][0]  # Drone heading from CSV
-
-    curr_position = (df.loc[df['num'] == i, ['lat', 'lon']].values[0][0],
-                    df.loc[df['num'] == i, ['lat', 'lon']].values[0][1]) # Known for first itteration -- Drone take-off
-    
+    # Math for converting lat/long to pixels in satellite image    
     lat_long_1 = (32.355491, 119.805926) # North, East
     lat_long_2 = (32.290290, 119.900052) # North, East
     geo_center = ((lat_long_1[0] + lat_long_2[0]) / 2, (lat_long_1[1] + lat_long_2[1]) / 2) # Center point
@@ -502,15 +498,20 @@ if __name__ == "__main__":
     meters_per_pixel_lat = geo_span_meters[0] / 24308 # Height of full satellite image in pixels
     meters_per_pixel_lon = geo_span_meters[1] / 35092 # Width of full satellite image in pixels
 
-    # Covert to pixels for first itteration, afterwards each update to curr, will be in pixels
-    actual_drone_y = (lat_long_1[0] - curr_position[0]) * meters_per_degree_lat / meters_per_pixel_lat
-    actual_drone_x = (curr_position[1] - lat_long_1[1]) * meters_per_degree_lon / meters_per_pixel_lon
-    curr_position = np.array([actual_drone_x, actual_drone_y])
-
     # Loop, continuously process images from drone camera feed
-    while i <= 97: # <-- Replace with loop that runs for each image in dataset (or ROS2 image callback for full onboard drone processing)
+    while i <= len(df): # <-- Replace with loop that runs for each image in dataset (or ROS2 image callback for full onboard drone processing)
         start_time = time.time()
-        
+
+        if df.loc[df['num'] == i, ['filename']].values[0][0] in starting_drone_images:
+            # Reset position and heading at start of each dataset run
+            curr_heading = df.loc[df['num'] == i, ['Phi1']].values[0][0]
+            curr_position = (df.loc[df['num'] == i, ['lat', 'lon']].values[0][0],
+                            df.loc[df['num'] == i, ['lat', 'lon']].values[0][1]) # Known for first itteration -- Drone take-off
+            actual_drone_y = (lat_long_1[0] - curr_position[0]) * meters_per_degree_lat / meters_per_pixel_lat
+            actual_drone_x = (curr_position[1] - lat_long_1[1]) * meters_per_degree_lon / meters_per_pixel_lon       
+            curr_position = np.array([actual_drone_x, actual_drone_y])     
+            print(f"\n--- Starting new dataset run at image {i}, resetting position and heading ---\n")
+
         # Due to file formatting, we need to fill in leading zeros for dataset and image index (The first drone image is 0001)
         drone_image_path = f"geolocalization_dinov3/dataset_data/drone_images/{used_dataset:02d}/{used_dataset:02d}_{i:04d}.JPG" # NOTE: Once we move to ROS2, find image without hardcoding path
         full_sat_image = cv2.imread("geolocalization_dinov3/full_satellite_image_small.png")
