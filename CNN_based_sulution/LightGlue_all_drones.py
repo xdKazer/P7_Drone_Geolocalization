@@ -907,7 +907,7 @@ with open(CSV_FINAL_RESULT_PATH, "a", newline="") as f:
                             "x_ekf", "y_ekf", "phi_ekf_deg",
                             "dx", "dy", 
                             "dx_ekf", "dy_ekf",
-                            "error", "ekf_error", 
+                            "error", "error_pred", "ekf_error", 
                             "heading_diff", "ekf_heading_diff", 
                             "time_s", "ekf_time_s"])
 
@@ -1298,7 +1298,7 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
                         f"{x_pred[0]:.8f}", f"{x_pred[1]:.8f}", f"{x_pred[3]:.3f}", # x_ekf, y_ekf, phi_ekf_deg
                         "N/A", "N/A", # dx, dy
                         f"{dx_ekf:.4f}", f"{dy_ekf:.4f}", # dx_ekf, dy_ekf
-                        "N/A", f"{error_ekf:.4f}", # error, ekf_error
+                        "N/A",f"{error_ekf:.4f}", f"{error_ekf:.4f}", # error, error_pred, ekf_error
                         "N/A", f"{dphi_ekf:.4f}", # heading_diff, ekf_heading_diff
                         "N/A", "N/A" # time_s, ekf_time_s
                         ])
@@ -1453,30 +1453,31 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
             draw_ellipse(sat_individual, center_pred, Sigma_disp, k_sigma=k, color=color[0], thickness=1)
 
             cv2.imwrite(str(out_overlay), sat_individual)
+    error_pred, _, _, _, _ = determine_pos_error((x_pred[0], x_pred[1]), x_pred[3], DRONE_INFO_DIR, drone_img)
         
-        #------------- save final results to overall CSV file --------------------
-        # add to the bottom of results_{sat_number}.csv file:
-        with open(CSV_FINAL_RESULT_PATH, "a", newline="") as f:
-            w = csv.writer(f)
-            w.writerow([
-                drone_img,
-                tile_name.stem,
-                K,
-                len(selected_tiles),
-                num_inliers,
-                f"{avg_confidence:.3f}",
-                f"{median_reproj_error_px:.3f}",
-                f"{shape_conf:.3f}",
-                f"{best_conf_overall:.3f}",
-                f"{meas_x_px:.8f}", f"{meas_y_px:.8f}", f"{meas_phi_deg:.3f}",
-                f"{x_updated[0]:.8f}", f"{x_updated[1]:.8f}", f"{x_updated[3]:.3f}",
-                f"{dx:.4f}", f"{dy:.4f}",
-                f"{dx_ekf:.4f}", f"{dy_ekf:.4f}",
-                f"{error:.4f}", f"{error_ekf:.4f}",
-                f"{dphi:.4f}", f"{dphi_ekf:.4f}",
-                "N/A",# f"{time_total:.4f}",
-                "N/A"# f"{time_total_ekf:.4f}",
-            ])
+    #------------- save final results to overall CSV file --------------------
+    # add to the bottom of results_{sat_number}.csv file:
+    with open(CSV_FINAL_RESULT_PATH, "a", newline="") as f:
+        w = csv.writer(f)
+        w.writerow([
+            drone_img,
+            tile_name.stem,
+            K,
+            len(selected_tiles),
+            num_inliers,
+            f"{avg_confidence:.3f}",
+            f"{median_reproj_error_px:.3f}",
+            f"{shape_conf:.3f}",
+            f"{best_conf_overall:.3f}",
+            f"{meas_x_px:.8f}", f"{meas_y_px:.8f}", f"{meas_phi_deg:.3f}",
+            f"{x_updated[0]:.8f}", f"{x_updated[1]:.8f}", f"{x_updated[3]:.3f}",
+            f"{dx:.4f}", f"{dy:.4f}",
+            f"{dx_ekf:.4f}", f"{dy_ekf:.4f}",
+            f"{error:.4f}", f"{error_pred:.4f}", f"{error_ekf:.4f}", 
+            f"{dphi:.4f}", f"{dphi_ekf:.4f}",
+            "N/A",# f"{time_total:.4f}",
+            "N/A"# f"{time_total_ekf:.4f}",
+        ])
 
 results = get_metrics(CSV_FINAL_RESULT_PATH)
 print(results)
