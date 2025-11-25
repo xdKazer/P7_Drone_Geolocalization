@@ -21,7 +21,7 @@ dataset_dir = BASE / "UAV_VisLoc_dataset"
 sat_number  = "03"
 
 tif_path = dataset_dir / sat_number / f"satellite{sat_number}.tif"
-out_dir  = dataset_dir / sat_number / "sat_tiles_overlap_native"
+out_dir  = dataset_dir / sat_number / "sat_tiles_overlap"
 out_dir.mkdir(parents=True, exist_ok=True)
 
 # Reference drone image

@@ -23,10 +23,10 @@ from get_metrics_from_csv import get_metrics
 FEATURES = "superpoint"       # 'superpoint' | 'disk' | 'sift' | 'aliked'
 DISPLAY_LONG_SIDE = 1200      # only for visualization
 MAX_KPTS = None               # max keypoints to load from .pt files (None = all) (This controls memory usage) TODO also controls speed
-MIN_CONFIDENCE_FOR_EKF_UPDATE = 0.3  # min confidence to use measurement update in EKF
+MIN_CONFIDENCE_FOR_EKF_UPDATE = 0.2  # min confidence to use measurement update in EKF
 
 sat_number = "03"
-visualisations_enabled = True
+visualisations_enabled = False
 # --- EKF globals (top of file, before the big for-loop) ---
 ekf = None
 t_last = None   # timestamp of previous processed frame
@@ -909,7 +909,7 @@ with open(CSV_FINAL_RESULT_PATH, "a", newline="") as f:
                             "dx_ekf", "dy_ekf",
                             "error", "error_pred", "ekf_error", 
                             "heading_diff", "ekf_heading_diff", 
-                            "time_s", "ekf_time_s"])
+                            "time_s"])
 
 # -------------------- Preload satellite tiles --------------------              
 all_tile_names = [p for p in SAT_DIR.iterdir() if p.is_file() and p.suffix.lower() == ".png"]
@@ -920,6 +920,8 @@ sat_vis, SX, SY = load_sat_display_and_scale()
 
 # -------------------- Load drone features --------------------
 for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
+    t_start = time.perf_counter()
+    t_end= None
     if img_path.suffix.lower() not in [".jpg", ".png", ".jpeg"]:
         continue
     drone_img = img_path.name
@@ -1269,6 +1271,7 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
 
      # ----------------------------- IF needed, skip update and use predict only-------------------
     if (H_best is None or best_conf_overall < MIN_CONFIDENCE_FOR_EKF_UPDATE):
+        t_end = time.perf_counter()
         if H_best is not None:
             # -------------------- Read top-1 candidate scores --------------------
             top1 = scores_small[0] # top-1 only.
@@ -1283,6 +1286,7 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
         print(f"[info] Skipping EKF update for {drone_img} due to no valid homography or low confidence ({best_conf_overall:.4f} < {MIN_CONFIDENCE_FOR_EKF_UPDATE})")
         pose_ekf = get_location_in_sat_img((x_pred[0], x_pred[1]), SAT_LONG_LAT_INFO_DIR, sat_number, SAT_DISPLAY_META)
         error_ekf, dx_ekf, dy_ekf, dphi_ekf, _ = determine_pos_error(pose_ekf, x_pred[3], DRONE_INFO_DIR, drone_img)
+    
         with open(CSV_FINAL_RESULT_PATH, "a", newline="") as f:
             w = csv.writer(f)
             w.writerow([drone_img, #"drone_image",
@@ -1300,7 +1304,7 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
                         f"{dx_ekf:.4f}", f"{dy_ekf:.4f}", # dx_ekf, dy_ekf
                         "N/A",f"{error_ekf:.4f}", f"{error_ekf:.4f}", # error, error_pred, ekf_error
                         "N/A", f"{dphi_ekf:.4f}", # heading_diff, ekf_heading_diff
-                        "N/A", "N/A" # time_s, ekf_time_s
+                        f"{t_end - t_start:.4f}",   # time_s
                         ])
             
         # visualize search area and predicted position on satellite 
@@ -1330,16 +1334,11 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
             )
 
             cv2.imwrite(str(OUT_OVERALL_SAT_VIS_PATH), overlay_img)
-            continue # next drone image
+        continue # next drone image
 
-    # -------------------- Read top-1 candidate scores --------------------
+    # -------------------- Read top-1 candidate scores needed for ekf --------------------
     top1 = scores_small[0] # top-1 only.
-    tile_name = top1["tile"]               
-    num_inliers = top1["inliers"]
-    K = top1["total_matches"]
-    avg_confidence = top1["avg_conf"]
-    median_reproj_error_px = top1["median_err"]
-    shape_conf = top1["shape_score"]
+    tile_name = top1["tile"]
     best_conf_overall = top1["overall_conf"]
 
     # -------------------- Visualizations: plotting the matches side-by-side --------------------
@@ -1391,6 +1390,7 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
     x_updated[3] = img_to_compass(np.rad2deg(x_updated[3]))  # convert back to degrees for logging
     #print(f"[EKF] Updated state: x={x_updated[0]:.2f}, y={x_updated[1]:.2f}, v={x_updated[2]:.2f} px/s, phi={(x_updated[3]):.2f} deg")
     #EKF done
+    t_end = time.perf_counter()
 
     #------------- Position error computation --------------------
     # Error in meters (using ORIGINAL-frame center)
@@ -1453,8 +1453,15 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
             draw_ellipse(sat_individual, center_pred, Sigma_disp, k_sigma=k, color=color[0], thickness=1)
 
             cv2.imwrite(str(out_overlay), sat_individual)
+    
+    # -------------------- Read top-1 candidate scores needed for CSV --------------------            
+    num_inliers = top1["inliers"]
+    K = top1["total_matches"]
+    avg_confidence = top1["avg_conf"]
+    median_reproj_error_px = top1["median_err"]
+    shape_conf = top1["shape_score"]
+
     error_pred, _, _, _, _ = determine_pos_error((x_pred[0], x_pred[1]), x_pred[3], DRONE_INFO_DIR, drone_img)
-        
     #------------- save final results to overall CSV file --------------------
     # add to the bottom of results_{sat_number}.csv file:
     with open(CSV_FINAL_RESULT_PATH, "a", newline="") as f:
@@ -1473,10 +1480,9 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
             f"{x_updated[0]:.8f}", f"{x_updated[1]:.8f}", f"{x_updated[3]:.3f}",
             f"{dx:.4f}", f"{dy:.4f}",
             f"{dx_ekf:.4f}", f"{dy_ekf:.4f}",
-            f"{error:.4f}", f"{error_pred:.4f}", f"{error_ekf:.4f}", 
+            f"{error:.4f}", f"{error_pred:.4f}", f"{error_ekf:.4f}",
             f"{dphi:.4f}", f"{dphi_ekf:.4f}",
-            "N/A",# f"{time_total:.4f}",
-            "N/A"# f"{time_total_ekf:.4f}",
+            f"{t_end-t_start:.4f}",
         ])
 
 results = get_metrics(CSV_FINAL_RESULT_PATH)
