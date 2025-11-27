@@ -26,7 +26,7 @@ MAX_KPTS = None               # max keypoints to load from .pt files (None = all
 MIN_CONFIDENCE_FOR_EKF_UPDATE = 0.2  # min confidence to use measurement update in EKF
 
 sat_number = "03"
-visualisations_enabled = False
+visualisations_enabled = True
 # --- EKF globals (top of file, before the big for-loop) ---
 ekf = None
 t_last = None   # timestamp of previous processed frame
@@ -610,6 +610,22 @@ def get_confidence_meas(
     conf = (1.0 - alpha_err) * c_prior + alpha_err * c_err
     return float(np.clip(conf, 0.0, 1.0))
 
+
+def fmt_shape_terms(terms) -> str:
+    """
+    Format shape term array as '(x,x,x,x,x)' with 3 decimals, or 'N/A' if missing.
+    """
+    if terms is None:
+        return "N/A"
+    arr = np.asarray(terms, dtype=np.float64).reshape(-1)
+    parts = []
+    for v in arr[:5]:
+        if np.isfinite(v):
+            parts.append(f"{v:.3f}")
+        else:
+            parts.append("nan")
+    return f"({','.join(parts)})"
+
 # ---------------------- homography convexity check ----------------------
 
 def is_homography_convex_and_corners_warped(H, img_w, img_h):
@@ -676,11 +692,11 @@ def get_homography_shape_score(
 
     # ---------- Validate input ----------
     if corners is None:
-        return 0.0
+        return 0.0, np.full(5, np.nan, dtype=np.float64)
 
     corners = np.asarray(corners, dtype=np.float64)
     if corners.shape != (4, 2) or not np.isfinite(corners).all():
-        return 0.0
+        return 0.0, np.full(5, np.nan, dtype=np.float64)
 
     # =====================================================================
     # 0) Compute side vectors & lengths from corners
@@ -778,7 +794,7 @@ def get_homography_shape_score(
     min_t  = float(terms.min())
 
     shape_score = 0.6 * min_t + 0.4 * mean_t
-    return float(np.clip(shape_score, 0.0, 1.0))
+    return float(np.clip(shape_score, 0.0, 1.0)), terms
 
 # ---------------------- search region ----------------------
 def ellipse_from_cov(mu_xy, Sigma_xy, k=2.0):
@@ -902,7 +918,7 @@ matcher = LightGlue(features=feat).eval().to(device)
 with open(CSV_FINAL_RESULT_PATH, "a", newline="") as f:
                 w = csv.writer(f)
                 w.writerow(["drone_image", "tile", "total_matches", "search_tiles", "inliers", "avg_confidence", 
-                            "median_reproj_error_px",  "shape_score", "overall_confidence", 
+                            "median_reproj_error_px", "shape_terms", "shape_score", "overall_confidence", 
                             "x_meas", "y_meas", "phi_meas_deg",
                             "x_ekf", "y_ekf", "phi_ekf_deg",
                             "dx", "dy", 
@@ -1119,6 +1135,7 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
     # we need to restart variables for best match
     H_best = None
     best_shape_score = 0.0
+    best_shape_terms = None
     best_conf_overall = 0.0
 
     with torch.inference_mode():
@@ -1129,6 +1146,7 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
             median_projection_err = float("inf")   
             overall_conf = float("-inf") 
             shape_conf = float("nan")  
+            shape_terms = np.full(5, np.nan, dtype=np.float64)
             K = None
             H = None
             is_convex_dlt = False
@@ -1185,7 +1203,7 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
                         avg_conf = float(np.mean(scores_np[inlier_mask]))
 
                 # compute shape score and median reprojection error for RANSAC H
-                shape_ransac = get_homography_shape_score(corners_ransac, drone_rot_size[0], drone_rot_size[1], SCALE_TILE_TO_DRONE)
+                shape_ransac, terms_ransac = get_homography_shape_score(corners_ransac, drone_rot_size[0], drone_rot_size[1], SCALE_TILE_TO_DRONE)
                 median_projection_err_ransac = get_median_projection_error(
                         H_ransac, pts_drone_np, pts_tile_np, inlier_mask
                     )
@@ -1201,10 +1219,11 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
                 if is_convex_dlt == False: # if DLT is not convex, use RANSAC
                     H = H_ransac
                     shape_conf = shape_ransac
+                    shape_terms = terms_ransac
                     median_projection_err = median_projection_err_ransac
                 else:
                     # compute shape score for DLT
-                    shape_dlt = get_homography_shape_score(corners_dlt, drone_rot_size[0], drone_rot_size[1], SCALE_TILE_TO_DRONE)
+                    shape_dlt, terms_dlt = get_homography_shape_score(corners_dlt, drone_rot_size[0], drone_rot_size[1], SCALE_TILE_TO_DRONE)
                     median_projection_err_dlt = get_median_projection_error(
                         H_dlt, pts_drone_np, pts_tile_np, inlier_mask
                     )
@@ -1212,10 +1231,12 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
                     if shape_dlt > shape_ransac: 
                         H = H_dlt
                         shape_conf = shape_dlt
+                        shape_terms = terms_dlt
                         median_projection_err = median_projection_err_dlt
                     else: # keep RANSAC
                         H = H_ransac
                         shape_conf = shape_ransac
+                        shape_terms = terms_ransac
                         median_projection_err = median_projection_err_ransac
                         
                 # ---------- Overall Confidence + CHOSE BEST----------
@@ -1230,6 +1251,7 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
                             continue  # keep previous best if overall_conf tie but shape_conf not better
                         H_best = H
                         best_shape_score = shape_conf
+                        best_shape_terms = shape_terms
                         best_conf_overall = overall_conf
                         best_pts_drone_np = pts_drone_np
                         best_pts_tile_np = pts_tile_np
@@ -1243,6 +1265,7 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
                 "avg_conf": avg_conf,
                 "median_err": median_projection_err,  
                 "shape_score": shape_conf,
+                "shape_terms": shape_terms,
                 "overall_conf": overall_conf
             })
     
@@ -1252,8 +1275,7 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
     if visualisations_enabled:
         with open(CSV_RESULT_PATH, "w", newline="") as f:
             w = csv.writer(f)
-            w.writerow(["tile", "total_matches", "inliers", "avg_confidence", "median_reproj_error", "shape_score", "overall_conf"
-                        ])
+            w.writerow(["tile", "total_matches", "inliers", "avg_confidence", "median_reproj_error", "shape_terms", "shape_score", "overall_conf"])
             for r in scores_small:
                 w.writerow([
                     r["tile"].name,
@@ -1261,6 +1283,7 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
                     r["inliers"],
                     "" if not math.isfinite(r["avg_conf"]) else f"{r['avg_conf']:.4f}",
                     "" if not math.isfinite(r["median_err"]) else f"{r['median_err']:.4f}",
+                    fmt_shape_terms(r.get("shape_terms")),
                     "" if not math.isfinite(r["shape_score"]) else f"{r['shape_score']:.4f}",
                     "" if not math.isfinite(r["overall_conf"]) else f"{r['overall_conf']:.4f}"
                 ])
@@ -1272,6 +1295,13 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
      # ----------------------------- IF needed, skip update and use predict only-------------------
     if (H_best is None or best_conf_overall < MIN_CONFIDENCE_FOR_EKF_UPDATE):
         t_end = time.perf_counter()
+        tile_name = None
+        num_inliers = None
+        K = None
+        avg_confidence = None
+        median_reproj_error_px = None
+        shape_conf = None
+        shape_terms = None
         if H_best is not None:
             # -------------------- Read top-1 candidate scores --------------------
             top1 = scores_small[0] # top-1 only.
@@ -1281,11 +1311,13 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
             avg_confidence = top1["avg_conf"]
             median_reproj_error_px = top1["median_err"]
             shape_conf = top1["shape_score"]
+            shape_terms = top1.get("shape_terms")
             best_conf_overall = top1["overall_conf"]
 
         print(f"[info] Skipping EKF update for {drone_img} due to no valid homography or low confidence ({best_conf_overall:.4f} < {MIN_CONFIDENCE_FOR_EKF_UPDATE})")
         pose_ekf = get_location_in_sat_img((x_pred[0], x_pred[1]), SAT_LONG_LAT_INFO_DIR, sat_number, SAT_DISPLAY_META)
         error_ekf, dx_ekf, dy_ekf, dphi_ekf, _ = determine_pos_error(pose_ekf, x_pred[3], DRONE_INFO_DIR, drone_img)
+        shape_terms_str = fmt_shape_terms(shape_terms)
     
         with open(CSV_FINAL_RESULT_PATH, "a", newline="") as f:
             w = csv.writer(f)
@@ -1296,6 +1328,7 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
                         "N/A" if num_inliers is None else num_inliers, # "inliers",
                         "N/A" if avg_confidence is None else f"{avg_confidence:.3f}", #"avg_confidence", 
                         "N/A" if median_reproj_error_px is None else f"{median_reproj_error_px:.3f}", # median_reproj_error,
+                        shape_terms_str,
                         "N/A" if shape_conf is None else f"{shape_conf:.3f}", # shape_score,
                         "N/A" if best_conf_overall == 0.0  else f"{best_conf_overall:.3f}", # best_conf_overall
                         "N/A", "N/A", "N/A", # x_meas, y_meas, phi_meas_deg
@@ -1340,6 +1373,8 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
     top1 = scores_small[0] # top-1 only.
     tile_name = top1["tile"]
     best_conf_overall = top1["overall_conf"]
+    shape_terms = best_shape_terms if best_shape_terms is not None else top1.get("shape_terms")
+    shape_terms_str = fmt_shape_terms(shape_terms)
 
     # -------------------- Visualizations: plotting the matches side-by-side --------------------
     if visualisations_enabled:
@@ -1474,6 +1509,7 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
             num_inliers,
             f"{avg_confidence:.3f}",
             f"{median_reproj_error_px:.3f}",
+            shape_terms_str,
             f"{shape_conf:.3f}",
             f"{best_conf_overall:.3f}",
             f"{meas_x_px:.8f}", f"{meas_y_px:.8f}", f"{meas_phi_deg:.3f}",
