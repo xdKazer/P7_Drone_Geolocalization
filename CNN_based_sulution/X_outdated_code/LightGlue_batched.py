@@ -17,7 +17,7 @@ from lightglue.utils import load_image, rbd
 
 from datetime import datetime # to determine dt from csv
 
-from get_metrics_from_csv import get_metrics
+from CNN_based_sulution.get_metrics_from_csv import get_metrics
 
 # -------------------- Config --------------------
 FEATURES = "superpoint"       # 'superpoint' | 'disk' | 'sift' | 'aliked'

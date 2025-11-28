@@ -4,7 +4,6 @@ outputs/
 .venv/
 geolocalization_dinov3/*
 test2.py
-LG_with_no_precomputed.py
 extract_keypoints_offline.py
 
 

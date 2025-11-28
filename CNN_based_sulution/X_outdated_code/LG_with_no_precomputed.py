@@ -4,7 +4,7 @@ from scipy.stats import chi2
 from pathlib import Path
 import shutil # to delete folders
 from typing import Optional
-import json, re
+import json
 
 import numpy as np
 import matplotlib
@@ -24,9 +24,11 @@ FEATURES = "superpoint"       # 'superpoint' | 'disk' | 'sift' | 'aliked'
 DISPLAY_LONG_SIDE = 1200      # only for visualization
 MAX_KPTS = None               # max keypoints to load from .pt files (None = all) (This controls memory usage) TODO also controls speed
 MIN_CONFIDENCE_FOR_EKF_UPDATE = 0.2  # min confidence to use measurement update in EKF
+# Drone GSD (meters per pixel)
+drone_m_per_px = 0.125
 
 sat_number = "03"
-visualisations_enabled = True
+visualisations_enabled = False
 # --- EKF globals (top of file, before the big for-loop) ---
 ekf = None
 t_last = None   # timestamp of previous processed frame
@@ -38,36 +40,51 @@ DATASET_DIR = BASE / "UAV_VisLoc_dataset"
 SAT_LONG_LAT_INFO_DIR = DATASET_DIR / "satellite_coordinates_range.csv"
 DRONE_INFO_DIR = DATASET_DIR / sat_number / f"{sat_number}.csv"
 DRONE_IMG_CLEAN = DATASET_DIR / sat_number / "short_run"  
-SAT_DIR   = DATASET_DIR / sat_number / "sat_tiles_overlap" 
+SAT_TIF_PATH   = DATASET_DIR / sat_number / f"satellite{sat_number}.tif" 
 OUT_DIR_CLEAN   = BASE / "outputs" / sat_number
 OUT_OVERALL_SAT_VIS_PATH = OUT_DIR_CLEAN / f"overall_overlay_on_sat.png"
 
 # delete folder if exists
 folder = OUT_DIR_CLEAN
-
 if folder.exists() and folder.is_dir():
     shutil.rmtree(folder)
 
 OUT_DIR_CLEAN.mkdir(parents=True, exist_ok=True)
 CSV_FINAL_RESULT_PATH = OUT_DIR_CLEAN / f"results_{sat_number}.csv"
-TILE_PT_DIR = DATASET_DIR / sat_number / f"{FEATURES}_features" / sat_number
 SAT_DISPLAY_IMG  = DATASET_DIR / sat_number / "satellite03_small.png"
 SAT_DISPLAY_META = SAT_DISPLAY_IMG.with_suffix(SAT_DISPLAY_IMG.suffix + ".json")  # {"scale": s, "original_size_hw":[H,W],...}
-TILE_WH_DIR = SAT_DIR / "a_tile_size.txt"  
 
 
-############################ Read tile information ############################
-# a_tile_size.txt format:
-#   stride_h stride_w tile_h_sat tile_w_sat H_drone W_drone scale_sat_to_drone
-with open(TILE_WH_DIR) as f:
-    stride_h_str, stride_w_str, tile_h_str, tile_w_str, scale_str = f.read().strip().split()
+SAT_IMG_FULL = cv2.imread(str(SAT_TIF_PATH), cv2.IMREAD_COLOR)
+if SAT_IMG_FULL is None:
+    raise FileNotFoundError(f"Cannot read {SAT_TIF_PATH}")
+SAT_HW = SAT_IMG_FULL.shape[:2]
 
-Stride_H  = int(stride_h_str)       
-Stride_W  = int(stride_w_str)  
-TILE_H = int(tile_h_str)     
-TILE_W = int(tile_w_str)
+# -------------------- Read scale metadata (drone_px per sat_px) --------------------
+def haversine_m(lat1, lon1, lat2, lon2):
+    R = 6371000.0
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dl   = math.radians(lon2 - lon1)
+    a = math.sin(dphi/2)**2 + math.cos(p1)*math.cos(p2)*math.sin(dl/2)**2
+    return 2 * R * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
-SCALE_TILE_TO_DRONE = float(scale_str)   #How many drone-pixels correspond to one satellite pixel. 
+with open(SAT_LONG_LAT_INFO_DIR, newline="") as f:
+    for r in csv.DictReader(f):
+        if r["mapname"] == f"satellite{sat_number}.tif":
+            lat_min = np.float64(r["LT_lat_map"])
+            lon_min = np.float64(r["LT_lon_map"])
+            lat_max = np.float64(r["RB_lat_map"])
+            lon_max = np.float64(r["RB_lon_map"])
+
+sat_height_m = haversine_m(lat_min, lon_min, lat_max, lon_min)
+sat_width_m  = haversine_m(lat_min, lon_min, lat_min, lon_max)
+
+sat_m_px_h = sat_height_m / SAT_HW[0]
+sat_m_px_w = sat_width_m  / SAT_HW[1]
+sat_m_per_px = math.sqrt(sat_m_px_h * sat_m_px_w)
+
+NUMBER_OF_DRONE_PX_FOR_1_SAT = np.float64(sat_m_per_px / drone_m_per_px)  #How many drone-pixels correspond to one satellite pixel. 
 # This is needed for downsampling of drone img
 
 ########################################################################################
@@ -350,10 +367,10 @@ def latlon_to_orig_xy(lat, lon, SAT_LONG_LAT_INFO_DIR, sat_number, SAT_DISPLAY_M
     v = (np.float64(lat) - LT_lat) / (RB_lat - LT_lat) * sat_H
     return u, v
 
-def get_visualisation_parameters(H_orig2tile, DRONE_ORIGINAL_W, DRONE_ORIGINAL_H, x_off, y_off):
+def get_visualisation_parameters(H_orig2sat, DRONE_ORIGINAL_W, DRONE_ORIGINAL_H):
     """
-    Given homography from original drone image to UPSCALED tile pixels (H_orig2tile), tile scale, original drone image size, 
-    and tile offsets (x_off, y_off) in ORIGINAL satellite pixels, compute:
+    Given homography from original drone image to satellite ROI pixels (H_orig2sat) and offsets (x_off, y_off)
+    in ORIGINAL satellite pixels, compute:
     - center_global: (x,y) center of drone image in ORIGINAL satellite pixels
     - corners_global: (4,2) corners of drone image in ORIGINAL satellite pixels
     - heading_unitvec_meas: unit vector of drone heading in ORIGINAL satellite pixels
@@ -364,26 +381,19 @@ def get_visualisation_parameters(H_orig2tile, DRONE_ORIGINAL_W, DRONE_ORIGINAL_H
     center0  = np.array([[w0/2.0, h0/2.0]], dtype=np.float32)
     forward0 = np.array([[w0/2.0, h0/2.0 - max(20.0, 0.10*h0)]], dtype=np.float32)
 
-    # 2) Project to TILE (UPSCALED TILE PIXELS!)
-    center_tile_px  = project_pts(H_orig2tile, center0)[0].astype(np.float64)
-    forward_tile_px = project_pts(H_orig2tile, forward0)[0].astype(np.float64)
+    # 2) Project to SAT ROI pixels
+    center_global  = project_pts(H_orig2sat, center0)[0].astype(np.float64)
+    forward_global = project_pts(H_orig2sat, forward0)[0].astype(np.float64)
 
-    # 4) LOCAL → GLOBAL ORIGINAL SATELLITE using tile offset
-    offset = np.array([x_off, y_off], dtype=np.float64)
-    center_global  = center_tile_px  + offset
-    forward_global = forward_tile_px + offset
-
-    # 5) Heading vector
+    # 3) Heading vector
     v_pred = forward_global - center_global
     norm   = np.hypot(v_pred[0], v_pred[1]) or 1.0
     heading_unitvec_meas = v_pred / norm
 
-    # 6) Corners for visualization
+    # 4) Corners for visualization
     corners0 = np.array([[0,0],[w0,0],[w0,h0],[0,h0]], dtype=np.float32)
 
-    corners_tile_px = project_pts(H_orig2tile, corners0)
-
-    corners_global = corners_tile_px + offset
+    corners_global = project_pts(H_orig2sat, corners0)
 
     return center_global, corners_global, heading_unitvec_meas
 
@@ -404,25 +414,9 @@ def get_measurements(center_global, heading_unitvector_from_homography):
 
 def load_sat_display_and_scale():
     img = cv2.imread(str(SAT_DISPLAY_IMG), cv2.IMREAD_UNCHANGED)
-    if img is None:
-        raise FileNotFoundError(f"Cannot read {SAT_DISPLAY_IMG}")
     meta = json.loads(SAT_DISPLAY_META.read_text())
-    if "scale" in meta:
-        sx = sy = float(meta["scale"])
-    elif "scale_xy" in meta:
-        sx, sy = map(float, meta["scale_xy"])
-    else:
-        raise KeyError(f"{SAT_DISPLAY_META} missing 'scale' or 'scale_xy'")
+    sx = sy = float(meta["scale"])
     return img, sx, sy
-
-def tile_offset_from_name(tile_path: Path):
-    name = tile_path.stem
-    m = re.search(r"y(?P<y>\d+)_x(?P<x>\d+)", name)
-    if not m:
-        raise ValueError(f"Cannot parse offsets from '{tile_path.name}'. Expected '...y<Y>_x<X>...'")
-    y_off = int(m.group("y"))
-    x_off = int(m.group("x"))
-    return x_off, y_off
 
 def project_pts(H, pts_xy):
     xy_h = cv2.convertPointsToHomogeneous(pts_xy).reshape(-1,3).T  # 3xN
@@ -498,9 +492,15 @@ def make_segments(p0, p1, x_offset):
     segs[:, 1, 1] = p1[:, 1]
     return segs
 
-def visualize_inliers(drone_path: Path, tile_path: Path, pts0, pts1, inlier_mask, out_png):
+def visualize_inliers(drone_path: Path, sat_img, pts0, pts1, inlier_mask, out_png, label="sat_roi"):
     I0 = to_numpy_image(load_image(str(drone_path)))
-    I1 = to_numpy_image(load_image(str(tile_path)))
+    if isinstance(sat_img, (str, Path)):
+        I1 = to_numpy_image(load_image(str(sat_img)))
+        label = Path(sat_img).name
+    else:
+        I1 = np.asarray(sat_img, dtype=np.float32)
+        if I1.max() > 1.0:
+            I1 = I1 / 255.0
     I0d, s0 = resize_for_display(np.clip(I0, 0.0, 1.0))
     I1d, s1 = resize_for_display(np.clip(I1, 0.0, 1.0))
     p0d = pts0 * s0
@@ -515,7 +515,7 @@ def visualize_inliers(drone_path: Path, tile_path: Path, pts0, pts1, inlier_mask
     if inlier_mask is None or not inlier_mask.any():
         plt.figure(figsize=(14, 7))
         plt.imshow(canvas); plt.axis("off")
-        plt.title(f"{tile_path.name}: No inliers")
+        plt.title(f"{label}: No inliers")
         plt.tight_layout(); plt.savefig(out_png, dpi=150); plt.close()
         return
 
@@ -529,33 +529,8 @@ def visualize_inliers(drone_path: Path, tile_path: Path, pts0, pts1, inlier_mask
     ax.add_collection(lc)
     ax.scatter(p0d[idx, 0],         p0d[idx, 1],       s=2, c="yellow", alpha=0.7)
     ax.scatter(p1d[idx, 0] + W0,    p1d[idx, 1],       s=2, c="cyan",   alpha=0.7)
-    ax.set_title(f"{tile_path.name} | inliers={len(idx)}")
+    ax.set_title(f"{label} | inliers={len(idx)}")
     plt.tight_layout(); plt.savefig(out_png, dpi=150); plt.close()
-
-def make_feature_pt_path_for(image_path: Path) -> Path:
-    """
-    returns path for feature file for image (.pt) files
-    """
-    folder = TILE_PT_DIR if TILE_PT_DIR is not None else image_path.parent
-    return folder / (image_path.stem + ".pt")
-
-def load_feats_pt_batched(pt_path: Path, device: str):
-    d = torch.load(str(pt_path), map_location="cpu", weights_only=True)
-    for k in ("keypoints", "descriptors", "keypoint_scores", "image_size"):
-        if k not in d:
-            raise KeyError(f"{pt_path} missing key '{k}'")
-    kpts = d["keypoints"].to(dtype=torch.float32)
-    desc = d["descriptors"].to(dtype=torch.float32)
-    scrs = d["keypoint_scores"].to(dtype=torch.float32)
-    isize = d["image_size"].to(dtype=torch.int64)
-    feats_b = {
-        "keypoints":   kpts.unsqueeze(0).to(device),
-        "descriptors": desc.unsqueeze(0).to(device),
-        "keypoint_scores": scrs.unsqueeze(0).to(device),
-        "image_size":  isize.unsqueeze(0).to(device),
-    }
-    feats_r = rbd(feats_b)
-    return feats_b, feats_r
 
 def get_confidence_meas(
     num_inliers,
@@ -610,22 +585,6 @@ def get_confidence_meas(
     conf = (1.0 - alpha_err) * c_prior + alpha_err * c_err
     return float(np.clip(conf, 0.0, 1.0))
 
-
-def fmt_shape_terms(terms) -> str:
-    """
-    Format shape term array as '(x,x,x,x,x)' with 3 decimals, or 'N/A' if missing.
-    """
-    if terms is None:
-        return "N/A"
-    arr = np.asarray(terms, dtype=np.float64).reshape(-1)
-    parts = []
-    for v in arr[:5]:
-        if np.isfinite(v):
-            parts.append(f"{v:.3f}")
-        else:
-            parts.append("nan")
-    return f"({','.join(parts)})"
-
 # ---------------------- homography convexity check ----------------------
 
 def is_homography_convex_and_corners_warped(H, img_w, img_h):
@@ -669,7 +628,7 @@ def get_homography_shape_score(
     corners,
     img_w,
     img_h,
-    scale_drone_to_tile,   # drone_px per tile_px
+    scale_drone_to_sat,   # drone_px per sat_px
     tau_pair=0.2,          # tolerance for opposite side length consistency
     tau_ar=0.2,            # tolerance for aspect ratio
     tau_angle=12.0,        # degrees tolerance for angles (no safe zone)
@@ -692,11 +651,11 @@ def get_homography_shape_score(
 
     # ---------- Validate input ----------
     if corners is None:
-        return 0.0, np.full(5, np.nan, dtype=np.float64)
+        return 0.0
 
     corners = np.asarray(corners, dtype=np.float64)
     if corners.shape != (4, 2) or not np.isfinite(corners).all():
-        return 0.0, np.full(5, np.nan, dtype=np.float64)
+        return 0.0
 
     # =====================================================================
     # 0) Compute side vectors & lengths from corners
@@ -769,12 +728,12 @@ def get_homography_shape_score(
     # =====================================================================
     # 4) ABSOLUTE SCALE (only term with dead-band)
     # =====================================================================
-    area_now = w_est * h_est      # warped rect area in tile px²
+    area_now = w_est * h_est      # warped rect area in sat px²
     area0    = float(img_w * img_h)  # original drone rect area in drone px²
     if area_now <= 0 or area0 <= 0:
         return 0.0
 
-    S = float(scale_drone_to_tile)     # drone_px per tile_px
+    S = float(scale_drone_to_sat)     # drone_px per sat_px
     # expected: scale_now ~ 1
     scale_now = S * math.sqrt(area_now / area0)
     scale_err = abs(scale_now - 1.0)
@@ -794,7 +753,7 @@ def get_homography_shape_score(
     min_t  = float(terms.min())
 
     shape_score = 0.6 * min_t + 0.4 * mean_t
-    return float(np.clip(shape_score, 0.0, 1.0)), terms
+    return float(np.clip(shape_score, 0.0, 1.0))
 
 # ---------------------- search region ----------------------
 def ellipse_from_cov(mu_xy, Sigma_xy, k=2.0):
@@ -805,28 +764,23 @@ def ellipse_from_cov(mu_xy, Sigma_xy, k=2.0):
     angle_rad = np.arctan2(vecs[1,1], vecs[0,1])  # angle of major axis
     return a, b, angle_rad, mu_xy
 
-def ellipse_bbox(mu_xy, Sigma_xy, k=2.0, n=72): # n is number of points to sample
+def ellipse_bbox(mu_xy, Sigma_xy, HW_SAT,extra_margin=0.0, k=2.0, n=72):
     a,b,theta,mu = ellipse_from_cov(mu_xy, Sigma_xy, k)
     t = np.linspace(0, 2*np.pi, n, endpoint=False)
-    pts = np.stack([a*np.cos(t), b*np.sin(t)], axis=0)  # 2×n
+    pts = np.stack([a*np.cos(t), b*np.sin(t)], axis=0)
     R = np.array([[np.cos(theta), -np.sin(theta)],
                   [np.sin(theta),  np.cos(theta)]])
     pts_world = (R @ pts).T + mu[None,:]
     x0,y0 = pts_world.min(axis=0)
     x1,y1 = pts_world.max(axis=0)
-    return (x0,y0,x1,y1)  # bbox in ORIGINAL sat px
 
-def tiles_in_bbox(bbox, TILE_W, TILE_H, all_tile_names):
-    x_min, y_min, x_max, y_max = bbox
-    selected_tiles = []
-    for tile_path in all_tile_names:
-        x_off, y_off = tile_offset_from_name(tile_path)
-        tile_bbox = (x_off, y_off, x_off + TILE_W, y_off + TILE_H)
-        # check intersection
-        if not (tile_bbox[2] < x_min or tile_bbox[0] > x_max or
-                tile_bbox[3] < y_min or tile_bbox[1] > y_max):
-            selected_tiles.append(tile_path)
-    return selected_tiles 
+    if extra_margin > 0.0:
+        x0 = int(max(x0 - extra_margin, 0.0))
+        y0 = int(max(y0 - extra_margin, 0.0))
+        x1 = int(min(x1 + extra_margin, HW_SAT[1]))
+        y1 = int(min(y1 + extra_margin, HW_SAT[0]))
+
+    return (x0,y0,x1,y1)  # bbox in ORIGINAL sat px
 ###################################################################################################
 
 ################################## EKF Tuning parameters ##################################
@@ -896,8 +850,8 @@ R_phi is too small (you are over-trusting noisy heading measurements).
 # -------------------- Device & models --------------------
 device = "cuda" if torch.cuda.is_available() else "cpu"
 #print(f"[info] device: {device}. Extracting features using {FEATURES}.")
-# -------------------- Feature extractor & matcher --------------------
 
+# -------------------- Feature extractor & matcher --------------------
 feat = FEATURES.lower()
 if feat not in ("superpoint", "disk", "sift", "aliked"):
     raise ValueError("FEATURES must be 'superpoint', 'disk', 'sift', or 'aliked'.")
@@ -915,24 +869,33 @@ elif feat == "aliked":
 
 matcher = LightGlue(features=feat).eval().to(device)
 
-with open(CSV_FINAL_RESULT_PATH, "a", newline="") as f:
-                w = csv.writer(f)
-                w.writerow(["drone_image", "tile", "total_matches", "search_tiles", "inliers", "avg_confidence", 
-                            "median_reproj_error_px", "shape_terms", "shape_score", "overall_confidence", 
-                            "x_meas", "y_meas", "phi_meas_deg",
-                            "x_ekf", "y_ekf", "phi_ekf_deg",
-                            "dx", "dy", 
-                            "dx_ekf", "dy_ekf",
-                            "error", "error_pred", "ekf_error", 
-                            "heading_diff", "ekf_heading_diff", 
-                            "time_s"])
+# -------------------- Output CSV --------------------
+with open(CSV_FINAL_RESULT_PATH, "w", newline="") as f:
+    w = csv.writer(f)
+    w.writerow([
+        "drone_image", "roi_bbox", "total_matches", "inliers", "drone_features",
+        "avg_confidence", 
+        "median_reproj_error_px",  "shape_score", "overall_confidence", 
+        "x_meas", "y_meas", "phi_meas_deg",
+        "x_ekf", "y_ekf", "phi_ekf_deg",
+        "dx", "dy", 
+        "dx_ekf", "dy_ekf",
+        "error", "error_pred", "ekf_error", 
+        "heading_diff", "ekf_heading_diff", 
+        "time_s"])
 
-# -------------------- Preload satellite tiles --------------------              
-all_tile_names = [p for p in SAT_DIR.iterdir() if p.is_file() and p.suffix.lower() == ".png"]
 # -------------------- Confidence scaling for ellipse --------------------
 k = math.sqrt(chi2.ppf(0.99, df=2)) # TODO confidence scaling for 2D ellipse. so how conservative we are. the df is 2 since 2D.
 #initialize satellite display
 sat_vis, SX, SY = load_sat_display_and_scale()
+
+def crop_sat_roi(bbox):
+    x0, y0, x1, y1 = bbox
+    x0 = int(max(0, math.floor(x0)))
+    y0 = int(max(0, math.floor(y0)))
+    x1 = int(min(SAT_HW[1], math.ceil(x1)))
+    y1 = int(min(SAT_HW[0], math.ceil(y1)))
+    return (x0, y0, x1, y1), SAT_IMG_FULL[y0:y1, x0:x1]
 
 # -------------------- Load drone features --------------------
 for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
@@ -961,9 +924,13 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
     if visualisations_enabled:
         OUT_DIR = OUT_DIR_CLEAN / str(drone_img)
         OUT_DIR.mkdir(parents=True, exist_ok=True)
-        CSV_RESULT_PATH  = OUT_DIR / "results.csv" 
+
     if not DRONE_IMG.exists():
         raise FileNotFoundError(f"Missing drone image: {DRONE_IMG}")
+    _bgr_orig = cv2.imread(str(DRONE_IMG), cv2.IMREAD_COLOR)
+    if _bgr_orig is None:
+        raise FileNotFoundError(f"Cannot read {DRONE_IMG}")
+    H_orig, W_orig = _bgr_orig.shape[:2]
     
     # -------------------- EKF initialisation--------------------
     if ekf is None: # first frame is skipped for EKF initialization
@@ -1053,19 +1020,31 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
     # create search area using Predicted covariance P:
     P_pred = ekf.P
     sigma = P_pred[:2, :2]  # position covariance 2x2
+
+    # drone size in SATELLITE px
+    W_sat_margin = W_orig / NUMBER_OF_DRONE_PX_FOR_1_SAT
+    H_sat_margin = H_orig / NUMBER_OF_DRONE_PX_FOR_1_SAT
+
+    # half diagonal in SATELLITE px (max distance from center to any corner)
+    extra_margin = 0.5 * math.sqrt(W_sat_margin**2 + H_sat_margin**2)
     
-    ellipse_bbox_coords = ellipse_bbox(x_pred[:2], sigma, k=k, n=72) # this uses SVD to determine viedest axes and orienation of ellipse to get bbx
-
-    # -------------------- Determine tiles in search area --------------------
-    selected_tiles = tiles_in_bbox(ellipse_bbox_coords, TILE_W, TILE_H, all_tile_names)
-
+    ellipse_bbox_coords = ellipse_bbox(x_pred[:2], sigma, SAT_HW, extra_margin=extra_margin, k=k, n=72) # this uses SVD to determine widest axes and orientation of ellipse to get bbx
+    bbox_int, sat_roi_bgr = crop_sat_roi(ellipse_bbox_coords)
+    x0, y0, x1, y1 = bbox_int
+    roi_label = f"roi_x{x0}_y{y0}_x{x1}_y{y1}"
+    if sat_roi_bgr.size == 0 or x1 <= x0 or y1 <= y0:
+        print(f"[warning] Empty ROI for {drone_img} with bbox {bbox_int}. Skipping.")
+        continue
+    error_pred, _, _, _, _ = determine_pos_error((x_pred[0], x_pred[1]), x_pred[3], DRONE_INFO_DIR, drone_img)
     # -------------------- Rotate drone image & extract features --------------------
+    num_kpts_drone = 0
     if feat == "sift":
         R_orig2rot = np.eye(3, dtype=np.float64)
         with torch.inference_mode():
             img0_t = load_image(str(DRONE_IMG)).to("cpu")
             feats_drone_b_scaled = extractor.extract(img0_t)
             feats_drone_r_scaled = rbd(feats_drone_b_scaled)
+        num_kpts_drone = int(feats_drone_r_scaled["keypoints"].shape[0])
         bgr_rot = cv2.imread(str(DRONE_IMG), cv2.IMREAD_COLOR)
         drone_rot_size = (bgr_rot.shape[1], bgr_rot.shape[0])  # (W,H)
         DRONE_IMG_FOR_VIZ = DRONE_IMG
@@ -1107,7 +1086,7 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
         # -------------------- Extract features from rotated drone image --------------------
         with torch.inference_mode():
             # SCALE drone img to match sat tiles
-            scale_drone_image = 1.0 / SCALE_TILE_TO_DRONE   # sat_px_per_drone_px
+            scale_drone_image = 1.0 / NUMBER_OF_DRONE_PX_FOR_1_SAT   # sat_px_per_drone_px
             bgr_rot_small = cv2.resize(
                             bgr_rot,
                             (int(wR * scale_drone_image), int(hR * scale_drone_image)),
@@ -1123,171 +1102,111 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
 
             feats_drone_b_scaled = extractor.extract(img_t)
             feats_drone_r_scaled = rbd(feats_drone_b_scaled)
+        num_kpts_drone = int(feats_drone_r_scaled["keypoints"].shape[0])
 
         hR, wR = bgr_rot.shape[:2]
         drone_rot_size = (wR, hR)
         
-    # -------------------- Pass 1: score all tiles --------------------   
-    if not selected_tiles:
-        raise FileNotFoundError(f"No PNG tiles in {SAT_DIR}")
-
-    scores_small = []
-    # we need to restart variables for best match
+    # -------------------- Match drone ↔ sat ROI --------------------
     H_best = None
     best_shape_score = 0.0
-    best_shape_terms = None
     best_conf_overall = 0.0
+    best_pts_drone_np = None
+    best_pts_sat_np = None
+    best_inlier_mask = None
+    num_inliers = 0
+    avg_conf = float("nan")
+    median_projection_err = float("inf")
+    shape_conf = float("nan")
+    K = 0
 
     with torch.inference_mode():
-        for i, p in enumerate(selected_tiles):
-            # the following is necessary to avoid "referenced before assignment" errors
-            num_inliers = 0 
-            avg_conf = float("nan")
-            median_projection_err = float("inf")   
-            overall_conf = float("-inf") 
-            shape_conf = float("nan")  
-            shape_terms = np.full(5, np.nan, dtype=np.float64)
-            K = None
-            H = None
-            is_convex_dlt = False
-            H_ransac = None
-            H_dlt = None
-            inlier_mask = None
+        rgb_roi = cv2.cvtColor(sat_roi_bgr, cv2.COLOR_BGR2RGB)
+        roi_np = rgb_roi.astype(np.float32) / 255.0
+        roi_t = torch.from_numpy(roi_np).permute(2, 0, 1).unsqueeze(0).to(device if feat != "sift" else "cpu")
+        feats_roi_b = extractor.extract(roi_t)
+        feats_roi_r = rbd(feats_roi_b)
+        num_kpts_sat = int(feats_roi_r["keypoints"].shape[0])
 
-            tile_pt = make_feature_pt_path_for(p)
+        matches01 = matcher({"image0": feats_drone_b_scaled, "image1": feats_roi_b})
+        matches01_r = rbd(matches01)
 
-            # -------------------- Load / extract features for tile --------------------
-            if tile_pt.exists():
-                feats_tile_b, feats_tile_r = load_feats_pt_batched(tile_pt, device if feat != "sift" else "cpu")
-            else: # if none saved, extract on the fly
-                if extractor is None:
-                    raise FileNotFoundError(f"Missing {tile_pt} and no extractor available.")
-                img1_t  = load_image(str(p)).to(device if feat != "sift" else "cpu")
-                feats_tile_b = extractor.extract(img1_t)
-                feats_tile_r = rbd(feats_tile_b) # TODO save the features from drone imge for future runs
-                print(f"[info] Extracted features on-the-fly for tile {p.name}.")
+        matches = matches01_r.get("matches", None)
 
-            # -------------------- Match features --------------------
-            matches01 = matcher({"image0": feats_drone_b_scaled, "image1": feats_tile_b})
-            matches01_r = rbd(matches01)
+        # Filter by LightGlue confidence (very mild filter)
+        scores = matches01_r["scores"].detach().cpu().numpy()
+        mask_good = scores > 0.25
 
-            matches = matches01_r.get("matches", None)
-            K = int(matches.shape[0]) if (matches is not None and matches.numel() > 0) else 0
+        # Safety: require at least X matches
+        MIN_MATCHES = 20
+        if mask_good.sum() < MIN_MATCHES:
+            mask_good = np.ones_like(mask_good, dtype=bool)
 
-            # -------------------- Estimate homography with RANSAC or DLT--------------------
-            if K >= 4: # at least 4 matches to estimate homography 
-                pts_drone_small_np = feats_drone_r_scaled["keypoints"][matches[:, 0]].detach().cpu().numpy()
-                pts_tile_np = feats_tile_r["keypoints"][matches[:, 1]].detach().cpu().numpy()
+        matches = matches[mask_good]
+        scores = scores[mask_good]
 
-                # scale pts_drone back to ORIGINAL drone px (IMPORTANT for homography estimation)
-                pts_drone_np = pts_drone_small_np * SCALE_TILE_TO_DRONE
-                # since small = full * scale  → full = small / scale
 
-                # RANSAC with MAGSAC
-                H_ransac, mask = cv2.findHomography(
-                    pts_drone_np, pts_tile_np, method=cv2.USAC_MAGSAC,
-                    ransacReprojThreshold=3.0, confidence=0.999
-                ) 
-                # check for convexity of H_ransac
-                is_convex, corners_ransac =is_homography_convex_and_corners_warped(H_ransac, drone_rot_size[0], drone_rot_size[1]) #original drone size for convexity check
-                if is_convex == False:
-                    continue # skip non-convex homographies
-                # get inlier count and avg confidence from LG
+        K = int(matches.shape[0]) if (matches is not None and matches.numel() > 0) else 0
+
+        if K >= 4:
+            pts_drone_small_np = feats_drone_r_scaled["keypoints"][matches[:, 0]].detach().cpu().numpy()
+            pts_sat_roi_np = feats_roi_r["keypoints"][matches[:, 1]].detach().cpu().numpy()
+
+            pts_drone_np = pts_drone_small_np * NUMBER_OF_DRONE_PX_FOR_1_SAT
+            pts_sat_np = pts_sat_roi_np + np.array([x0, y0], dtype=np.float32)
+
+            H_ransac, mask = cv2.findHomography(
+                pts_drone_np, pts_sat_np, method=cv2.USAC_MAGSAC,
+                ransacReprojThreshold=3.0, confidence=0.999
+            ) 
+            is_convex, corners_ransac = is_homography_convex_and_corners_warped(H_ransac, drone_rot_size[0], drone_rot_size[1]) #original drone size for convexity check
+            if is_convex:
                 if mask is not None:
                     inlier_mask = mask.ravel().astype(bool)
                     num_inliers = int(inlier_mask.sum())
 
-                    scores_t = matches01_r.get("scores", None)
-                    if scores_t is not None and num_inliers > 0:
-                        scores_np = scores_t.detach().cpu().numpy()
-                        avg_conf = float(np.mean(scores_np[inlier_mask]))
+                    if scores is not None and num_inliers > 0:
+                        avg_conf = float(np.mean(scores[inlier_mask]))
 
-                # compute shape score and median reprojection error for RANSAC H
-                shape_ransac, terms_ransac = get_homography_shape_score(corners_ransac, drone_rot_size[0], drone_rot_size[1], SCALE_TILE_TO_DRONE)
+                shape_ransac = get_homography_shape_score(corners_ransac, drone_rot_size[0], drone_rot_size[1], NUMBER_OF_DRONE_PX_FOR_1_SAT)
                 median_projection_err_ransac = get_median_projection_error(
-                        H_ransac, pts_drone_np, pts_tile_np, inlier_mask
+                        H_ransac, pts_drone_np, pts_sat_np, inlier_mask
                     )
 
-                #--------------- Optional DLT refinement ---------------
-                if H_ransac is not None and num_inliers >= 8: # at least 8 inliers to use DLT otherwise unstable
-                    H_dlt, _ = cv2.findHomography(pts_drone_np[inlier_mask], pts_tile_np[inlier_mask], method=0)
+                H_dlt = None
+                is_convex_dlt = False
+                if H_ransac is not None and num_inliers >= 8 and inlier_mask is not None:
+                    H_dlt, _ = cv2.findHomography(pts_drone_np[inlier_mask], pts_sat_np[inlier_mask], method=0)
                     is_convex_dlt, corners_dlt = is_homography_convex_and_corners_warped(H_dlt, drone_rot_size[0], drone_rot_size[1])
 
-                # ---------- Decide between RANSAC and DLT ----------------------
-                #   We use both reprojection error and shape score to decide which one to keep.
-                #   Reprojection error will always be better for DLT but if we have a good RANSAC
                 if is_convex_dlt == False: # if DLT is not convex, use RANSAC
-                    H = H_ransac
+                    H_best = H_ransac
                     shape_conf = shape_ransac
-                    shape_terms = terms_ransac
                     median_projection_err = median_projection_err_ransac
                 else:
-                    # compute shape score for DLT
-                    shape_dlt, terms_dlt = get_homography_shape_score(corners_dlt, drone_rot_size[0], drone_rot_size[1], SCALE_TILE_TO_DRONE)
+                    shape_dlt = get_homography_shape_score(corners_dlt, drone_rot_size[0], drone_rot_size[1], NUMBER_OF_DRONE_PX_FOR_1_SAT)
                     median_projection_err_dlt = get_median_projection_error(
-                        H_dlt, pts_drone_np, pts_tile_np, inlier_mask
+                        H_dlt, pts_drone_np, pts_sat_np, inlier_mask
                     )
-                    # both exist, enough inliers: use DLT only if better in shape
                     if shape_dlt > shape_ransac: 
-                        H = H_dlt
+                        H_best = H_dlt
                         shape_conf = shape_dlt
-                        shape_terms = terms_dlt
                         median_projection_err = median_projection_err_dlt
                     else: # keep RANSAC
-                        H = H_ransac
+                        H_best = H_ransac
                         shape_conf = shape_ransac
-                        shape_terms = terms_ransac
                         median_projection_err = median_projection_err_ransac
                         
-                # ---------- Overall Confidence + CHOSE BEST----------
-                if H is not None:
-                    overall_conf = get_confidence_meas(
+                if H_best is not None:
+                    best_conf_overall = get_confidence_meas(
                         num_inliers, avg_conf, median_projection_err, shape_conf
                     )
+                    best_shape_score = shape_conf
+                    best_pts_drone_np = pts_drone_np
+                    best_pts_sat_roi_np = pts_sat_roi_np
+                    best_pts_sat_np = pts_sat_np
+                    best_inlier_mask = inlier_mask
 
-                    # ---------- Keep best homography across tiles ----------
-                    if overall_conf > best_conf_overall:  
-                        if overall_conf == best_conf_overall and shape_conf < best_shape_score:
-                            continue  # keep previous best if overall_conf tie but shape_conf not better
-                        H_best = H
-                        best_shape_score = shape_conf
-                        best_shape_terms = shape_terms
-                        best_conf_overall = overall_conf
-                        best_pts_drone_np = pts_drone_np
-                        best_pts_tile_np = pts_tile_np
-                        best_inlier_mask = inlier_mask
-
-            # -------------------- Save per-tile score --------------------           
-            scores_small.append({
-                "tile": p,
-                "inliers": num_inliers,
-                "total_matches": K,
-                "avg_conf": avg_conf,
-                "median_err": median_projection_err,  
-                "shape_score": shape_conf,
-                "shape_terms": shape_terms,
-                "overall_conf": overall_conf
-            })
-    
-    # -------------------- Rank them and save in CSV. There is gonna be one CSV for each drone image --------------------
-    scores_small.sort(key=lambda d:(d["overall_conf"], 0.0 if not math.isfinite(d["shape_score"]) else d["shape_score"]),
-                                    reverse=True)
-    if visualisations_enabled:
-        with open(CSV_RESULT_PATH, "w", newline="") as f:
-            w = csv.writer(f)
-            w.writerow(["tile", "total_matches", "inliers", "avg_confidence", "median_reproj_error", "shape_terms", "shape_score", "overall_conf"])
-            for r in scores_small:
-                w.writerow([
-                    r["tile"].name,
-                    r["total_matches"],
-                    r["inliers"],
-                    "" if not math.isfinite(r["avg_conf"]) else f"{r['avg_conf']:.4f}",
-                    "" if not math.isfinite(r["median_err"]) else f"{r['median_err']:.4f}",
-                    fmt_shape_terms(r.get("shape_terms")),
-                    "" if not math.isfinite(r["shape_score"]) else f"{r['shape_score']:.4f}",
-                    "" if not math.isfinite(r["overall_conf"]) else f"{r['overall_conf']:.4f}"
-                ])
-    
     ########################################################################################################
     #- --------------------- Pass 2: Visualization and Kalman Filtering on top 1 candidate --------------------
     ##########################################################################################################
@@ -1295,47 +1214,26 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
      # ----------------------------- IF needed, skip update and use predict only-------------------
     if (H_best is None or best_conf_overall < MIN_CONFIDENCE_FOR_EKF_UPDATE):
         t_end = time.perf_counter()
-        tile_name = None
-        num_inliers = None
-        K = None
-        avg_confidence = None
-        median_reproj_error_px = None
-        shape_conf = None
-        shape_terms = None
-        if H_best is not None:
-            # -------------------- Read top-1 candidate scores --------------------
-            top1 = scores_small[0] # top-1 only.
-            tile_name = top1["tile"]               
-            num_inliers = top1["inliers"]
-            K = top1["total_matches"]
-            avg_confidence = top1["avg_conf"]
-            median_reproj_error_px = top1["median_err"]
-            shape_conf = top1["shape_score"]
-            shape_terms = top1.get("shape_terms")
-            best_conf_overall = top1["overall_conf"]
-
         print(f"[info] Skipping EKF update for {drone_img} due to no valid homography or low confidence ({best_conf_overall:.4f} < {MIN_CONFIDENCE_FOR_EKF_UPDATE})")
         pose_ekf = get_location_in_sat_img((x_pred[0], x_pred[1]), SAT_LONG_LAT_INFO_DIR, sat_number, SAT_DISPLAY_META)
         error_ekf, dx_ekf, dy_ekf, dphi_ekf, _ = determine_pos_error(pose_ekf, x_pred[3], DRONE_INFO_DIR, drone_img)
-        shape_terms_str = fmt_shape_terms(shape_terms)
     
         with open(CSV_FINAL_RESULT_PATH, "a", newline="") as f:
             w = csv.writer(f)
             w.writerow([drone_img, #"drone_image",
-                        "N/A" if tile_name is None else tile_name.stem, # "tile",
-                        "N/A" if K is None else K, # "total_matches",
-                        len(selected_tiles), #search_tiles",
-                        "N/A" if num_inliers is None else num_inliers, # "inliers",
-                        "N/A" if avg_confidence is None else f"{avg_confidence:.3f}", #"avg_confidence", 
-                        "N/A" if median_reproj_error_px is None else f"{median_reproj_error_px:.3f}", # median_reproj_error,
-                        shape_terms_str,
-                        "N/A" if shape_conf is None else f"{shape_conf:.3f}", # shape_score,
-                        "N/A" if best_conf_overall == 0.0  else f"{best_conf_overall:.3f}", # best_conf_overall
+                        roi_label,
+                        K, # "total_matches",
+                        num_inliers, # "inliers",
+                        num_kpts_drone,
+                        "" if not math.isfinite(avg_conf) else f"{avg_conf:.3f}", #"avg_confidence", 
+                        "" if not math.isfinite(median_projection_err) else f"{median_projection_err:.3f}", # median_reproj_error,
+                        "" if not math.isfinite(shape_conf) else f"{shape_conf:.3f}", # shape_score,
+                        "" if best_conf_overall == 0.0  else f"{best_conf_overall:.3f}", # best_conf_overall
                         "N/A", "N/A", "N/A", # x_meas, y_meas, phi_meas_deg
                         f"{x_pred[0]:.8f}", f"{x_pred[1]:.8f}", f"{x_pred[3]:.3f}", # x_ekf, y_ekf, phi_ekf_deg
                         "N/A", "N/A", # dx, dy
                         f"{dx_ekf:.4f}", f"{dy_ekf:.4f}", # dx_ekf, dy_ekf
-                        "N/A",f"{error_ekf:.4f}", f"{error_ekf:.4f}", # error, error_pred, ekf_error
+                        "N/A",f"{error_pred:.4f}", f"{error_ekf:.4f}", # error, error_pred, ekf_error
                         "N/A", f"{dphi_ekf:.4f}", # heading_diff, ekf_heading_diff
                         f"{t_end - t_start:.4f}",   # time_s
                         ])
@@ -1369,34 +1267,22 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
             cv2.imwrite(str(OUT_OVERALL_SAT_VIS_PATH), overlay_img)
         continue # next drone image
 
-    # -------------------- Read top-1 candidate scores needed for ekf --------------------
-    top1 = scores_small[0] # top-1 only.
-    tile_name = top1["tile"]
-    best_conf_overall = top1["overall_conf"]
-    shape_terms = best_shape_terms if best_shape_terms is not None else top1.get("shape_terms")
-    shape_terms_str = fmt_shape_terms(shape_terms)
-
     # -------------------- Visualizations: plotting the matches side-by-side --------------------
     if visualisations_enabled:
-        out_match_png = OUT_DIR / f"top1_{tile_name.stem}_matches.png"
-        visualize_inliers(DRONE_IMG_FOR_VIZ, tile_name, best_pts_drone_np, best_pts_tile_np, best_inlier_mask, str(out_match_png))
+        out_match_png = OUT_DIR / f"{roi_label}_matches.png"
+        visualize_inliers(DRONE_IMG_FOR_VIZ, sat_roi_bgr[..., ::-1] / 255.0, best_pts_drone_np, pts_sat_roi_np, best_inlier_mask, str(out_match_png), label=roi_label)
 
 
     ##############################################################################################
     #initialize satellite display
     sat_base = sat_vis.copy()
 
-    # ORIGINAL drone size (for original-frame overlays / error)
-    _bgr_orig = cv2.imread(str(DRONE_IMG), cv2.IMREAD_COLOR)
-    H_orig, W_orig = _bgr_orig.shape[:2]
-
-    # Compute H from ORIGINAL drone frame to TILE frame
-    H_rot2tile = H_best # the best match
-    H_orig2tile = H_rot2tile @ R_orig2rot   
+    # Compute H from ORIGINAL drone frame to SAT frame
+    H_rot2sat = H_best # the best match
+    H_orig2sat = H_rot2sat @ R_orig2rot   
 
     # -------------------- Get visualisation parameters --------------------
-    x_off, y_off = tile_offset_from_name(tile_name) # Project ORIGINAL drone corners/center (for overlays & error)
-    center_global, corners_global, heading_unitvector_measurement = get_visualisation_parameters(H_orig2tile, W_orig, H_orig, x_off, y_off)
+    center_global, corners_global, heading_unitvector_measurement = get_visualisation_parameters(H_orig2sat, W_orig, H_orig)
 
     #################################################################
     #------------- extended kalman filter update step ------------
@@ -1450,7 +1336,7 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
         for i in range(2):
             if i == 0: # individual overlay for this tile
                 sat_individual = sat_base.copy()
-                out_overlay = OUT_DIR / f"top1_{tile_name.stem}_overlay_on_sat.png"
+                out_overlay = OUT_DIR / f"{roi_label}_overlay_on_sat.png"
                 #BGR colors
                 color = [(255,255,255), (255, 0, 0), (0, 255, 0), (0, 0, 255),(0,255,255)]  # Blue: GT, Green: EKF, Red: Meas, Yellow: Pred, Cyan: overall
 
@@ -1489,28 +1375,18 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
 
             cv2.imwrite(str(out_overlay), sat_individual)
     
-    # -------------------- Read top-1 candidate scores needed for CSV --------------------            
-    num_inliers = top1["inliers"]
-    K = top1["total_matches"]
-    avg_confidence = top1["avg_conf"]
-    median_reproj_error_px = top1["median_err"]
-    shape_conf = top1["shape_score"]
-
-    error_pred, _, _, _, _ = determine_pos_error((x_pred[0], x_pred[1]), x_pred[3], DRONE_INFO_DIR, drone_img)
     #------------- save final results to overall CSV file --------------------
-    # add to the bottom of results_{sat_number}.csv file:
     with open(CSV_FINAL_RESULT_PATH, "a", newline="") as f:
         w = csv.writer(f)
         w.writerow([
             drone_img,
-            tile_name.stem,
+            roi_label,
             K,
-            len(selected_tiles),
             num_inliers,
-            f"{avg_confidence:.3f}",
-            f"{median_reproj_error_px:.3f}",
-            shape_terms_str,
-            f"{shape_conf:.3f}",
+            num_kpts_drone,
+            f"{avg_conf:.3f}" if math.isfinite(avg_conf) else "",
+            f"{median_projection_err:.3f}" if math.isfinite(median_projection_err) else "",
+            f"{shape_conf:.3f}" if math.isfinite(shape_conf) else "",
             f"{best_conf_overall:.3f}",
             f"{meas_x_px:.8f}", f"{meas_y_px:.8f}", f"{meas_phi_deg:.3f}",
             f"{x_updated[0]:.8f}", f"{x_updated[1]:.8f}", f"{x_updated[3]:.3f}",
