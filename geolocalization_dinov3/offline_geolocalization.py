@@ -131,6 +131,8 @@ if __name__ == "__main__":
                 # Run model
                 features = process_image_with_dino(image_tensor, model, device)
 
+                print(features.shape)  # Should be [num_patches, feature_dim]
+
                 # Add individually processed features to shared array.
                 h_patches = image_resized.shape[1] // PATCH_SIZE; w_patches = image_resized.shape[2] // PATCH_SIZE # 32 x 37
                 sat_patch_feature.append((features.cpu()))

@@ -25,19 +25,10 @@ import re
 # Configuration
 # ----------------------------
 PATCH_SIZE = 16 # Keep constant for DINOv3 ViT models
-IMAGE_SIZE = 1024 # Desired size for the image (DINOv3 was trained on 512x512 images)
 
 # ----------------------------
 # Helper function
 # ----------------------------
-# Resize while preserving aspect ratio
-def resize_transform_preserve_aspect_ratio(image: Image, image_size: int = IMAGE_SIZE, patch_size: int = PATCH_SIZE) -> torch.Tensor:
-    """Resize image so its dimensions are divisible by patch size while preserving aspect ratio."""
-    w, h = image.size
-    h_patches = int(image_size / patch_size)
-    w_patches = int((w * image_size) / (h * patch_size))
-    return TF.to_tensor(TF.resize(image, (h_patches * patch_size, w_patches * patch_size)))
-
 def tile_offset_from_name(tile_path: Path):
     name = tile_path.stem
     m = re.search(r"y(?P<y>\d+)_x(?P<x>\d+)", name)
@@ -76,65 +67,29 @@ def tiles_in_bbox(bbox, TILE_W, TILE_H, all_tile_names):
         if not (tile_bbox[2] < x_min or tile_bbox[0] > x_max or
                 tile_bbox[3] < y_min or tile_bbox[1] > y_max):
             selected_tiles.append(tile_path)
-    return selected_tiles 
+    return selected_tiles
 
-def preprocess_image(image: Image) -> torch.Tensor:
-    """Preprocess image for model input"""
-    image_resized = resize_transform_preserve_aspect_ratio(image, image_size=IMAGE_SIZE, patch_size=PATCH_SIZE) # Uses aspect ratio preserving resize
-    return image_resized.unsqueeze(0), image_resized  # [1, 3, H, W]
-
-
-def process_image_with_dino(image_tensor: torch.Tensor, model: AutoModel, device: torch.device) -> torch.Tensor:
-    """Process image with DINO model and return PCA projected features"""
-    start_time = time.time() # Measure inference time
+def process_image_with_dino(image: Image, model: AutoModel, device: torch.device) -> torch.Tensor:
+    """Process image with DINO model and return PCA projected features."""
+    #start_time = time.time() # Measure inference time
+    image_tensor = TF.to_tensor(image).unsqueeze(0).to(device)
 
     image_tensor = image_tensor.to(device)
-    with torch.no_grad(): # no gradients needed for inference, grad only used for backpropagation-training
+    with torch.no_grad(): # no gradients needed for inference, grad only used for training
         outputs = model(image_tensor, output_hidden_states=True)
         hidden_states = outputs.hidden_states
     
-    end_time = time.time() # About 0.3 seconds on RTX 4060 Laptop GPU (first run slower due to model load) - 0.03 seconds subsequently
-    print(f"Model inference time: {end_time - start_time:.2f} seconds")
+    #end_time = time.time()
+    #print(f"Model inference time: {end_time - start_time:.2f} seconds")
 
     features = hidden_states[-1][0, 1:, :]  # remove CLS token, take batch 0
 
     return features
 
-def pca_project_rgb(features: torch.Tensor, image_resized: torch.Tensor) -> torch.Tensor:
-    """Project features to 3D RGB space using PCA."""
-    x = features  # [num_patches, feature_dim]
-    h_patches = image_resized.shape[1] // PATCH_SIZE # // is integer division, rounds down
-    w_patches = image_resized.shape[2] // PATCH_SIZE
-
-    num_patches = h_patches * w_patches
-    print(f"Image size: {image_resized.shape[1:]} -> Patch grid: {h_patches} x {w_patches} = {num_patches} patches")
-
-    # Keep only the first `num_patches` features in case of extra tokens
-    x = x[:num_patches, :]
-
-    # ----------------------------
-    # PCA to 3D for RGB visualization
-    # ----------------------------
-    x_cpu = x.cpu().numpy()  # move to CPU for PCA
-    pca = PCA(n_components=3, whiten=True)
-    projected_image = torch.from_numpy(pca.fit_transform(x_cpu)).view(h_patches, w_patches, 3)
-
-    # Multiply by 2 and apply sigmoid to scale values between 0 and 1 for visualization
-    projected_image = torch.nn.functional.sigmoid(projected_image.mul(2.0)).permute(2, 0, 1)
-
-    # The outputs first 4 columns are misaligned, so we move them to the back, to restore the image
-    # This is a quick fix solution. If time allows, we should investigate the root cause.
-    projected_image = torch.cat((projected_image[:, :, 4:], projected_image[:, :, :4]), dim=2) 
-    
-    return projected_image
-
-
 def locate_drone_position(
     drone_features: torch.Tensor,
     sat_patches,       # stitched satellite image (H x W x 3)
     sat_features,      # feature_grid: 2D list of [row][col] tiles, each tile = list of feature blocks
-    kernel_size,
-    fine_kernel_size,
     device='cuda'
 ):
     # Normalize drone features
@@ -148,13 +103,12 @@ def locate_drone_position(
     print(f"Tile grid: {num_tiles_rows} rows x {num_tiles_cols} cols")
 
     # Compute valid kernel positions for coarse search
-    valid_rows = num_tiles_rows - kernel_size + 1
-    valid_cols = num_tiles_cols - kernel_size + 1
+    valid_rows = num_tiles_rows
+    valid_cols = num_tiles_cols
     heatmap = np.full((valid_rows, valid_cols), -np.inf, dtype=float)
     best_score = -float('inf')
     best_pos = None
 
-    # Build a coordinate grid matching feature_grid indices
     coord_grid = []
     for yi, y in enumerate(ys):
         row_coords = []
@@ -166,8 +120,8 @@ def locate_drone_position(
     for row in range(valid_rows):
         for col in range(valid_cols):
             kernel_tiles = []
-            for r in range(row, row + kernel_size):
-                for c in range(col, col + kernel_size):
+            for r in range(row, row + 1): # kernel_size was 1 prior to edit
+                for c in range(col, col + 1):
                     tile_feat = torch.cat([b.to(device) for b in sat_features[r][c]], dim=0)
                     kernel_tiles.append(tile_feat)
             kernel_features = torch.cat(kernel_tiles, dim=0).to(device)
@@ -185,151 +139,33 @@ def locate_drone_position(
             del kernel_features, similarity
             torch.cuda.empty_cache()
 
+    #plt.figure(figsize=(8,6))
+    #plt.imshow(heatmap, cmap='hot', interpolation='nearest')
+    #plt.colorbar()
+    #plt.show()
+
     # Map best coarse kernel to patch coordinates
     row, col = best_pos
     crop_left   = col * tile_width
-    crop_right  = (col + kernel_size) * tile_width
+    crop_right  = (col + 1) * tile_width
     crop_top    = row * tile_height
-    crop_bottom = (row + kernel_size) * tile_height
+    crop_bottom = (row + 1) * tile_height
+    patch = Image.fromarray(sat_patches[crop_top:crop_bottom, crop_left:crop_right, :])
 
     # NOTE: winner_x / winner_y should be passed in from metadata if available
     winner_x, winner_y = coord_grid[row][col]
 
-    print(f"Best coarse match at tile grid ({row}, {col})")
-    print(coord_grid)
-
-    features_to_load = "tile_y{}_x{}.pt".format(winner_y, winner_x)
-    path_to_features = Path("geolocalization_dinov3/tile_features") / features_to_load
-
-    tile_feat_list = torch.load(path_to_features, map_location=device, weights_only=True)  # shape: (N, D)
-    tile_feat = torch.cat(tile_feat_list, dim=0)
-
-    # Determine fine-grained grid
-    D = tile_feat.shape[1]
-    Hbig = 32
-    Wbig = 37
-    tile_feat = tile_feat[:Hbig*Wbig]
-    tile_grid = tile_feat.view(Hbig, Wbig, D)
-
-    # Split into fine tiles
-    num_tiles_width = Wbig
-    num_tiles_height = Hbig
-
-    patch_features_list = []
-    h_step = Hbig / num_tiles_height
-    w_step = Wbig / num_tiles_width
-
-    for i in range(num_tiles_height):
-        h_start = int(round(i * h_step))
-        h_end   = int(round((i+1) * h_step))
-        h_end = min(h_end, Hbig)  # ensure no overflow
-        for j in range(num_tiles_width):
-            w_start = int(round(j * w_step))
-            w_end   = int(round((j+1) * w_step))
-            w_end = min(w_end, Wbig)
-            patch_features_list.append(tile_grid[h_start:h_end, w_start:w_end, :].reshape(-1, D))
-
-    # Fine-grained search
-    heatmap_fine = np.full((num_tiles_height - fine_kernel_size + 1,
-                            num_tiles_width - fine_kernel_size + 1), -np.inf, dtype=float)
-    # Initialize a min-heap of size 3 for top similarities
-    top_k = 3
-    best_scores_fine = [(-float('inf'), None)] * top_k  # [(score, (row, col)), ...]
-
-    for row in range(heatmap_fine.shape[0]):
-        for col in range(heatmap_fine.shape[1]):
-            kernel_tiles = []
-            for r in range(row, row + fine_kernel_size):
-                for c in range(col, col + fine_kernel_size):
-                    kernel_tiles.append(patch_features_list[r * num_tiles_width + c])
-            kernel_features = torch.cat(kernel_tiles, dim=0).to(device)
-            kernel_features = F.normalize(kernel_features, dim=-1)
-
-            similarity = torch.matmul(drone_features, kernel_features.T)
-            sim_weights = torch.softmax(similarity.flatten()/1, dim=0)
-            sim_score = (similarity.flatten() * sim_weights).sum().item()
-            heatmap_fine[row, col] = sim_score
-
-            # Maintain top 3 scores
-            if sim_score > best_scores_fine[0][0]:
-                best_scores_fine[0] = (sim_score, (row, col))
-                best_scores_fine.sort()  # Keep smallest at index 0
-
-            del kernel_features, similarity
-            torch.cuda.empty_cache()
-
-    # Sort top 3 in descending order
-    top_scores = sorted(best_scores_fine, key=lambda x: x[0], reverse=True)
-
-    #plt.figure(figsize=(8,6))
-    #plt.imshow(heatmap_fine, cmap='hot', interpolation='nearest')
-    #plt.colorbar()
-    #plt.show()
-
-    # Crop all top 3 patches
-    coarse_patch = sat_patches[crop_top:crop_bottom, crop_left:crop_right, :]
-    patch_height, patch_width = coarse_patch.shape[:2]
-    fine_tile_h = patch_height // num_tiles_height
-    fine_tile_w = patch_width  // num_tiles_width
-
-    top_patches_with_coords = []
-    for score, (row, col) in top_scores:
-        center_y = row * fine_tile_h + (fine_kernel_size * fine_tile_h) // 2
-        center_x = col * fine_tile_w  + (fine_kernel_size * fine_tile_w)  // 2
-
-        crop_top_fine    = max(0, center_y - (fine_kernel_size * fine_tile_h) // 2)
-        crop_left_fine   = max(0, center_x - (fine_kernel_size * fine_tile_w)  // 2)
-        crop_bottom_fine = min(patch_height, crop_top_fine + fine_kernel_size * fine_tile_h)
-        crop_right_fine  = min(patch_width,  crop_left_fine + fine_kernel_size * fine_tile_w)
-
-        patch = Image.fromarray(coarse_patch[crop_top_fine:crop_bottom_fine,
-                                            crop_left_fine:crop_right_fine, :])
-        # Store as (patch, crop_left, crop_top)
-        top_patches_with_coords.append((patch, crop_left_fine, crop_top_fine))
-
     # Return all top 3 patches with coordinates
-    return top_patches_with_coords, heatmap_fine, winner_x, winner_y, [kernel_size, 3, 3, fine_kernel_size, num_tiles_height, num_tiles_width]
+    return [patch, crop_left, crop_top], heatmap, winner_x, winner_y, (Path("geolocalization_dinov3/tile_features_uniform") / "tile_y{}_x{}.pt".format(winner_y, winner_x))
 
-
-def drone_position_homography(drone_img: Image.Image, sat_patch: Image.Image, drone_heading: float, kernel_info: list):
+def drone_position_homography(og_drone_img: Image.Image, drone_img_rotated: Image.Image, sat_patch: Image.Image, drone_heading: float):
     """ From the satellite patch and the drone image, find the drone position using feature matching and homography """
-    # Resize satellite patch to roughly match drone image
-    # We use the meters per pixel from both the satellite and drone images to compute the scaling factors
-    # The drone was reported to have a resolution of 0.1-0.2m per pixel, 0.15m per pixel seems to provide the right scale
-    scale_hor =  2.167/0.15 * (kernel_info[0] / kernel_info[1]) * (kernel_info[3] / kernel_info[4])
-    scale_ver =  2.234/0.15 * (kernel_info[0] / kernel_info[2]) * (kernel_info[3] / kernel_info[5])
-    #print("Resizing satellite patch by factors: ", scale_hor, scale_ver)
-    new_width = int(sat_patch.width * scale_hor)
-    new_height = int(sat_patch.height * scale_ver)
-
-    # Resize satellite patch without cropping:
-    sat_resized = sat_patch.resize((new_width, new_height), Image.LANCZOS)
-    #print("Image has been resized")
-
     # Convert to grayscale
-    sat_gray = cv2.cvtColor(np.array(sat_resized), cv2.COLOR_RGB2GRAY)
-    drone_gray = cv2.cvtColor(np.array(drone_img), cv2.COLOR_RGB2GRAY)
+    sat_cv2 = cv2.cvtColor(np.array(sat_patch), cv2.COLOR_RGB2BGR)
+    drone_cv2 = cv2.cvtColor(np.array(drone_img_rotated), cv2.COLOR_RGB2BGR)
 
-    h, w = drone_gray.shape[:2]
-    cx, cy = w // 2, h // 2
-
-    # Rotate the drone image using drone_heading
-    M = cv2.getRotationMatrix2D((cx, cy), -drone_heading, 1.0)  # Negative angle for clockwise rotation
-    
-    # Compute new bounding size - to avoid cropping after rotation
-    cos = abs(M[0,0])
-    sin = abs(M[0,1])
-    new_w = int(h * sin + w * cos)
-    new_h = int(h * cos + w * sin)
-
-    # update matrix so image is centered
-    M[0,2] += new_w/2 - cx
-    M[1,2] += new_h/2 - cy
-
-    drone_gray_rotated = cv2.warpAffine(drone_gray, M, (new_w, new_h), flags=cv2.INTER_LINEAR, borderValue=0)
-
-    sat_tensor = TF.to_tensor(sat_gray).unsqueeze(0).float().to(device)  # Shape [1, C, H, W]
-    drone_tensor = TF.to_tensor(drone_gray_rotated).unsqueeze(0).float().to(device)
+    sat_tensor = TF.to_tensor(sat_cv2).unsqueeze(0).float().to(device)  # Shape [1, C, H, W]
+    drone_tensor = TF.to_tensor(drone_cv2).unsqueeze(0).float().to(device)
 
     # --- SuperPoint keypoints and descriptors ---
     superpoint = SuperPoint().eval().to(device)
@@ -372,17 +208,15 @@ def drone_position_homography(drone_img: Image.Image, sat_patch: Image.Image, dr
     #kp_sat_cv   = [cv2.KeyPoint(float(x), float(y), 1.0) for x, y in kp_sat_data_r["keypoints"].detach().cpu().numpy()]
     #dmatches = [cv2.DMatch(int(i), int(j), 0) for i, j in matches]
 
-    #scale = 0.3
     #vis = cv2.drawMatches(
-        #drone_gray_rotated, kp_drone_cv,
-        #sat_gray, kp_sat_cv,
-        #dmatches, None,
-        #matchColor=(0, 255, 0),
-        #singlePointColor=(255, 0, 0),
-        #flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS
+    #    drone_cv2, kp_drone_cv,
+    #    sat_cv2, kp_sat_cv,
+    #    dmatches, None,
+    #    matchColor=(0, 255, 0),
+    #    singlePointColor=(255, 0, 0),
+    #    flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS
     #)
-    #vis_resized = cv2.resize(vis, (int(vis.shape[1]*scale), int(vis.shape[0]*scale)))
-    #cv2.imshow("Feature Matches", vis_resized)
+    #cv2.imshow("Feature Matches", vis)
     #cv2.waitKey(0)
     #cv2.destroyAllWindows()
 
@@ -395,31 +229,30 @@ def drone_position_homography(drone_img: Image.Image, sat_patch: Image.Image, dr
     if pts_drone.shape[0] >= 4:
         H, mask = cv2.findHomography(pts_drone, pts_sat, cv2.RANSAC, ransacReprojThreshold=3.0, confidence=0.999)
 
-        if len(pts_drone) < 150: # Typically we get more than this for good matches
-            print("Untrustworthy reprojection confidence due to low number of matches.")
+        if len(pts_drone) < 100:
+            print(f"Warning: Only {len(pts_drone)} matches found, homography may be unreliable. Tossing to avoid noise")
             H = None
-            return H, sat_corners, drone_center, [1, 1], drone_heading
-
-        # Remember to remove the scale factor from satellite patch coordinates
-        S = np.array([[1/scale_hor, 0, 0],
-                      [0, 1/scale_ver, 0],
-                      [0, 0, 1]])
-        H = S @ H  # Adjust homography to original satellite patch size
+            return H, sat_corners, drone_center, heading_vec, heading_deg
 
         # Drone corners in drone image
         drone_corners = np.array([
             [0, 0],
-            [drone_img.width, 0],
-            [drone_img.width, drone_img.height],
-            [0, drone_img.height]
+            [og_drone_img.width, 0],
+            [og_drone_img.width, og_drone_img.height],
+            [0, og_drone_img.height]
         ], dtype=np.float32).reshape(-1, 1, 2)
 
-        # Convert corners back to original image using warp matrix
-        drone_corners_rot = cv2.transform(drone_corners, M)
+        drone_corners_rot = cv2.transform(drone_corners.reshape(-1,1,2), M)
+        drone_corners_rot = drone_corners_rot.reshape(-1,2)
 
-        # Map to satellite using Homography
-        sat_corners = cv2.perspectiveTransform(drone_corners_rot, H)
-        sat_corners = sat_corners.reshape(-1, 2) # From (4,1,2) -> (4,2)
+        # Apply scaling
+        S = np.array([[scale_hor, 0],
+                      [0, scale_ver]], dtype=np.float32)
+
+        drone_corners_scaled = (drone_corners_rot @ S.T).astype(np.float32)
+
+        sat_corners = cv2.perspectiveTransform(drone_corners_scaled.reshape(-1,1,2), H)
+        sat_corners = sat_corners.reshape(-1,2)
 
         # Check convexity of the satellite corners. (Camera image is square, so mapped corners should also be convex)
         P = sat_corners
@@ -463,7 +296,7 @@ def drone_position_homography(drone_img: Image.Image, sat_patch: Image.Image, dr
         print("Not enough good matches found for homography.")
 
     return H, sat_corners, drone_center, heading_vec, heading_deg
-    
+   
 
 if __name__ == "__main__":
     # Setup model
@@ -478,8 +311,12 @@ if __name__ == "__main__":
     failed_detections = 1  # Count failed homography detections - starts at 1 to avoid multi by zero
     starting_drone_images = ["03_0001.JPG", "03_0097.JPG", "03_0193.JPG", "03_0289.JPG", "03_0385.JPG", "03_0481.JPG", "03_0577.JPG", "03_0673.JPG", ] # the names of the drone images that starts a run
 
+    # Initialize position and heading
+    curr_position = None
+    curr_heading = 0.0
+
     # Initilize directories and paths
-    sat_feature_dir = "geolocalization_dinov3/tile_features"
+    sat_feature_dir = "geolocalization_dinov3/tile_features_uniform"
 
     # If working with a dataset, then we need to load their CSV file:
     csv_file_path = f"geolocalization_dinov3/dataset_data/csv_files/{used_dataset:02d}.csv"
@@ -525,26 +362,54 @@ if __name__ == "__main__":
         actual_drone_x = (actual_drone_position[1] - lat_long_1[1]) * meters_per_degree_lon / meters_per_pixel_lon
         actual_drone_curr_position = np.array([actual_drone_x, actual_drone_y])
 
-        # Preprocess image - Resize and convert to tensor
-        image_tensor, image_resized = preprocess_image(pil_image)
+        # Rotate drone image based on heading (Known for first itteration, estimated later)
+        h, w = pil_image.size[1], pil_image.size[0]
+        cx, cy = w // 2, h // 2
 
-        # Run DINOv3 model
-        features = process_image_with_dino(image_tensor, model, device)
+        # Rotate the drone image using drone_heading
+        M = cv2.getRotationMatrix2D((cx, cy), -curr_heading, 1.0)  # Negative angle for clockwise rotation
+        
+        # Compute new bounding size - to avoid cropping after rotation
+        cos = abs(M[0,0])
+        sin = abs(M[0,1])
+        new_w = int(h * sin + w * cos)
+        new_h = int(h * cos + w * sin)
+
+        # Update matrix so image is centered
+        M[0,2] += new_w/2 - cx
+        M[1,2] += new_h/2 - cy
+
+        # Perform the rotation
+        drone_rotated = cv2.warpAffine(np.array(pil_image), M, (new_w, new_h), flags=cv2.INTER_LINEAR, borderValue=0)
+
+        # Scale drone image to match satellite image scale (Based on pixels per meter)
+        scale_hor = 0.15/2.167 * 3 # Drone ppm is somewhere between 0.1 and 0.2. 0.15 seems to be good for dataset 03
+        scale_ver = 0.15/2.234 * 3
+        #print("Resizing satellite patch by factors: ", scale_hor, scale_ver)
+        new_width = int(drone_rotated.shape[1] * scale_hor)
+        new_height = int(drone_rotated.shape[0] * scale_ver)
+
+        # Resize satellite patch without cropping:
+        rotated_drone_resized = Image.fromarray(drone_rotated).resize((new_width, new_height), Image.LANCZOS)
+        # Currently drone is (329x306) while sub-tiles are (171x171) -- Consider getting these closer in size?
+
+        # Extract DINOv3 features from drone image (Using Native Drone Size!!!)
+        features = process_image_with_dino(rotated_drone_resized, model, device)
 
         # Generate an ellipse box around the current drone position estimate (Done to ensure drone position does not jump too far)
-        sigma = np.array([[15000.0 * failed_detections, 0.0], [0.0, 15000.0 * failed_detections]])  # Uncertainty covariance in pixels (tune as needed)
+        sigma = np.array([[30000.0 * failed_detections, 0.0], [0.0, 30000.0 * failed_detections]])  # Uncertainty covariance in pixels (tune as needed)
         k = 2.0  # Scaling factor for ellipse size (e.g., 2 standard deviations)
         ellipse_bbox_coords = ellipse_bbox(curr_position[:2], sigma, k=k, n=72)
 
-        TILE_W = 3963; TILE_H = 3349 # Currently width x height are just hardcoded from satellite_image_processing.py
+        TILE_W = 2064; TILE_H = 2025 # Currently width x height are just hardcoded from satellite_image_processing.py
         
         # Extract the tile names for the tiles within the ellipsis
-        all_tile_names = [p for p in Path("geolocalization_dinov3/tiles_png_1km").iterdir() if p.is_file() and p.suffix.lower() == ".png"]
+        all_tile_names = [p for p in Path("geolocalization_dinov3/tiles_uniform").iterdir() if p.is_file() and p.suffix.lower() == ".png"]
         selected_tiles = tiles_in_bbox(ellipse_bbox_coords, TILE_W, TILE_H, all_tile_names)
         print(f"Selected tiles in ellipse: {[t.name for t in selected_tiles]}")
 
         # Extract the features for the tiles within the ellipsis
-        all_feature_names = [p for p in Path("geolocalization_dinov3/tile_features").iterdir() if p.is_file() and p.suffix.lower() == ".pt"]
+        all_feature_names = [p for p in Path("geolocalization_dinov3/tile_features_uniform").iterdir() if p.is_file() and p.suffix.lower() == ".pt"]
         selected_features_pts = tiles_in_bbox(ellipse_bbox_coords, TILE_W, TILE_H, all_feature_names)
         #print(f"Selected tiles in ellipse: {[t.name for t in selected_features_pts]}")
 
@@ -627,48 +492,23 @@ if __name__ == "__main__":
         # Do note that, due to overlap, visualising the stichted image, will look weird, but don't worry, only 1 tile is used for localisation.
 
         # Locate drone tile position in satellite tiles
-        patch, heatmap, crop_cand_left, crop_cand_top, info = locate_drone_position(
+        patch, heatmap, crop_cand_left, crop_cand_top, picked_feats = locate_drone_position(
         drone_features=features,            # Features from drone image
         sat_patches=full_img,               # Pass the satellite images that are within ellipse
         sat_features=feature_grid,          # Point to the list of features corresponds to satellite image patches
-        kernel_size=1,                      # Expands kernel from top-left tile to N x N tiles
-        fine_kernel_size=28,                # For fine grained search within each candidate
         device=device                       # Use same device as model (likely 'cuda' - GPU)
         )
 
-        H = None
-        sat_corners = None
-        drone_center = None
-        heading_vec = None
-        heading_deg = None
-        winner_patch_info = None  # Store the patch info that succeeded
-
-        for idx, (patch, crop_left, crop_top) in enumerate(patch):
-            print(f"Trying homography for patch at left={crop_left}, top={crop_top}", str(idx+1) + "/3")
-            H_candidate, corners_candidate, center_candidate, vec_candidate, deg_candidate = drone_position_homography(
-                drone_img=pil_image,
-                sat_patch=patch,
+        H, corners, center, heading_vec, heading_deg = drone_position_homography(
+                og_drone_img=pil_image,
+                drone_img_rotated=rotated_drone_resized,
+                sat_patch=patch[0],
                 drone_heading=curr_heading,
-                kernel_info=info
-            )
-
-            if H_candidate is not None:
-                # First valid homography found
-                H = H_candidate
-                sat_corners = corners_candidate
-                drone_center = center_candidate
-                heading_vec = vec_candidate
-                heading_deg = deg_candidate
-                winner_patch_info = (patch, crop_left, crop_top)
-                print(f"Valid homography found for patch at left={crop_left}, top={crop_top}")
-                break  # stop at first successful candidate
-        else:
-            print("No valid homography found for any top candidate patches.")
+        )
 
         if H is not None:
             curr_heading = heading_deg  # Update current heading for next iteration
-            crop_left, crop_top = winner_patch_info[1], winner_patch_info[2]
-            drone_position_candidate = drone_center.astype(np.float64) + np.array([crop_left, crop_top])
+            drone_position_candidate = center.astype(np.float64) + np.array([patch[1], patch[2]])
             drone_position_world = drone_position_candidate + np.array([crop_cand_left, crop_cand_top])
 
             # Convert to lat-long using inverse of earlier conversion (From satellite_image_processing.py)
@@ -682,20 +522,17 @@ if __name__ == "__main__":
             total_error = np.sqrt(error_lat**2 + error_lon**2)
             print(f"Position error: {total_error:.2f} meters (Lat error: {error_lat:.2f} m, Lon error: {error_lon:.2f} m)")
             
-            curr_position = drone_position_world  # Update current position estimate for next itteration    
+            curr_position = drone_position_world  # Update current position estimate for next itteration   
 
-            # Added time to end of loop - measures total time for geolocalization
-            end_time = time.time()
-            print(f"Total drone geolocalization time: {end_time - start_time:.2f} seconds") # Roughly 11.5 seconds on RTX 4060 Laptop GPU
+            end_time = time.time() 
 
             # NOTE: Move the visualisation below out of the code, once we have nice images in the report
             # Do the same for sat_corners if needed for visualization
-            sat_corners_pixel = sat_corners + np.array([crop_left, crop_top])
+            """""
+            sat_corners_pixel = corners + np.array([patch[1], patch[2]])
             sat_corners_pixel = sat_corners_pixel + np.array([crop_cand_left, crop_cand_top])
 
-            """""
             scale = 0.3  # same scale used when resizing full image
-
             # Scale all coordinates
             sat_corners_pixel_scaled = sat_corners_pixel * scale
             drone_position_scaled = drone_position_world * scale
@@ -738,7 +575,7 @@ if __name__ == "__main__":
                 'processing_time_sec': end_time - start_time
             }
             log_df = pd.DataFrame([log_data])
-            log_csv_path = f"geolocalization_dinov3/dataset_data/logs/geolocalization_log_dataset_{used_dataset:02d}.csv"
+            log_csv_path = f"geolocalization_dinov3/dataset_data/logs/geolocalization_log_dataset_TVL_{used_dataset:02d}.csv"
 
             # Write to CSV file for data logging:
             if i == 1:
@@ -748,6 +585,7 @@ if __name__ == "__main__":
 
             failed_detections = 1 # Reset failed detections counter
             i += 1  # Move to next image in dataset
+
         else:
             print("Homography could not be computed for this frame. - Skipping localisation to avoid noise")
 
@@ -789,7 +627,7 @@ if __name__ == "__main__":
                 'processing_time_sec': end_time - start_time
             }
             log_df = pd.DataFrame([log_data])
-            log_csv_path = f"geolocalization_dinov3/dataset_data/logs/geolocalization_log_dataset_{used_dataset:02d}.csv"
+            log_csv_path = f"geolocalization_dinov3/dataset_data/logs/geolocalization_log_dataset_TVL_{used_dataset:02d}.csv"
 
             # Write to CSV file for data logging:
             if i == 1:

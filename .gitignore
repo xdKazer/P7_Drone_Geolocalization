@@ -423,3 +423,6 @@ FodyWeavers.xsd
 /geolocalization_dinov3/tile_features/
 /geolocalization_dinov3/full_satellite_image_small.png
 /geolocalization_dinov3/dataset_data/drone_images/*
+
+/geolocalization_dinov3/tiles_uniform
+/geolocalization_dinov3/tile_features_uniform
