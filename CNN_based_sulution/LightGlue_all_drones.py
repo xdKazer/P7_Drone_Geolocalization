@@ -26,12 +26,13 @@ MAX_KPTS = None               # max keypoints to load from .pt files (None = all
 MIN_CONFIDENCE_FOR_EKF_UPDATE = 0.2  # min confidence to use measurement update in EKF
 
 sat_number = "03"
-visualisations_enabled = True
+visualisations_enabled = False
 # --- EKF globals (top of file, before the big for-loop) ---
 ekf = None
 t_last = None   # timestamp of previous processed frame
 x_updated = None # needed for rotation of drone img
-starting_drone_images = ["03_0001.JPG", "03_0097.JPG", "03_0193.JPG", "03_0289.JPG", "03_0385.JPG", "03_0481.JPG", "03_0577.JPG", "03_0673.JPG", ] # the names of the drone images that starts a run
+if sat_number == "03":
+    starting_drone_images = ["03_0001.JPG", "03_0097.JPG", "03_0193.JPG", "03_0289.JPG", "03_0385.JPG", "03_0481.JPG", "03_0577.JPG", "03_0673.JPG", ] # the names of the drone images that starts a run
 
 BASE = Path(__file__).parent.resolve()
 DATASET_DIR = BASE / "UAV_VisLoc_dataset"
@@ -562,8 +563,8 @@ def get_confidence_meas(
     avg_conf,
     median_err_px,
     shape_conf,
-    s_err=2.5,      # reproj error scaling
-    n_err_min=60,   # only use reprojection error if inliers >= this
+    s_err=2,      # reproj error scaling
+    n_err_min=80,   # only use reprojection error if inliers >= this
     alpha_err=0.2   # fixed weight for reprojection error when used
 ):
     """
@@ -598,7 +599,7 @@ def get_confidence_meas(
     c_shape = float(np.clip(shape_conf if np.isfinite(shape_conf) else 0.0, 0.0, 1.0))
 
     # --- always 50/50 LG & shape ---
-    c_prior = 0.3 * c_lg + 0.7 * c_shape
+    c_prior = 0.4 * c_lg + 0.6 * c_shape
 
     # --- if not enough inliers or bad error -> ignore reprojection term ---
     if num_inliers < n_err_min or not np.isfinite(median_err_px):

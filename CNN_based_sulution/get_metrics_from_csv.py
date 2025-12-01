@@ -123,14 +123,14 @@ def get_metrics(csv_path):
         # Means (original)
         "mean_error_m": mean(errors),
         "mean_error_m_ekf": mean(ekf_errors),
-        "mean_heading_deg": mean(heading_diffs),
-        "mean_heading_deg_ekf": mean(ekf_heading_diffs),
-        "mean_dx_m": mean(dxs),
-        "mean_dy_m": mean(dys),
-        "mean_dx_m_ekf": mean(dxs_ekf),
-        "mean_dy_m_ekf": mean(dys_ekf),
-        "mean_time_s": mean(times),
-        "mean_time_s_ekf": mean(ekf_times),
+        #"mean_heading_deg": mean(heading_diffs),
+        #"mean_heading_deg_ekf": mean(ekf_heading_diffs),
+        #"mean_dx_m": mean(dxs),
+        #"mean_dy_m": mean(dys),
+        #"mean_dx_m_ekf": mean(dxs_ekf),
+        #"mean_dy_m_ekf": mean(dys_ekf),
+        #"mean_time_s": mean(times),
+        #"mean_time_s_ekf": mean(ekf_times),
 
         # RMSE for position error
         "rmse_error_m": rmse(errors),
@@ -141,17 +141,17 @@ def get_metrics(csv_path):
         "std_error_m_ekf": std(ekf_errors),
 
         # STD for time
-        "std_time_s": std(times),
-        "std_time_s_ekf": std(ekf_times),
+        #"std_time_s": std(times),
+        #"std_time_s_ekf": std(ekf_times),
 
         # Unsuccessful split counts
-        "unsuccessful_matches": unsuccessful_matches,
-        "unsuccessful_no_homography": unsuccessful_no_homography,
-        "unsuccessful_low_confidence": unsuccessful_low_confidence,
-        "unsuccessful_unknown_confidence": unsuccessful_unknown_confidence,
+        #"unsuccessful_matches": unsuccessful_matches,
+        #"unsuccessful_no_homography": unsuccessful_no_homography,
+        #"unsuccessful_low_confidence": unsuccessful_low_confidence,
+        #"unsuccessful_unknown_confidence": unsuccessful_unknown_confidence,
 
         # EKF unsuccessful (optional)
-        "unsuccessful_matches_ekf": unsuccessful_matches_ekf,
+        #"unsuccessful_matches_ekf": unsuccessful_matches_ekf,
 
         "total_rows": total_rows,
         "successful_rows": len(errors),
