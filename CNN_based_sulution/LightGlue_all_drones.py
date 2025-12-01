@@ -1451,14 +1451,14 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
 
     # ---- Measurement covariance from confidence ---- must be computed each frame
     R = ekf.R_from_conf(
-            pos_base_std=50.0, # in px. we expect araound +-15 m ca= 50px error in position measurement
+            pos_base_std=55.0, # in px. measured the difference of GT and meas for first run and found mean around 55 px, with 95 percentile around 10 and 123 px
             heading_base_std_rad=np.deg2rad(3.0), # a normal good measurement are seen to be within +-3 degrees
             overall_conf=best_conf_overall,  # between 0 and 1
-            pos_min_scale=0.3, # controls how much we trust low confidence measurements sets the unceartanty
+            pos_min_scale=0.5, # controls how much we trust low confidence measurements sets the unceartanty
             pos_max_scale=2.0,  # controls how much we trust high confidence measurements sets the certainty
-            heading_min_scale=0.5, # same for heading -||-
+            heading_min_scale=0.5, # same for heading -||- determined using 95 percentile
             heading_max_scale=2.75  # same for heading -||-
-        )  # this gives us R matrix for EKF update. R tells us how ceartain we are about the measurements.
+        )  # this gives us R matrix for EKF update. R tells us how certain we are about the measurements.
 
     # ---- Build measurement (x, y, phi) from homography in ORIGINAL pixels. compass heading ----
     meas_phi_deg, (meas_x_px, meas_y_px) = get_measurements(center_global, heading_unitvector_measurement)
