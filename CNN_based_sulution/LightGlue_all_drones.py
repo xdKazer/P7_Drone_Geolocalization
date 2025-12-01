@@ -26,6 +26,8 @@ MAX_KPTS = None               # max keypoints to load from .pt files (None = all
 MIN_CONFIDENCE_FOR_EKF_UPDATE = 0.2  # min confidence to use measurement update in EKF
 
 sat_number = "03"
+#OBS: ekf is tuned for straight flight. if working with more turning, increase sigma_phi and sigma_b_phi in EKF+ P0+ and tune R_from_conf
+
 visualisations_enabled = False
 # --- EKF globals (top of file, before the big for-loop) ---
 ekf = None
@@ -218,8 +220,6 @@ class EKF_ConstantVelHeading:
         Rphi = (heading_base_std_rad * scale_heading)**2
         return np.diag([Rx, Ry, Rphi]).astype(float)
 
-
-
 # -------------------- Angle wrapping --------------------
 def wrap_deg(a): # this is used to get between -180 and 180 which is used in campass based heading
     """Wrap degrees to [-180, 180)."""
@@ -238,6 +238,7 @@ def compass_to_img(psi_deg):
 def _wrap_pi(a: float) -> float:
     """Wrap angle to [-pi, pi]. Use anywhere you touch headings."""
     return (a + np.pi) % (2*np.pi) - np.pi
+
 # -------------------- Helpers --------------------
 def get_median_projection_error(H, pts0, pts1, inlier_mask):
     """ Compute median projection error confidence based on reprojection error of inliers."""
@@ -387,7 +388,6 @@ def get_visualisation_parameters(H_orig2tile, DRONE_ORIGINAL_W, DRONE_ORIGINAL_H
     corners_global = corners_tile_px + offset
 
     return center_global, corners_global, heading_unitvec_meas
-
 
 def get_measurements(center_global, heading_unitvector_from_homography):
     """
@@ -558,6 +558,55 @@ def load_feats_pt_batched(pt_path: Path, device: str):
     feats_r = rbd(feats_b)
     return feats_b, feats_r
 
+def classify_meas_quality(
+    num_inliers,
+    avg_conf,
+    shape_conf,
+    median_err_px,
+    overall_conf,
+):
+    """
+    Classify the measurement into { 'reject', 'low', 'medium', 'high' }.
+
+    Based on:
+      - inlier count
+      - avg_conf (LightGlue)
+      - shape_conf
+      - median reprojection error
+      - overall_conf (your combined score)
+
+    Thresholds are tuned for your current dataset and can be tweaked.
+    """
+
+    # Basic guards
+    if num_inliers is None or num_inliers <= 0:
+        return "reject"
+    if not np.isfinite(avg_conf) or not np.isfinite(shape_conf):
+        return "reject"
+    if overall_conf is None or not np.isfinite(overall_conf):
+        overall_conf = 0.0
+
+    # Very bad → reject
+    if overall_conf < 0.2 or num_inliers < 10 or shape_conf < 0.2:
+        return "reject"
+
+    # HIGH quality: strong inliers, good shape, good LG conf, decent reproj error
+    if (avg_conf > 0.65 and
+        num_inliers > 80 and
+        shape_conf > 0.65 and
+        np.isfinite(median_err_px) and
+        median_err_px < 2.5):
+        return "high"
+
+    # MEDIUM quality: usable but not great
+    if (avg_conf > 0.45 and
+        num_inliers > 20 and
+        shape_conf > 0.4):
+        return "medium"
+
+    # LOW quality: we still update, but with a very large R
+    return "low"
+
 def get_confidence_meas(
     num_inliers,
     avg_conf,
@@ -611,7 +660,6 @@ def get_confidence_meas(
     conf = (1.0 - alpha_err) * c_prior + alpha_err * c_err
     return float(np.clip(conf, 0.0, 1.0))
 
-
 def fmt_shape_terms(terms) -> str:
     """
     Format shape term array as '(x,x,x,x,x)' with 3 decimals, or 'N/A' if missing.
@@ -628,7 +676,6 @@ def fmt_shape_terms(terms) -> str:
     return f"({','.join(parts)})"
 
 # ---------------------- homography convexity check ----------------------
-
 def is_homography_convex_and_corners_warped(H, img_w, img_h):
     """
     Check if the homography H maps the drone image (0..w, 0..h) corners
@@ -828,7 +875,6 @@ def tiles_in_bbox(bbox, TILE_W, TILE_H, all_tile_names):
                 tile_bbox[3] < y_min or tile_bbox[1] > y_max):
             selected_tiles.append(tile_path)
     return selected_tiles 
-###################################################################################################
 
 ################################## EKF Tuning parameters ##################################
 """
@@ -1017,7 +1063,7 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
         # Process noise covariance Q (model uncertainty) Tune when ekf trust model to much or too little (high values=less trust in model)
         Q0 = np.diag([3.0,                  # px/√s : baseline diffusion on x,y
                       0.5,                  # px/√s : how much v can wander
-                      np.deg2rad(1),      # rad/√s : how much phi can wander pr second. # we fly straight so expect small changes
+                      np.deg2rad(0.5),      # rad/√s : how much phi can wander pr second. # we fly straight so expect small changes
                       np.deg2rad(0.0025)     # rad/√s : how much bias_phi can wander pr second
                     ])  # this is something we only set for this first run it will be updated by EKF later. 
 
@@ -1406,12 +1452,12 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
     # ---- Measurement covariance from confidence ---- must be computed each frame
     R = ekf.R_from_conf(
             pos_base_std=50.0, # in px. we expect araound +-15 m ca= 50px error in position measurement
-            heading_base_std_rad=np.deg2rad(15.0), # can jump due to bad matches
+            heading_base_std_rad=np.deg2rad(3.0), # a normal good measurement are seen to be within +-3 degrees
             overall_conf=best_conf_overall,  # between 0 and 1
-            pos_min_scale=0.3, # controls how much we trust low confidence measurements
-            pos_max_scale=2.0,  # controls how much we trust high confidence measurements
-            heading_min_scale=1, # same for heading
-            heading_max_scale=4  # same for heading
+            pos_min_scale=0.3, # controls how much we trust low confidence measurements sets the unceartanty
+            pos_max_scale=2.0,  # controls how much we trust high confidence measurements sets the certainty
+            heading_min_scale=0.5, # same for heading -||-
+            heading_max_scale=2.75  # same for heading -||-
         )  # this gives us R matrix for EKF update. R tells us how ceartain we are about the measurements.
 
     # ---- Build measurement (x, y, phi) from homography in ORIGINAL pixels. compass heading ----
