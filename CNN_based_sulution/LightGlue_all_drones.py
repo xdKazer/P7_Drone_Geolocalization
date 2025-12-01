@@ -27,7 +27,7 @@ MIN_CONFIDENCE_FOR_EKF_UPDATE = 0.2  # min confidence to use measurement update 
 
 sat_number = "03"
 #OBS: ekf is tuned for straight flight. if working with more turning, increase sigma_phi and sigma_b_phi in EKF+ P0+ and tune R_from_conf
-
+# OBS we assume top down view (important for shape terms, heading, and EKF motion model)
 visualisations_enabled = False
 # --- EKF globals (top of file, before the big for-loop) ---
 ekf = None
@@ -560,7 +560,7 @@ def load_feats_pt_batched(pt_path: Path, device: str):
 
 def classify_meas_quality(
     num_inliers,
-    avg_conf,
+    LG_conf,
     shape_conf,
     median_err_px,
     overall_conf,
@@ -570,7 +570,7 @@ def classify_meas_quality(
 
     Based on:
       - inlier count
-      - avg_conf (LightGlue)
+      - LG_conf (LightGlue)
       - shape_conf
       - median reprojection error
       - overall_conf (your combined score)
@@ -581,7 +581,7 @@ def classify_meas_quality(
     # Basic guards
     if num_inliers is None or num_inliers <= 0:
         return "reject"
-    if not np.isfinite(avg_conf) or not np.isfinite(shape_conf):
+    if not np.isfinite(LG_conf) or not np.isfinite(shape_conf):
         return "reject"
     if overall_conf is None or not np.isfinite(overall_conf):
         overall_conf = 0.0
@@ -591,7 +591,7 @@ def classify_meas_quality(
         return "reject"
 
     # HIGH quality: strong inliers, good shape, good LG conf, decent reproj error
-    if (avg_conf > 0.65 and
+    if (LG_conf > 0.65 and
         num_inliers > 80 and
         shape_conf > 0.65 and
         np.isfinite(median_err_px) and
@@ -599,7 +599,7 @@ def classify_meas_quality(
         return "high"
 
     # MEDIUM quality: usable but not great
-    if (avg_conf > 0.45 and
+    if (LG_conf > 0.45 and
         num_inliers > 20 and
         shape_conf > 0.4):
         return "medium"
@@ -609,7 +609,7 @@ def classify_meas_quality(
 
 def get_confidence_meas(
     num_inliers,
-    avg_conf,
+    LG_conf,
     median_err_px,
     shape_conf,
     s_err=2,      # reproj error scaling
@@ -625,12 +625,12 @@ def get_confidence_meas(
 
     Inputs:
       num_inliers   : number of inliers
-      avg_conf      : LightGlue avg confidence (0..1)
+      LG_conf      : LightGlue avg confidence (0..1)
       median_err_px : median reprojection error in pixels
       shape_conf    : shape/scale score (0..1)
 
     Behavior:
-      - If avg_conf <= 0 or num_inliers <= 0 -> return 0.
+      - If LG_conf <= 0 or num_inliers <= 0 -> return 0.
       - Base confidence:
             c_prior = 0.5 * c_lg + 0.5 * c_shape
       - If num_inliers < n_err_min or median_err_px is not finite:
@@ -641,10 +641,10 @@ def get_confidence_meas(
     """
 
     # basic guards
-    if avg_conf <= 0 or num_inliers <= 0:
+    if LG_conf <= 0 or num_inliers <= 0:
         return 0.0
 
-    c_lg    = float(np.clip(avg_conf, 0.0, 1.0))
+    c_lg    = float(np.clip(LG_conf, 0.0, 1.0))
     c_shape = float(np.clip(shape_conf if np.isfinite(shape_conf) else 0.0, 0.0, 1.0))
 
     # --- always 50/50 LG & shape ---
@@ -713,7 +713,7 @@ def is_homography_convex_and_corners_warped(H, img_w, img_h):
 
     return is_convex, corners_warped
 
-def get_homography_shape_score(
+def get_shape_score(
     corners,
     img_w,
     img_h,
@@ -748,7 +748,7 @@ def get_homography_shape_score(
 
     # =====================================================================
     # 0) Compute side vectors & lengths from corners
-    #     Order assumed: [top-left, top-right, bottom-right, bottom-left]
+    #     Order: [top-left, top-right, bottom-right, bottom-left]
     # =====================================================================
     vT = corners[1] - corners[0]  # top
     vR = corners[2] - corners[1]  # right
@@ -789,7 +789,7 @@ def get_homography_shape_score(
     # 3) ANGLES  (no safe zone)
     # =====================================================================
     def angle(a, b, c):
-        """Angle ABC in degrees, with B as vertex."""
+        """Angle ABC in degrees, with B as corner."""
         BA = a - b
         BC = c - b
         den = (np.linalg.norm(BA) * np.linalg.norm(BC) + 1e-9)
@@ -964,7 +964,7 @@ matcher = LightGlue(features=feat).eval().to(device)
 
 with open(CSV_FINAL_RESULT_PATH, "a", newline="") as f:
                 w = csv.writer(f)
-                w.writerow(["drone_image", "tile", "total_matches", "search_tiles", "inliers", "avg_confidence", 
+                w.writerow(["drone_image", "tile", "total_matches", "search_tiles", "inliers", "LG_confidence", 
                             "median_reproj_error_px", "shape_terms", "shape_score", "overall_confidence", 
                             "x_meas", "y_meas", "phi_meas_deg",
                             "x_ekf", "y_ekf", "phi_ekf_deg",
@@ -972,7 +972,7 @@ with open(CSV_FINAL_RESULT_PATH, "a", newline="") as f:
                             "dx_ekf", "dy_ekf",
                             "error", "error_pred", "ekf_error", 
                             "heading_diff", "ekf_heading_diff", 
-                            "time_s"])
+                            "time_s", "SDS",])
 
 # -------------------- Preload satellite tiles --------------------              
 all_tile_names = [p for p in SAT_DIR.iterdir() if p.is_file() and p.suffix.lower() == ".png"]
@@ -1189,7 +1189,7 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
         for i, p in enumerate(selected_tiles):
             # the following is necessary to avoid "referenced before assignment" errors
             num_inliers = 0 
-            avg_conf = float("nan")
+            LG_conf = float("nan")
             median_projection_err = float("inf")   
             overall_conf = float("-inf") 
             shape_conf = float("nan")  
@@ -1247,10 +1247,10 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
                     scores_t = matches01_r.get("scores", None)
                     if scores_t is not None and num_inliers > 0:
                         scores_np = scores_t.detach().cpu().numpy()
-                        avg_conf = float(np.mean(scores_np[inlier_mask]))
+                        LG_conf = float(np.mean(scores_np[inlier_mask]))
 
                 # compute shape score and median reprojection error for RANSAC H
-                shape_ransac, terms_ransac = get_homography_shape_score(corners_ransac, drone_rot_size[0], drone_rot_size[1], SCALE_TILE_TO_DRONE)
+                shape_ransac, terms_ransac = get_shape_score(corners_ransac, drone_rot_size[0], drone_rot_size[1], SCALE_TILE_TO_DRONE)
                 median_projection_err_ransac = get_median_projection_error(
                         H_ransac, pts_drone_np, pts_tile_np, inlier_mask
                     )
@@ -1270,7 +1270,7 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
                     median_projection_err = median_projection_err_ransac
                 else:
                     # compute shape score for DLT
-                    shape_dlt, terms_dlt = get_homography_shape_score(corners_dlt, drone_rot_size[0], drone_rot_size[1], SCALE_TILE_TO_DRONE)
+                    shape_dlt, terms_dlt = get_shape_score(corners_dlt, drone_rot_size[0], drone_rot_size[1], SCALE_TILE_TO_DRONE)
                     median_projection_err_dlt = get_median_projection_error(
                         H_dlt, pts_drone_np, pts_tile_np, inlier_mask
                     )
@@ -1289,7 +1289,7 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
                 # ---------- Overall Confidence + CHOSE BEST----------
                 if H is not None:
                     overall_conf = get_confidence_meas(
-                        num_inliers, avg_conf, median_projection_err, shape_conf
+                        num_inliers, LG_conf, median_projection_err, shape_conf
                     )
 
                     # ---------- Keep best homography across tiles ----------
@@ -1309,7 +1309,7 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
                 "tile": p,
                 "inliers": num_inliers,
                 "total_matches": K,
-                "avg_conf": avg_conf,
+                "LG_conf": LG_conf,
                 "median_err": median_projection_err,  
                 "shape_score": shape_conf,
                 "shape_terms": shape_terms,
@@ -1322,13 +1322,13 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
     if visualisations_enabled:
         with open(CSV_RESULT_PATH, "w", newline="") as f:
             w = csv.writer(f)
-            w.writerow(["tile", "total_matches", "inliers", "avg_confidence", "median_reproj_error", "shape_terms", "shape_score", "overall_conf"])
+            w.writerow(["tile", "total_matches", "inliers", "LG_confidence", "median_reproj_error", "shape_terms", "shape_score", "overall_conf"])
             for r in scores_small:
                 w.writerow([
                     r["tile"].name,
                     r["total_matches"],
                     r["inliers"],
-                    "" if not math.isfinite(r["avg_conf"]) else f"{r['avg_conf']:.4f}",
+                    "" if not math.isfinite(r["LG_conf"]) else f"{r['LG_conf']:.4f}",
                     "" if not math.isfinite(r["median_err"]) else f"{r['median_err']:.4f}",
                     fmt_shape_terms(r.get("shape_terms")),
                     "" if not math.isfinite(r["shape_score"]) else f"{r['shape_score']:.4f}",
@@ -1345,7 +1345,7 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
         tile_name = None
         num_inliers = None
         K = None
-        avg_confidence = None
+        LG_confidence = None
         median_reproj_error_px = None
         shape_conf = None
         shape_terms = None
@@ -1355,7 +1355,7 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
             tile_name = top1["tile"]               
             num_inliers = top1["inliers"]
             K = top1["total_matches"]
-            avg_confidence = top1["avg_conf"]
+            LG_confidence = top1["LG_conf"]
             median_reproj_error_px = top1["median_err"]
             shape_conf = top1["shape_score"]
             shape_terms = top1.get("shape_terms")
@@ -1373,7 +1373,7 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
                         "N/A" if K is None else K, # "total_matches",
                         len(selected_tiles), #search_tiles",
                         "N/A" if num_inliers is None else num_inliers, # "inliers",
-                        "N/A" if avg_confidence is None else f"{avg_confidence:.3f}", #"avg_confidence", 
+                        "N/A" if LG_confidence is None else f"{LG_confidence:.3f}", #"LG_confidence", 
                         "N/A" if median_reproj_error_px is None else f"{median_reproj_error_px:.3f}", # median_reproj_error,
                         shape_terms_str,
                         "N/A" if shape_conf is None else f"{shape_conf:.3f}", # shape_score,
@@ -1539,11 +1539,23 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
     # -------------------- Read top-1 candidate scores needed for CSV --------------------            
     num_inliers = top1["inliers"]
     K = top1["total_matches"]
-    avg_confidence = top1["avg_conf"]
+    LG_confidence = top1["LG_conf"]
     median_reproj_error_px = top1["median_err"]
     shape_conf = top1["shape_score"]
 
-    error_pred, _, _, _, _ = determine_pos_error((x_pred[0], x_pred[1]), x_pred[3], DRONE_INFO_DIR, drone_img)
+    predicted_pose_latlong = get_location_in_sat_img((x_pred[0], x_pred[1]), SAT_LONG_LAT_INFO_DIR, sat_number, SAT_DISPLAY_META)
+    error_pred, _, _, _, _ = determine_pos_error(predicted_pose_latlong, x_pred[3], DRONE_INFO_DIR, drone_img)
+
+
+    # pts0 = drone coordinates of inlier matches
+    x = best_pts_drone_np[:, 0]
+    y = best_pts_drone_np[:, 1]
+
+    spread_x = (x.max() - x.min()) / img.shape[:2][1]  # normalize by width
+    spread_y = (y.max() - y.min()) / img.shape[:2][0]  # normalize by height
+
+    sds = np.sqrt(spread_x * spread_y)  # geometric mean
+
     #------------- save final results to overall CSV file --------------------
     # add to the bottom of results_{sat_number}.csv file:
     with open(CSV_FINAL_RESULT_PATH, "a", newline="") as f:
@@ -1554,7 +1566,7 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
             K,
             len(selected_tiles),
             num_inliers,
-            f"{avg_confidence:.3f}",
+            f"{LG_confidence:.3f}",
             f"{median_reproj_error_px:.3f}",
             shape_terms_str,
             f"{shape_conf:.3f}",
@@ -1566,6 +1578,7 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
             f"{error:.4f}", f"{error_pred:.4f}", f"{error_ekf:.4f}",
             f"{dphi:.4f}", f"{dphi_ekf:.4f}",
             f"{t_end-t_start:.4f}",
+            f"{sds:.4f}"
         ])
 
 results = get_metrics(CSV_FINAL_RESULT_PATH)
