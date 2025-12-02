@@ -9,30 +9,46 @@ input_file = "geolocalization_dinov3/dataset_data/satellite_images/satellite03.t
 output_folder = Path("geolocalization_dinov3/tiles_uniform")
 output_folder.mkdir(parents=True, exist_ok=True)
 
-target = 2048  # desired tile size
+target = 2048           # desired tile size
+overlap = 0.25          # 25% overlap
 
 with rasterio.open(input_file) as src:
     H, W = src.height, src.width
     print(f"Image size: {W} x {H}")
 
-    # Compute number of tiles to get closest size to target
+    # Number of tiles without overlap (as baseline)
     nx = round(W / target)
     ny = round(H / target)
 
-    # Compute exact tile size to fill the image
+    # Uniform tile size
     tile_w = W // nx
     tile_h = H // ny
 
-    print(f"Dividing into {nx} x {ny} tiles")
-    print(f"Uniform tile size: {tile_w} x {tile_h}")
+    # Overlap stride
+    stride_w = int(tile_w * (1 - overlap))
+    stride_h = int(tile_h * (1 - overlap))
+
+    # Total tiles needed to cover the image with overlap
+    tiles_x = math.ceil((W - tile_w) / stride_w) + 1
+    tiles_y = math.ceil((H - tile_h) / stride_h) + 1
+
+    print(f"Tile size: {tile_w} x {tile_h}")
+    print(f"Stride: {stride_w} x {stride_h}")
+    print(f"Creating {tiles_x} x {tiles_y} tiles with 25% overlap")
 
     count = 0
-    for i in range(ny):
-        for j in range(nx):
-            x0 = j * tile_w
-            y0 = i * tile_h
+    for i in range(tiles_y):
+        for j in range(tiles_x):
 
-            # All tiles use the same size
+            x0 = j * stride_w
+            y0 = i * stride_h
+
+            # Clip windows at borders
+            if x0 + tile_w > W:
+                x0 = W - tile_w
+            if y0 + tile_h > H:
+                y0 = H - tile_h
+
             window = Window(col_off=x0, row_off=y0,
                             width=tile_w, height=tile_h)
 
@@ -44,8 +60,9 @@ with rasterio.open(input_file) as src:
             tile.save(out_path)
 
             count += 1
-            print(f"Saved tile {count}/{nx*ny}")
+            print(f"Saved tile {count}/{tiles_x * tiles_y}")
 
+    # Save downscaled visualization
     scale = 0.3
     full_img = src.read()
     full_img = np.moveaxis(full_img, 0, -1)
