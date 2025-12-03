@@ -1444,9 +1444,9 @@ for j, img_path in enumerate(sorted(DRONE_DIR.iterdir())):
         # ------------- Overlays on SATELLITE image -------------------- 
         # map to DOWNSCALED satellite coords for visualization
         corners_disp = (corners_meas_in_tile_px * SX) + np.array(pixel_offset)  # shift to display coords
-        center_measurement  = center_meas_in_tile_px[0] * SX + pixel_offset[0], center_meas_in_tile_px[1] * SY + pixel_offset[1]
+        center_measurement  = round(meas_x_px_global) * SX + pixel_offset[0], round(meas_y_px_global) * SY + pixel_offset[1]
         center_ekf = np.array([x_updated[0] * SX + pixel_offset[0], x_updated[1] * SY + pixel_offset[1]])
-        center_gt = np.array([meas_x_px_global * SX + pixel_offset[0], meas_y_px_global * SY + pixel_offset[1]])
+        center_gt = np.array([GT_centre_x_px_tile * SX + pixel_offset[0], GT_centre_y_px_tile * SY + pixel_offset[1]])
         center_pred = np.array([x_pred[0] * SX + pixel_offset[0], x_pred[1] * SY + pixel_offset[1]])
 
         for i in range(2):
