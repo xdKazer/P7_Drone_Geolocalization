@@ -121,7 +121,7 @@ def get_metrics(csv_path):
 
     results = {
         # Means (original)
-        "mean_error_m": mean(errors),
+        #"mean_error_m": mean(errors),
         "mean_error_m_ekf": mean(ekf_errors),
         #"mean_heading_deg": mean(heading_diffs),
         #"mean_heading_deg_ekf": mean(ekf_heading_diffs),
@@ -133,11 +133,11 @@ def get_metrics(csv_path):
         #"mean_time_s_ekf": mean(ekf_times),
 
         # RMSE for position error
-        "rmse_error_m": rmse(errors),
+        #"rmse_error_m": rmse(errors),
         "rmse_error_m_ekf": rmse(ekf_errors),
 
         # STD for position error
-        "std_error_m": std(errors),
+        #"std_error_m": std(errors),
         "std_error_m_ekf": std(ekf_errors),
 
         # STD for time
@@ -153,8 +153,8 @@ def get_metrics(csv_path):
         # EKF unsuccessful (optional)
         #"unsuccessful_matches_ekf": unsuccessful_matches_ekf,
 
-        "total_rows": total_rows,
-        "successful_rows": len(errors),
+        #"total_rows": total_rows,
+        #"successful_rows": len(errors),
     }
 
     return results
