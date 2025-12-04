@@ -1,34 +1,61 @@
 import rasterio
 from rasterio.windows import Window
+from rasterio.merge import merge
 from PIL import Image
 import numpy as np
 from pathlib import Path
 import math
 
-input_file = "geolocalization_dinov3/dataset_data/satellite_images/satellite03.tif"
+# Specifically for satellite 09, This code is needed to stitch the 4 provided tiles into one large image
+tiles = [
+    "geolocalization_dinov3/dataset_data/satellite_images/satellite09_01-01.tif",
+    "geolocalization_dinov3/dataset_data/satellite_images/satellite09_01-02.tif",
+    "geolocalization_dinov3/dataset_data/satellite_images/satellite09_02-01.tif",
+    "geolocalization_dinov3/dataset_data/satellite_images/satellite09_02-02.tif"
+]
+
+src_files = [rasterio.open(t) for t in tiles]
+mosaic, transform = merge(src_files)
+
+# Use metadata of first tile but update to mosaic size
+meta = src_files[0].meta.copy()
+meta.update({
+    "height": mosaic.shape[1],
+    "width": mosaic.shape[2],
+    "transform": transform
+})
+
+stitched_file = "geolocalization_dinov3/dataset_data/satellite_images/satellite09.tif"
+
+
+with rasterio.open(stitched_file, "w", **meta) as dst:
+    dst.write(mosaic)
+
+for s in src_files: s.close()
+print(f"Mosaic created: {stitched_file}")
+
+# -------- TILE THE MOSAIC --------
+
+input_satellite = "geolocalization_dinov3/dataset_data/satellite_images/satellite08.tif"
 output_folder = Path("geolocalization_dinov3/tiles_uniform")
 output_folder.mkdir(parents=True, exist_ok=True)
 
-target = 2048           # desired tile size
-overlap = 0.25          # 25% overlap
+target = 1024          # desired tile size
+overlap = 0.25         # 25% overlap
 
-with rasterio.open(input_file) as src:
+with rasterio.open(stitched_file) as src:  # Change input_satellite to stitched_file for satellite 09
     H, W = src.height, src.width
-    print(f"Image size: {W} x {H}")
+    print(f"Stitched Image size: {W} x {H}")
 
-    # Number of tiles without overlap (as baseline)
     nx = round(W / target)
     ny = round(H / target)
 
-    # Uniform tile size
     tile_w = W // nx
     tile_h = H // ny
 
-    # Overlap stride
     stride_w = int(tile_w * (1 - overlap))
     stride_h = int(tile_h * (1 - overlap))
 
-    # Total tiles needed to cover the image with overlap
     tiles_x = math.ceil((W - tile_w) / stride_w) + 1
     tiles_y = math.ceil((H - tile_h) / stride_h) + 1
 
@@ -43,24 +70,18 @@ with rasterio.open(input_file) as src:
             x0 = j * stride_w
             y0 = i * stride_h
 
-            # Clip windows at borders
-            if x0 + tile_w > W:
-                x0 = W - tile_w
-            if y0 + tile_h > H:
-                y0 = H - tile_h
+            if x0 + tile_w > W: x0 = W - tile_w
+            if y0 + tile_h > H: y0 = H - tile_h
 
-            window = Window(col_off=x0, row_off=y0,
-                            width=tile_w, height=tile_h)
+            window = Window(x0, y0, tile_w, tile_h)
+            tile = src.read(window=window)
+            tile = np.moveaxis(tile, 0, -1)
 
-            img = src.read(window=window)
-            img = np.moveaxis(img, 0, -1)
-
-            tile = Image.fromarray(img)
-            out_path = output_folder / f"tile_y{y0}_x{x0}.png"
-            tile.save(out_path)
+            Image.fromarray(tile).save(output_folder / f"tile_y{y0}_x{x0}.png")
 
             count += 1
             print(f"Saved tile {count}/{tiles_x * tiles_y}")
+
 
     # Save downscaled visualization
     scale = 0.3
