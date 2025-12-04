@@ -50,6 +50,7 @@ TILES_DIR   = DATASET_DIR /  "tiles"
 SAT_IMG = DATASET_DIR / "sat_mosaic_small.png"
 SX, SY = 0.08667013347200554, 0.08667013347200554 
 pixel_offset = [2980, 1365]
+mesurement_failed = 0  # counter for number of consecutive failed measurements
 
 
 OUT_DIR_CLEAN   = BASE / "VPAIR_outputs"
@@ -999,20 +1000,20 @@ for j, img_path in enumerate(sorted(DRONE_DIR.iterdir())):
                     break
 
         # initial state: (x, y, v, phi, bias_phi) OBS: must be in image representation and phi:rad!!!
-        x0 = np.array([0, 0, vel0, yaw0_rad_img, np.deg2rad(0.0)], dtype=np.float64)  # x,y in ORIGINAL sat pixels
+        x0 = np.array([0,0 , vel0, yaw0_rad_img, np.deg2rad(0.0)], dtype=np.float64)  # x,y in ORIGINAL sat pixels
 
         # P is the initial covariance for measurement uncertainty
-        P0 = np.diag([(50.0)**2,            # σx = 50 px
-                    (50.0)**2,              # σy = 50 px
-                    (3.0)**2,               # σv = 3 px/s (since we have a rough estimate)
-                    np.deg2rad(15.0)**2,     # σφ = 15° deg/s
+        P0 = np.diag([(20.0)**2,            # σx = 50 px
+                    (20.0)**2,              # σy = 50 px
+                    (5.0)**2,               # σv = 3 px/s 
+                    np.deg2rad(5.0)**2,     # σφ = 15° deg/s
                     np.deg2rad(3.0)**2      # at t0 we are unsure with around σbias_φ = 10.0 deg (This only affect us at start untill convergence)
                     ])  # this is something we only set for this first run it will be updated by EKF later. 
         
         # Process noise covariance Q (model uncertainty) Tune when ekf trust model to much or too little (high values=less trust in model)
-        Q0 = np.diag([3.0,                  # px/√s : baseline diffusion on x,y
-                      0.5,                  # px/√s : how much v can wander
-                      np.deg2rad(5),      # rad/√s : how much phi can wander pr second. # we fly straight so expect small changes
+        Q0 = np.diag([5.0,                  # px/√s : baseline diffusion on x,y
+                      0.5 ,                  # px/√s : how much v can wander
+                      np.deg2rad(10.0),      # rad/√s : how much phi can wander pr second. # we fly straight so expect small changes
                       np.deg2rad(0.0025)     # rad/√s : how much bias_phi can wander pr second
                     ])  # this is something we only set for this first run it will be updated by EKF later. 
 
@@ -1038,12 +1039,21 @@ for j, img_path in enumerate(sorted(DRONE_DIR.iterdir())):
     # create search area using Predicted covariance P:
     P_pred = ekf.P
     sigma = P_pred[:2, :2]  # position covariance 2x2
+
+    if mesurement_failed != 0:
+        if mesurement_failed == 1:
+            last_known_pose = x_updated.copy()
+        search_pose = last_known_pose[:2]
+        L = (last_known_pose[2] * dt_sec)* 1.1 * mesurement_failed  # (vel * dt) * 10% * number of fails = radius
+        sigma = np.diag([L**2, L**2])
+    else:
+        search_pose = x_pred[:2]
     
-    ellipse_bbox_coords = ellipse_bbox(x_pred[:2], sigma, k=k, n=72) # this uses SVD to determine viedest axes and orienation of ellipse to get bbx
+    ellipse_bbox_coords = ellipse_bbox(search_pose, sigma, k=k, n=72) # this uses SVD to determine viedest axes and orienation of ellipse to get bbx
 
     # -------------------- Determine tiles in search area --------------------
     selected_tiles = tiles_in_bbox(ellipse_bbox_coords, TILE_W, TILE_H, all_tile_names)
-    print(f"[info] Drone image {drone_img}: selected {selected_tiles[0]} to {selected_tiles[-1]} tiles in search area.")
+    print(f"[info] Drone image {drone_img}: selected {len(selected_tiles)}.")
 
     # -------------------- Rotate drone image & extract features --------------------
 
@@ -1252,6 +1262,7 @@ for j, img_path in enumerate(sorted(DRONE_DIR.iterdir())):
         median_reproj_error_px = None
         shape_conf = None
         shape_terms = None
+        mesurement_failed += 1
         if H_best is not None:
             # -------------------- Read top-1 candidate scores --------------------
             top1 = scores_small[0] # top-1 only.
@@ -1311,17 +1322,17 @@ for j, img_path in enumerate(sorted(DRONE_DIR.iterdir())):
             draw_point(overlay_img, pred_disp, color=(255,255,0), r=1)
 
             # --- Correct covariance scaling (see next section) ---
-            Sigma_orig = ekf.P[:2, :2]      # covariance in ORIGINAL px
+            sigma_copy = sigma.copy()
             J = np.diag([SX, SY])           # scaling x,y → display coords
-            Sigma_disp = J @ Sigma_orig @ J.T
+            Sigma_disp = J @ sigma_copy @ J.T
 
             draw_ellipse(
                 overlay_img,
                 pred_disp,
-                Sigma_disp,
+                Sigma_disp,  # from search area
                 k_sigma=k,
                 color=(255,255,0),
-                thickness=2,
+                thickness=1,
             )
 
             cv2.imwrite(str(OUT_OVERALL_SAT_VIS_PATH), overlay_img)
@@ -1334,6 +1345,7 @@ for j, img_path in enumerate(sorted(DRONE_DIR.iterdir())):
     shape_terms = best_shape_terms if best_shape_terms is not None else top1.get("shape_terms")
     shape_terms_str = fmt_shape_terms(shape_terms)
     print(f"[info] Top-1 candidate for {drone_img} is tile {tile_name}")
+
 
     if visualisations_enabled:
         out_match_png = OUT_DIR / f"top1_{Path(tile_name).stem}_matches.png"
@@ -1357,16 +1369,28 @@ for j, img_path in enumerate(sorted(DRONE_DIR.iterdir())):
     #------------- extended kalman filter update step ------------
     #################################################################
 
-    # ---- Measurement covariance from confidence ---- must be computed each frame
-    R = ekf.R_from_conf(
-            pos_base_std=40.0, #55 in px. measured the difference of GT and meas for first run and found mean around 55 px, with 95 percentile around 10 and 123 px
-            heading_base_std_rad=np.deg2rad(3.0), # a normal good measurement are seen to be within +-3 degrees
-            overall_conf=best_conf_overall,  # between 0 and 1
-            pos_min_scale=0.1, # 0.5 controls how much we trust low confidence measurements sets the unceartanty determined using 95 percentile
-            pos_max_scale=2.0,  # controls how much we trust high confidence measurements sets the certainty -||-
-            heading_min_scale=0.1, # 0.5 same for heading -||- found through testing
-            heading_max_scale=2.75  # same for heading -||-
-        )  # this gives us R matrix for EKF update. R tells us how certain we are about the measurements.
+    if mesurement_failed >= 2:
+        # ---- Measurement covariance from confidence ---- must be computed each frame
+        R = ekf.R_from_conf(
+                pos_base_std=5.0, #55 in px. measured the difference of GT and meas for first run and found mean around 55 px, with 95 percentile around 10 and 123 px
+                heading_base_std_rad=np.deg2rad(20.0), # a normal good measurement are seen to be within +-3 degrees
+                overall_conf=best_conf_overall,  # between 0 and 1
+                pos_min_scale=0.1, # 0.5 controls how much we trust high confidence measurements sets the unceartanty determined using 95 percentile
+                pos_max_scale=2.0,  # controls how much we trust low confidence measurements sets the certainty -||-
+                heading_min_scale=0.1, # 0.5 same for heading -||- found through testing
+                heading_max_scale=2.75  # same for heading -||-
+            )  # this gives us R matrix for EKF update. R tells us how certain we are about the measurements.
+    else:
+        # ---- Measurement covariance from confidence ---- must be computed each frame
+        R = ekf.R_from_conf(
+                pos_base_std=20.0, #55 in px. measured the difference of GT and meas for first run and found mean around 55 px, with 95 percentile around 10 and 123 px
+                heading_base_std_rad=np.deg2rad(10.0), # a normal good measurement are seen to be within +-3 degrees
+                overall_conf=best_conf_overall,  # between 0 and 1
+                pos_min_scale=0.1, # 0.5 controls how much we trust high confidence measurements sets the unceartanty determined using 95 percentile
+                pos_max_scale=2.0,  # controls how much we trust low confidence measurements sets the certainty -||-
+                heading_min_scale=0.1, # 0.5 same for heading -||- found through testing
+                heading_max_scale=2.75  # same for heading -||-
+            )  # this gives us R matrix for EKF update. R tells us how certain we are about the measurements.
 
     # ---- Build measurement (x, y, phi) from homography in ORIGINAL pixels. compass heading ----
     meas_phi_deg, (meas_x_px_in_tile, meas_y_px_in_tile) = get_measurements(center_meas_in_tile_px, heading_unitvector_measurement)
@@ -1409,6 +1433,10 @@ for j, img_path in enumerate(sorted(DRONE_DIR.iterdir())):
     x_updated[3] = img_to_compass(np.rad2deg(x_updated[3]))  # convert back to degrees for logging
     #print(f"[EKF] Updated state: x={x_updated[0]:.2f}, y={x_updated[1]:.2f}, v={x_updated[2]:.2f} px/s, phi={(x_updated[3]):.2f} deg")
     #EKF done
+    if best_conf_overall >= 0.5: # we need a somewhat good measurement to reset fail counter
+        mesurement_failed = 0  # reset fail counter on successful measurement
+    else: 
+        mesurement_failed += 1
     t_end = time.perf_counter()
 
     meters_pr_pixel = MAP_M_PER_PX_GLOBAL
