@@ -2,6 +2,7 @@ import cv2
 import math
 from pathlib import Path
 import numpy as np
+import csv
 
 """
 This script tiles the satellite image into overlapping patches that:
@@ -18,7 +19,15 @@ This avoids destroying features, unlike the previous rescaled version.
 # ----------------- Config -----------------
 BASE        = Path(__file__).parent.resolve()
 dataset_dir = BASE / "UAV_VisLoc_dataset"
-sat_number  = "03"
+sat_number  = "02"
+# Drone GSD (meters per pixel)
+drone_m_per_px = 0.091706 # found using get_m_pr_pixel, that gives a ratio between satellite and drone GSD
+
+# Ratios for each sat and drone images:
+# | 1: 0.090266 m/px | 2: 0.091706 m/px,  | 3: 0.104327 m/px | 4: 0.14  m/px | 5: 0.?? m/px | 6: 0.?? m/px |
+# | 7: 0.?? m/px   | 8: 0.?? m/px | 9: 0.?? m/px | 10: 0.?? m/px | 11: 0.?? m/px
+
+
 
 tif_path = dataset_dir / sat_number / f"satellite{sat_number}.tif"
 out_dir  = dataset_dir / sat_number / "sat_tiles_overlap"
@@ -27,14 +36,23 @@ out_dir.mkdir(parents=True, exist_ok=True)
 # Reference drone image
 drone_ref_path = dataset_dir / sat_number / "drone" / f"{sat_number}_0010.JPG"
 
-# Drone GSD (meters per pixel)
-drone_m_per_px = 0.125
 
-# Geographic bounds of the satellite map
-coordinate_range_lat_lon_sat = [
-    (32.355491, 119.805926),  # top-left
-    (32.290290, 119.900052),  # bottom-right
-]
+
+# Geographic bounds of the satellite map 
+# read satellite_coordinates_range.csv and get sat range:
+with open("C:/Users/signe/P7_Drone_Geolocalization/CNN_based_sulution/UAV_run/UAV_VisLoc_dataset/satellite_coordinates_range.csv", newline="") as f:
+    for r in csv.DictReader(f):
+        if r["mapname"] == f"satellite{sat_number}.tif":
+            LT_lat = np.float64(r["LT_lat_map"])
+            LT_lon = np.float64(r["LT_lon_map"])
+            RB_lat = np.float64(r["RB_lat_map"])
+            RB_lon = np.float64(r["RB_lon_map"])
+            coordinate_range_lat_lon_sat = [
+                (LT_lat, LT_lon), # Left Top, (lat, lon)
+                (RB_lat, RB_lon), # Right Bottom, (lat, lon)
+            ]
+            break
+
 
 # Tile margin factor
 TILE_DIAG_MARGIN = 1.3
@@ -129,6 +147,7 @@ for y0 in ys:
         count += 1
 
 print(f"Saved {count} tiles to: {out_dir}")
+print(sat_m_per_px / drone_m_per_px)
 
 # ----------------- Metadata -----------------
 meta_path = out_dir / "a_tile_size.txt"

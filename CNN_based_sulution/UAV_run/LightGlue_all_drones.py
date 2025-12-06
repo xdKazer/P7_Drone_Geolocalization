@@ -24,8 +24,18 @@ FEATURES = "superpoint"       # 'superpoint' | 'disk' | 'sift' | 'aliked'
 DISPLAY_LONG_SIDE = 1200      # only for visualization
 MAX_KPTS = None               # max keypoints to load from .pt files (None = all) (This controls memory usage) TODO also controls speed
 MIN_CONFIDENCE_FOR_EKF_UPDATE = 0.2  # min confidence to use measurement update in EKF
+NUMBER_OF_ALLOWED_MISSES_IN_A_ROW = 2 # number of allowed missed measurements in a row before we need a high confidence to do an ekf update
+MIN_CONFIDENCE_FOR_EKF_UPDATE_AFTER_MISSES = 0.5  # min confidence to use measurement update in EKF after previous misses
+MIN_INLIERS_FOR_EKF_UPDATE = 10
+missed_measurements_in_a_row = 0 # counter for how many measurements have been skipped in a row
+SKIP_EKF_UPDATE = False # flag to skip ekf update in case of previous misses and low confidence
 
-sat_number = "03"
+# scaling of drone image:
+drone_img_scale = 0.9  # how much to downscale drone image before feature extraction to match scales between drone and satellite images
+# 01 = 1
+# 02=0.7
+sat_number = "02"          #| "01" | "02" | "03" | "04" | "05" | "06" | "07" | "08" | "09" | "10"  | "11" |
+
 #OBS: ekf is tuned for straight flight. if working with more turning, increase sigma_phi and sigma_b_phi in EKF+ P0+ and tune R_from_conf
 # OBS we assume top down view (important for shape terms, heading, and EKF motion model)
 visualisations_enabled = False
@@ -33,28 +43,53 @@ visualisations_enabled = False
 ekf = None
 t_last = None   # timestamp of previous processed frame
 x_updated = None # needed for rotation of drone img
+if sat_number == "01":
+    starting_drone_images = ["01_0001.JPG", "01_0080.JPG", "01_0162.JPG", "01_0241.JPG", "01_0323.JPG", "01_0403.JPG", "01_0486.JPG", "01_0567.JPG", "01_0651.JPG", "01_0732.JPG" ] # the names of the drone images that starts a run
+if sat_number == "02":
+    starting_drone_images = ["02_0001.JPG", "02_0102.JPG", "02_0207.JPG", "02_0310.JPG", "02_0416.JPG", "02_0521.JPG", "02_0629.JPG", "02_0736.JPG", "02_0847.JPG", "02_0958.JPG" ] # the names of the drone images that starts a run
 if sat_number == "03":
     starting_drone_images = ["03_0001.JPG", "03_0097.JPG", "03_0193.JPG", "03_0289.JPG", "03_0385.JPG", "03_0481.JPG", "03_0577.JPG", "03_0673.JPG", ] # the names of the drone images that starts a run
+if sat_number == "04":
+    starting_drone_images = ["04_0001.JPG", "04_0090.JPG", "04_0179.JPG", "04_0270.JPG", "04_0361.JPG", "04_0455.JPG", "04_0549.JPG", "04_0644.JPG", ] # the names of the drone images that starts a run
+if sat_number == "05":
+    starting_drone_images = ["05_0001.JPG", "05_0041.JPG", "05_0052.JPG", "05_0076.JPG", "05_0116.JPG", "05_0156.JPG", "05_0196.JPG", "05_0236.JPG", "05_0275.JPG", "05_0315.JPG", "05_0355.JPG", "05_0395.JPG", "05_0434.JPG", ] # the names of the drone images that starts a run
+if sat_number == "06":
+    starting_drone_images = ["06_0001.JPG", "06_0007.JPG", "06_0050.JPG", "06_0096.JPG", "06_0099.JPG", "06_0142.JPG", "06_0185.JPG", "06_0222.JPG", "06_0265.JPG", "06_0308.JPG", ] # the names of the drone images that starts a run
+#if sat_number == "07":
+    #--------------
+if sat_number == "08":
+    starting_drone_images = ["08_0215.JPG", "08_0312.JPG", "08_0409.JPG", "08_0509.JPG", "08_0609.JPG", "08_0713.JPG", "08_0818.JPG", "08_0026.JPG", ] # the names of the drone images that starts a run
+if sat_number == "09":
+    starting_drone_images = ["09_0001.JPG", "09_0129.JPG", "09_0256.JPG", "09_0384.JPG", "09_0512.JPG", "09_0640.JPG", ] # the names of the drone images that starts a run
+if sat_number == "10":
+    starting_drone_images = ["10_0001.JPG", "10_019.JPG", "10_037.JPG", "10_055.JPG", "10_073.JPG", "10_091.JPG", "10_109.JPG", "10_127.JPG", ] # the names of the drone images that starts a run
+if sat_number == "11":
+    starting_drone_images = ["11_0003.JPG", "11_052.JPG", "11_0101.JPG", "11_0150.JPG", "11_0199.JPG", "11_0248.JPG", "11_0297.JPG", "11_0346.JPG", "11_0395.JPG", "11_0444.JPG", "11_0493.JPG", "11_0542.JPG", ] # the names of the drone images that starts a run
 
+
+# -------------------- Paths --------------------
 BASE = Path(__file__).parent.resolve()
 DATASET_DIR = BASE / "UAV_VisLoc_dataset"
 SAT_LONG_LAT_INFO_DIR = DATASET_DIR / "satellite_coordinates_range.csv"
 DRONE_INFO_DIR = DATASET_DIR / sat_number / f"{sat_number}.csv"
 DRONE_IMG_CLEAN = DATASET_DIR / sat_number / "drone"  
 SAT_DIR   = DATASET_DIR / sat_number / "sat_tiles_overlap" 
-OUT_DIR_CLEAN   = BASE / "outputs" / sat_number
+if visualisations_enabled:
+    OUT_DIR_CLEAN   = BASE / "outputs" / f"{sat_number}_visualisations"
+else:
+    OUT_DIR_CLEAN   = BASE / "outputs" / sat_number
 OUT_OVERALL_SAT_VIS_PATH = OUT_DIR_CLEAN / f"overall_overlay_on_sat.png"
 
 # delete folder if exists
 folder = OUT_DIR_CLEAN
 
 if folder.exists() and folder.is_dir():
-    shutil.rmtree(folder)
+    shutil.rmtree(folder, ignore_errors=True)
 
 OUT_DIR_CLEAN.mkdir(parents=True, exist_ok=True)
 CSV_FINAL_RESULT_PATH = OUT_DIR_CLEAN / f"results_{sat_number}.csv"
 TILE_PT_DIR = DATASET_DIR / sat_number / f"{FEATURES}_features" / sat_number
-SAT_DISPLAY_IMG  = DATASET_DIR / sat_number / "satellite03_small.png"
+SAT_DISPLAY_IMG  = DATASET_DIR / sat_number / f"satellite{sat_number}_small.png"
 SAT_DISPLAY_META = SAT_DISPLAY_IMG.with_suffix(SAT_DISPLAY_IMG.suffix + ".json")  # {"scale": s, "original_size_hw":[H,W],...}
 TILE_WH_DIR = SAT_DIR / "a_tile_size.txt"  
 
@@ -70,7 +105,7 @@ Stride_W  = int(stride_w_str)
 TILE_H = int(tile_h_str)     
 TILE_W = int(tile_w_str)
 
-SCALE_TILE_TO_DRONE = float(scale_str)   #How many drone-pixels correspond to one satellite pixel. 
+SCALE_TILE_TO_DRONE = float(scale_str) * drone_img_scale  # How many drone-pixels correspond to one satellite pixel. 
 # This is needed for downsampling of drone img
 
 ########################################################################################
@@ -648,7 +683,7 @@ def get_confidence_meas(
     c_shape = float(np.clip(shape_conf if np.isfinite(shape_conf) else 0.0, 0.0, 1.0))
 
     # --- always 50/50 LG & shape ---
-    c_prior = 0.4 * c_lg + 0.6 * c_shape
+    c_prior = 0.5 * c_lg + 0.5 * c_shape
 
     # --- if not enough inliers or bad error -> ignore reprojection term ---
     if num_inliers < n_err_min or not np.isfinite(median_err_px):
@@ -971,8 +1006,8 @@ with open(CSV_FINAL_RESULT_PATH, "a", newline="") as f:
                             "dx", "dy", 
                             "dx_ekf", "dy_ekf",
                             "error", "error_pred", "ekf_error", 
-                            "heading_diff", "ekf_heading_diff", 
-                            "time_s", "SDS",])
+                            #"heading_diff", "ekf_heading_diff", 
+                            "time_s"])
 
 # -------------------- Preload satellite tiles --------------------              
 all_tile_names = [p for p in SAT_DIR.iterdir() if p.is_file() and p.suffix.lower() == ".png"]
@@ -983,6 +1018,19 @@ sat_vis, SX, SY = load_sat_display_and_scale()
 
 # -------------------- Load drone features --------------------
 for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
+    # we need to compute number of features for reporting we redo it later when we have the image downscaled
+    with torch.inference_mode():
+        temp_img = cv2.imread(str(img_path), cv2.IMREAD_COLOR)
+        # Convert BGR → RGB
+        rgb__ = cv2.cvtColor(temp_img, cv2.COLOR_BGR2RGB)
+        # Convert to float32 normalized [0,1]
+        img_np__ = rgb__.astype(np.float32) / 255.0
+        # Convert to torch tensor: HWC → CHW → BCHW
+        img_t__ = torch.from_numpy(img_np__).permute(2, 0, 1).unsqueeze(0).to(device)
+        feats_drone_b__ = extractor.extract(img_t__)
+        num_feats_in_drone = feats_drone_b__["keypoints"].shape[1]
+    ##############################################################################
+
     t_start = time.perf_counter()
     t_end= None
     if img_path.suffix.lower() not in [".jpg", ".png", ".jpeg"]:
@@ -1153,7 +1201,7 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
         # -------------------- Extract features from rotated drone image --------------------
         with torch.inference_mode():
             # SCALE drone img to match sat tiles
-            scale_drone_image = 1.0 / SCALE_TILE_TO_DRONE   # sat_px_per_drone_px
+            scale_drone_image = (1.0 / SCALE_TILE_TO_DRONE)   # sat_px_per_drone_px
             bgr_rot_small = cv2.resize(
                             bgr_rot,
                             (int(wR * scale_drone_image), int(hR * scale_drone_image)),
@@ -1169,7 +1217,6 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
 
             feats_drone_b_scaled = extractor.extract(img_t)
             feats_drone_r_scaled = rbd(feats_drone_b_scaled)
-            num_feats_in_drone = feats_drone_b_scaled["keypoints"].shape[1]
 
         hR, wR = bgr_rot.shape[:2]
         drone_rot_size = (wR, hR)
@@ -1298,6 +1345,8 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
                             continue  # keep previous best if overall_conf tie but shape_conf not better
                         H_best = H
                         best_shape_score = shape_conf
+                        best_LG_conf = LG_conf
+                        best_num_inliers = num_inliers
                         best_shape_terms = shape_terms
                         best_conf_overall = overall_conf
                         best_pts_drone_np = pts_drone_np
@@ -1338,10 +1387,15 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
     ########################################################################################################
     #- --------------------- Pass 2: Visualization and Kalman Filtering on top 1 candidate --------------------
     ##########################################################################################################
-
+    
      # ----------------------------- IF needed, skip update and use predict only-------------------
-    if (H_best is None or best_conf_overall < MIN_CONFIDENCE_FOR_EKF_UPDATE):
+    if missed_measurements_in_a_row > NUMBER_OF_ALLOWED_MISSES_IN_A_ROW and best_conf_overall < MIN_CONFIDENCE_FOR_EKF_UPDATE_AFTER_MISSES:
+        SKIP_EKF_UPDATE = True # set flag to skip ekf update due to too many misses in a row and low confidence
+
+    if (SKIP_EKF_UPDATE or H_best is None or best_LG_conf < MIN_CONFIDENCE_FOR_EKF_UPDATE or best_shape_score < MIN_CONFIDENCE_FOR_EKF_UPDATE or best_num_inliers < MIN_INLIERS_FOR_EKF_UPDATE):
         t_end = time.perf_counter()
+        missed_measurements_in_a_row += 1
+        SKIP_EKF_UPDATE = False
         tile_name = None
         num_inliers = None
         K = None
@@ -1361,7 +1415,7 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
             shape_terms = top1.get("shape_terms")
             best_conf_overall = top1["overall_conf"]
 
-        print(f"[info] Skipping EKF update for {drone_img} due to no valid homography or low confidence ({best_conf_overall:.4f} < {MIN_CONFIDENCE_FOR_EKF_UPDATE})")
+        #print(f"[info] Skipping EKF update for {drone_img} due to no valid homography or low confidence ({best_conf_overall:.4f} < {MIN_CONFIDENCE_FOR_EKF_UPDATE})")
         pose_ekf = get_location_in_sat_img((x_pred[0], x_pred[1]), SAT_LONG_LAT_INFO_DIR, sat_number, SAT_DISPLAY_META)
         error_ekf, dx_ekf, dy_ekf, dphi_ekf, _ = determine_pos_error(pose_ekf, x_pred[3], DRONE_INFO_DIR, drone_img)
         shape_terms_str = fmt_shape_terms(shape_terms)
@@ -1384,7 +1438,7 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
                         "N/A", "N/A", # dx, dy
                         f"{dx_ekf:.4f}", f"{dy_ekf:.4f}", # dx_ekf, dy_ekf
                         "N/A",f"{error_ekf:.4f}", f"{error_ekf:.4f}", # error, error_pred, ekf_error
-                        "N/A", f"{dphi_ekf:.4f}", # heading_diff, ekf_heading_diff
+                        #"N/A", f"{dphi_ekf:.4f}", # heading_diff, ekf_heading_diff
                         f"{t_end - t_start:.4f}",   # time_s
                         ])
             
@@ -1416,7 +1470,7 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
 
             cv2.imwrite(str(OUT_OVERALL_SAT_VIS_PATH), overlay_img)
         continue # next drone image
-
+    missed_measurements_in_a_row = 0  # reset counter since we have a valid measurement
     # -------------------- Read top-1 candidate scores needed for ekf --------------------
     top1 = scores_small[0] # top-1 only.
     tile_name = top1["tile"]
@@ -1452,7 +1506,7 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
 
     # ---- Measurement covariance from confidence ---- must be computed each frame
     R = ekf.R_from_conf(
-            pos_base_std=55.0, # in px. measured the difference of GT and meas for first run and found mean around 55 px, with 95 percentile around 10 and 123 px
+            pos_base_std=30.0, # in px. measured the difference of GT and meas for first run and found mean around 55 px, with 95 percentile around 10 and 123 px
             heading_base_std_rad=np.deg2rad(3.0), # a normal good measurement are seen to be within +-3 degrees
             overall_conf=best_conf_overall,  # between 0 and 1
             pos_min_scale=0.5, # controls how much we trust low confidence measurements sets the unceartanty determined using 95 percentile
@@ -1578,10 +1632,37 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
             f"{dx:.4f}", f"{dy:.4f}",
             f"{dx_ekf:.4f}", f"{dy_ekf:.4f}",
             f"{error:.4f}", f"{error_pred:.4f}", f"{error_ekf:.4f}",
-            f"{dphi:.4f}", f"{dphi_ekf:.4f}",
+            #f"{dphi:.4f}", f"{dphi_ekf:.4f}",
             f"{t_end-t_start:.4f}",
-            f"{sds:.4f}"
+            #f"{sds:.4f}"
         ])
 
-results = get_metrics(CSV_FINAL_RESULT_PATH)
-print(results)
+
+# -------------------- After all drone images processed: compute overall metrics --------------------
+metrics = get_metrics(CSV_FINAL_RESULT_PATH, 2000)
+
+print("OVERALL:",
+      "mean error:", metrics["overall"]["mean_error_m"],
+      "rmse:", metrics["overall"]["rmse_error_m"],
+      "STD:", metrics["overall"]["std_error_m"],
+      "---------------",
+      "mean error ekf:", metrics["overall"]["mean_error_m_ekf"],
+      "rmse ekf:", metrics["overall"]["rmse_error_m_ekf"],
+      "STD ekf:", metrics["overall"]["std_error_m_ekf"],
+      "---------------",
+      "mean time:", metrics["overall"]["mean_time_s"],
+      "unsuccessful matches:", metrics["overall"]["unsuccessful_matches"],
+      "unsuccessful matches ekf:", metrics["overall"]["unsuccessful_matches_ekf"],
+      "total_rows:", metrics["overall"]["total_rows"])
+
+for group_name, label in [("less_than", "< 2000 feats"),
+                          ("greater_equal", "≥ 2000 feats")]:
+    m = metrics[group_name]
+    print("")
+    print(label,
+          "mean error:", m["mean_error_m"],
+          "rmse:", m["rmse_error_m"],
+          "STD:", m["std_error_m"],
+          "mean time:", m["mean_time_s"],
+          "unsuccessful matches:", m["unsuccessful_matches"],
+          "total_rows:", m["total_rows"])
