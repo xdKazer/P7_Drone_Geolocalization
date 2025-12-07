@@ -10,7 +10,7 @@ import numpy as np
 # =========================
 # CONFIG (edit these)
 # =========================
-sat_num = "11"  # e.g., "01", "02", "03", ...
+sat_num = "06"  # e.g., "01", "02", "03", ...
 BASE_PATH         = Path(__file__).parent.resolve()
 INPUT_TIF         = BASE_PATH / f"UAV_VisLoc_dataset/{sat_num}/satellite{sat_num}.tif"
 OUTPUT_IMAGE      = BASE_PATH / f"UAV_VisLoc_dataset/{sat_num}/satellite{sat_num}_small.png"
