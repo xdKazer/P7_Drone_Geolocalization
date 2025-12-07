@@ -7,6 +7,7 @@ test2.py
 extract_keypoints_offline.py
 vpair_dataset/
 VPAIR_outputs/
+VPAIR_outputs_with_visualisations/
 
 
 ## Ignore Visual Studio temporary files, build results, and

@@ -1090,7 +1090,7 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
         # P is the initial covariance for measurement uncertainty
         P0 = np.diag([(50.0)**2,            # σx = 50 px
                     (50.0)**2,              # σy = 50 px
-                    (3.0)**2,               # σv = 3 px/s (since we have a rough estimate)
+                    (3.0)**2,               # σv = 3 px/s 
                     np.deg2rad(9.0)**2,     # σφ = 9° deg/s
                     np.deg2rad(9.0)**2      # at t0 we are unsure with around σbias_φ = 10.0 deg (This only affect us at start untill convergence)
                     ])  # this is something we only set for this first run it will be updated by EKF later. 
