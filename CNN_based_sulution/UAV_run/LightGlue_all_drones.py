@@ -26,7 +26,7 @@ MAX_KPTS = None               # max keypoints to load from .pt files (None = all
 MIN_CONFIDENCE_FOR_EKF_UPDATE = 0.2  # min confidence to use measurement update in EKF
 NUMBER_OF_ALLOWED_MISSES_IN_A_ROW = 2 # number of allowed missed measurements in a row before we need a high confidence to do an ekf update
 MIN_CONFIDENCE_FOR_EKF_UPDATE_AFTER_MISSES = 0.5  # min confidence to use measurement update in EKF after previous misses
-MIN_INLIERS_FOR_EKF_UPDATE = 8
+MIN_INLIERS_FOR_EKF_UPDATE = 10
 missed_measurements_in_a_row = 0 # counter for how many measurements have been skipped in a row
 SKIP_EKF_UPDATE = False # flag to skip ekf update in case of previous misses and low confidence
 
@@ -1377,7 +1377,7 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
     ##########################################################################################################
     
      # ----------------------------- IF needed, skip update and use predict only-------------------
-    if missed_measurements_in_a_row > NUMBER_OF_ALLOWED_MISSES_IN_A_ROW and best_LG_conf < MIN_CONFIDENCE_FOR_EKF_UPDATE_AFTER_MISSES or best_shape_score < MIN_CONFIDENCE_FOR_EKF_UPDATE_AFTER_MISSES:
+    if missed_measurements_in_a_row > NUMBER_OF_ALLOWED_MISSES_IN_A_ROW and best_conf_overall < MIN_CONFIDENCE_FOR_EKF_UPDATE_AFTER_MISSES:
         SKIP_EKF_UPDATE = True # set flag to skip ekf update due to too many misses in a row and low confidence
 
     if (SKIP_EKF_UPDATE or H_best is None or best_LG_conf < MIN_CONFIDENCE_FOR_EKF_UPDATE or best_shape_score < MIN_CONFIDENCE_FOR_EKF_UPDATE or best_num_inliers < MIN_INLIERS_FOR_EKF_UPDATE):
