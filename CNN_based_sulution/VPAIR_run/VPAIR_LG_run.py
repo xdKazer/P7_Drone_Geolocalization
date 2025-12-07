@@ -58,9 +58,9 @@ SX, SY = 0.08667013347200554, 0.08667013347200554
 pixel_offset = [2980, 1365]
 
 if visualisations_enabled:
-    OUT_DIR_CLEAN   = BASE / "VPAIR_outputs_with_visualisations"
+    OUT_DIR_CLEAN   = BASE / "outputs" / "VPAIR_outputs_with_visualisations"
 else:
-    OUT_DIR_CLEAN   = BASE / "VPAIR_outputs"
+    OUT_DIR_CLEAN   = BASE / "outputs" / "VPAIR_outputs"
 
 # delete folder if exists
 folder = OUT_DIR_CLEAN
@@ -953,8 +953,6 @@ for j, img_path in enumerate(sorted(DRONE_DIR.iterdir())):
     t_start = time.perf_counter()
     t_end = None
     
-    
-
     if j == 0: #first image
         meas_phi_deg = None #for rotation consistency check
         ekf = None
@@ -1002,18 +1000,18 @@ for j, img_path in enumerate(sorted(DRONE_DIR.iterdir())):
         # initial state: (x, y, v, phi, bias_phi) OBS: must be in image representation and phi:rad!!!
         x0 = np.array([0,0 , vel0, yaw0_rad_img, np.deg2rad(0.0)], dtype=np.float64)  # x,y in ORIGINAL sat pixels
 
-        # P is the initial covariance for measurement uncertainty
-        P0 = np.diag([(50.0)**2,            # σx = 50 px
-                    (50.0)**2,              # σy = 50 px
-                    (3.0)**2,               # σv = 3 px/s (since we have a rough estimate)
+        # P is the initial covariance for uncertainty
+        P0 = np.diag([(20.0)**2,            # σx = 50 px
+                    (20.0)**2,              # σy = 50 px
+                    (3.0)**2,               # σv = 3 px/s 
                     np.deg2rad(9.0)**2,     # σφ = 9° deg/s
-                    np.deg2rad(9.0)**2      # at t0 we are unsure with around σbias_φ = 10.0 deg (This only affect us at start untill convergence)
+                    np.deg2rad(0)**2      # at t0 we are unsure with around σbias_φ = 10.0 deg (This only affect us at start untill convergence)
                     ])  # this is something we only set for this first run it will be updated by EKF later. 
         
         # Process noise covariance Q (model uncertainty) Tune when ekf trust model to much or too little (high values=less trust in model)
         Q0 = np.diag([3.0,                  # px/√s : baseline diffusion on x,y
                       0.5,                  # px/√s : how much v can wander
-                      np.deg2rad(0.5),      # rad/√s : how much phi can wander pr second. # we fly straight so expect small changes
+                      np.deg2rad(8),      # rad/√s : how much phi can wander pr second. 
                       np.deg2rad(0.0025)     # rad/√s : how much bias_phi can wander pr second
                     ])  # this is something we only set for this first run it will be updated by EKF later. 
 
@@ -1023,8 +1021,8 @@ for j, img_path in enumerate(sorted(DRONE_DIR.iterdir())):
             start_x, start_y = pixel_offset
             draw_point(overlay_img, (start_x, start_y), color=(155,155,155), r=6) # light grey
             label_point(overlay_img, (start_x, start_y), f"Start {drone_img}", color=(155,155,155),
-                        offset=(10,-10), font_scale=0.5, thickness=1)
-            draw_ellipse(overlay_img, (start_x, start_y), ekf.P[:2, :2]*(SX*SY), k_sigma=k, color=(255,0,0), thickness=2)
+                        offset=(-100,-100), font_scale=0.5, thickness=1)
+            draw_ellipse(overlay_img, (start_x, start_y), ekf.P[:2, :2]*(SX*SY), k_sigma=k, color=(155,155,155), thickness=2)
             cv2.imwrite(str(OUT_OVERALL_SAT_VIS_PATH), overlay_img)
         continue # next drone image
 
@@ -1044,12 +1042,14 @@ for j, img_path in enumerate(sorted(DRONE_DIR.iterdir())):
         if missed_measurements_in_a_row == 1: # we want to keep searching around last known good position
             last_known_pose = x_updated.copy()
         search_pose = last_known_pose[:2]
-        L = (last_known_pose[2] * dt_sec)* 1.1 * missed_measurements_in_a_row  # (vel * dt) * 10% * number of fails = radius
+        L = (last_known_pose[2] * dt_sec)* 1.2 * missed_measurements_in_a_row  # (vel * dt) * 10% * number of fails = radius
         sigma = np.diag([L**2, L**2])
+        k_temp = 1 # we do not want to inflate it further
     else:
         search_pose = x_pred[:2]
+        k_temp = k
     
-    ellipse_bbox_coords = ellipse_bbox(search_pose, sigma, k=k, n=72) # this uses SVD to determine viedest axes and orienation of ellipse to get bbx
+    ellipse_bbox_coords = ellipse_bbox(search_pose, sigma, k=k_temp, n=72) # this uses SVD to determine viedest axes and orienation of ellipse to get bbx
 
     # -------------------- Determine tiles in search area --------------------
     selected_tiles = tiles_in_bbox(ellipse_bbox_coords, TILE_W, TILE_H, all_tile_names)
@@ -1063,6 +1063,12 @@ for j, img_path in enumerate(sorted(DRONE_DIR.iterdir())):
         phi_deg_flip = np.rad2deg(yaw0_rad)  # first frame use initial yaw
     else:
         phi_deg_flip = meas_phi_deg
+
+    """with open(DRONE_INFO_CSV, "r") as f:
+        r = csv.DictReader(f)
+        for row in r:
+            if Path(row["filename"]).stem == Path(drone_img).stem:
+                phi_deg_flip = np.rad2deg(float(row["yaw"]))   """
 
     # Arbitrary-angle rotation with padding; save the exact affine
     img = cv2.imread(str(DRONE_IMG), cv2.IMREAD_COLOR)
@@ -1335,9 +1341,9 @@ for j, img_path in enumerate(sorted(DRONE_DIR.iterdir())):
 
             draw_ellipse(
                 overlay_img,
-                pred_disp,
+                search_pose, # the last known pose
                 Sigma_disp,  # from search area
-                k_sigma=k,
+                k_sigma=1, # we do not want to inflate it further
                 color=(0,165,255),
                 thickness=1,
             )
@@ -1380,7 +1386,7 @@ for j, img_path in enumerate(sorted(DRONE_DIR.iterdir())):
     # ---- Measurement covariance from confidence ---- must be computed each frame
     # ---- Measurement covariance from confidence ---- must be computed each frame
     R = ekf.R_from_conf(
-            pos_base_std=30.0, # in px. measured the difference of GT and meas for first run and found mean around 55 px, with 95 percentile around 10 and 123 px
+            pos_base_std=20.0, # in px. measured the difference of GT and meas for first run and found mean around 55 px, with 95 percentile around 10 and 123 px
             heading_base_std_rad=np.deg2rad(3.0), # a normal good measurement are seen to be within +-3 degrees
             overall_conf=best_conf_overall,  # between 0 and 1
             pos_min_scale=0.5, # controls how much we trust low confidence measurements sets the unceartanty determined using 95 percentile
