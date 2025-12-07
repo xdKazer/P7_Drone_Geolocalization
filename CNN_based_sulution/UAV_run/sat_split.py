@@ -25,7 +25,7 @@ drone_m_per_px = 0.091706 # found using get_m_pr_pixel, that gives a ratio betwe
 
 # Ratios for each sat and drone images:
 # | 1: 0.090266 m/px | 2: 0.091706 m/px,  | 3: 0.104327 m/px | 4: 0.144053  m/px | 5: 0.120134 m/px | 6: 0.085574 m/px |
-# | 7: 0.?? m/px   | 8: 0.?? m/px | 9: 0.?? m/px | 10: 0.?? m/px | 11: 0.?? m/px
+# | 7: 0.?? m/px   | 8: 0.149043 m/px | 9: 0.221228 m/px | 10: 0.107205 m/px | 11: 0.210807 m/px
 
 
 

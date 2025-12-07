@@ -8,13 +8,13 @@ from pathlib import Path
 # ----------------- CONFIG -----------------
 BASE = Path(__file__).parent
 DATASET_DIR = BASE / "UAV_VisLoc_dataset"
-sat_number = "06"  # "01" | "02" | "03" | ...
+sat_number = "11"  # "01" | "02" | "03" | ...
 SAT_IMG_PATH   = DATASET_DIR / sat_number / f"satellite{sat_number}.tif"
-DRONE_IMG_PATH = DATASET_DIR / sat_number / "drone" / f"{sat_number}_0198.JPG"
+DRONE_IMG_PATH = DATASET_DIR / sat_number / "drone" / f"{sat_number}_0185.JPG"
 # For 01: use 01_0089.JPG, for 02: use 02_0022.JPG, use 03_0010.JPG for 03,
 # 4: use 04_0088.JPG, for 5: use 05_0130.JPG, 6: use 06_0198.JPG, 
-# 7: use 07_0???.JPG, 8: use 08_0???.JPG, 9: use 09_0???.JPG, 
-# 10: use 10_0???.JPG, 11: use 11_0???.JPG
+# 7: use 07_0???.JPG, 8: use 08_0825.JPG, 9: use 09_0066.JPG, 
+# 10: use 10_0065.JPG, 11: use 11_0185.JPG
 # -----------------  RESULTS -----------------
 """
 === RESULTS 01 ===
@@ -64,6 +64,39 @@ Satellite GSD:            0.274094 m/px
 Object real length:       22.962 m
 Drone GSD:                0.085574 m/px
 Drone/Sat GSD ratio:      0.312 ( >1 = coarser, <1 = finer )
+
+=== RESULTS 08===
+Satellite pixel distance: 225.180 px
+Drone pixel distance:     417.307 px
+Satellite GSD:            0.276208 m/px
+Object real length:       62.197 m
+Drone GSD:                0.149043 m/px
+Drone/Sat GSD ratio:      0.540 ( >1 = coarser, <1 = finer )
+
+=== RESULTS 09===
+Satellite pixel distance: 279.401 px
+Drone pixel distance:     523.283 px
+Satellite GSD:            0.414332 m/px
+Object real length:       115.765 m
+Drone GSD:                0.221228 m/px
+Drone/Sat GSD ratio:      0.534 ( >1 = coarser, <1 = finer )
+
+
+=== RESULTS 10===
+Satellite pixel distance: 160.798 px
+Drone pixel distance:     390.530 px
+Satellite GSD:            0.260369 m/px
+Object real length:       41.867 m
+Drone GSD:                0.107205 m/px
+Drone/Sat GSD ratio:      0.412 ( >1 = coarser, <1 = finer )
+
+=== RESULTS 11===
+Satellite pixel distance: 333.624 px
+Drone pixel distance:     416.541 px
+Satellite GSD:            0.263199 m/px
+Object real length:       87.810 m
+Drone GSD:                0.210807 m/px
+Drone/Sat GSD ratio:      0.801 ( >1 = coarser, <1 = finer )
 """
 
 
@@ -168,9 +201,9 @@ def main():
     print(f"Full satellite shape: {H_sat} x {W_sat}")
 
     # ---------- Crop SAT image region you care about ----------
-    CROP_region = 500
-    w = 5000
-    h =5000
+    CROP_region = 1000
+    w = 8200
+    h =3400
     # set crop region here:
     y0, y1 =h, h + CROP_region
     x0, x1 =  w, w + CROP_region
@@ -195,10 +228,19 @@ def main():
     w = 5000
     h =5000"""
     """ (07) : """
-    """ (08) : """
-    """ (09) : """
-    """ (10) : """
-    """ (11) : """
+    """ (08) :     CROP_region = 500
+    w = 4200
+    h =8200
+    """
+    """ (09) : CROP_region = 1000
+    w = 23000
+    h =14000"""
+    """ (10) : CROP_region = 500
+    w = 2700
+    h =2000"""
+    """ (11) : CROP_region = 1000
+    w = 8200
+    h =3400"""
 
     # clamp crop to image bounds
     y0 = max(0, min(H_sat, y0))
