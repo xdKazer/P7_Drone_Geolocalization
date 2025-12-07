@@ -5,10 +5,10 @@ from lightglue import SuperPoint
 from lightglue.utils import load_image, rbd
 
 Base_dir = Path(__file__).parent.resolve() 
-sat_number = "02"   #TODO !!!        #| "01" | "02" | "03" | "04" | "05" | "06" | "07" | "08" | "09" | "10"  | "11" |
+sat_number = "09"   #TODO !!!        #| "01" | "02" | "03" | "04" | "05" | "06" | "07" | "08" | "09" | "10"  | "11" |
 SAT_DIR   = Base_dir / f"UAV_VisLoc_dataset/{sat_number}/sat_tiles_overlap"
 output_dir = Base_dir / f"UAV_VisLoc_dataset/{sat_number}/superpoint_features/{sat_number}"
-
+ 
 
 MAX_KPTS = None  # max keypoints to extract (None = all)
 device = "cuda" if torch.cuda.is_available() else "cpu"

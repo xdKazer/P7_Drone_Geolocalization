@@ -8,12 +8,12 @@ from pathlib import Path
 # ----------------- CONFIG -----------------
 BASE = Path(__file__).parent
 DATASET_DIR = BASE / "UAV_VisLoc_dataset"
-sat_number = "11"  # "01" | "02" | "03" | ...
+sat_number = "07"  # "01" | "02" | "03" | ...
 SAT_IMG_PATH   = DATASET_DIR / sat_number / f"satellite{sat_number}.tif"
-DRONE_IMG_PATH = DATASET_DIR / sat_number / "drone" / f"{sat_number}_0185.JPG"
+DRONE_IMG_PATH = DATASET_DIR / sat_number / "drone" / f"{sat_number}_0010.JPG"
 # For 01: use 01_0089.JPG, for 02: use 02_0022.JPG, use 03_0010.JPG for 03,
 # 4: use 04_0088.JPG, for 5: use 05_0130.JPG, 6: use 06_0198.JPG, 
-# 7: use 07_0???.JPG, 8: use 08_0825.JPG, 9: use 09_0066.JPG, 
+# 7: use 07_0010.JPG, 8: use 08_0825.JPG, 9: use 09_0066.JPG, 
 # 10: use 10_0065.JPG, 11: use 11_0185.JPG
 # -----------------  RESULTS -----------------
 """
@@ -64,6 +64,8 @@ Satellite GSD:            0.274094 m/px
 Object real length:       22.962 m
 Drone GSD:                0.085574 m/px
 Drone/Sat GSD ratio:      0.312 ( >1 = coarser, <1 = finer )
+
+
 
 === RESULTS 08===
 Satellite pixel distance: 225.180 px
@@ -201,9 +203,9 @@ def main():
     print(f"Full satellite shape: {H_sat} x {W_sat}")
 
     # ---------- Crop SAT image region you care about ----------
-    CROP_region = 1000
-    w = 8200
-    h =3400
+    CROP_region = 10000
+    w = 0
+    h = 0
     # set crop region here:
     y0, y1 =h, h + CROP_region
     x0, x1 =  w, w + CROP_region
