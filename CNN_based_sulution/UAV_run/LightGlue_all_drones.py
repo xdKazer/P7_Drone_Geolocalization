@@ -26,14 +26,10 @@ MAX_KPTS = None               # max keypoints to load from .pt files (None = all
 MIN_CONFIDENCE_FOR_EKF_UPDATE = 0.2  # min confidence to use measurement update in EKF
 NUMBER_OF_ALLOWED_MISSES_IN_A_ROW = 2 # number of allowed missed measurements in a row before we need a high confidence to do an ekf update
 MIN_CONFIDENCE_FOR_EKF_UPDATE_AFTER_MISSES = 0.5  # min confidence to use measurement update in EKF after previous misses
-MIN_INLIERS_FOR_EKF_UPDATE = 10
+MIN_INLIERS_FOR_EKF_UPDATE = 8
 missed_measurements_in_a_row = 0 # counter for how many measurements have been skipped in a row
 SKIP_EKF_UPDATE = False # flag to skip ekf update in case of previous misses and low confidence
 
-# scaling of drone image:
-drone_img_scale = 0.9  # how much to downscale drone image before feature extraction to match scales between drone and satellite images
-# 01 = 1
-# 02=0.7
 sat_number = "02"          #| "01" | "02" | "03" | "04" | "05" | "06" | "07" | "08" | "09" | "10"  | "11" |
 
 #OBS: ekf is tuned for straight flight. if working with more turning, increase sigma_phi and sigma_b_phi in EKF+ P0+ and tune R_from_conf
@@ -105,7 +101,7 @@ Stride_W  = int(stride_w_str)
 TILE_H = int(tile_h_str)     
 TILE_W = int(tile_w_str)
 
-SCALE_TILE_TO_DRONE = float(scale_str) * drone_img_scale  # How many drone-pixels correspond to one satellite pixel. 
+SCALE_TILE_TO_DRONE = float(scale_str)  #comes from mpp_tile/mpp_drone
 # This is needed for downsampling of drone img
 
 ########################################################################################
@@ -753,18 +749,17 @@ def get_shape_score(
     img_w,
     img_h,
     scale_drone_to_tile,   # drone_px per tile_px
-    tau_pair=0.2,          # tolerance for opposite side length consistency
-    tau_ar=0.2,            # tolerance for aspect ratio
-    tau_angle=12.0,        # degrees tolerance for angles (no safe zone)
-    tau_scale_abs=0.5,     # how fast we penalize scale error beyond dead-band
-    scale_dead_band=0.10   # ONLY area has a dead zone (±10%)
+    tau_side_l_pairs=0.15,          # tolerance for opposite side length consistency ≈0.01 score when one side is ~2x the other, More tolerant → increase τ (e.g. 0.18–0.20), More strict → decrease τ (e.g. 0.12–0.13)
+    tau_aspect_ratio=0.30,            # tolerance for aspect ratio
+    tau_angle=15.0,        # degrees tolerance for angles 
+    tau_scale=0.5,     # how fast we penalize scale error  set loose as meters pr pixel is estimated not known exactly
 ):
     """
     Shape score in [0,1] using only the 4 warped corners (in tile coords).
 
     Checks:
       - s_w, s_h: opposite side length consistency (rectangularity)
-      - s_ar: aspect ratio vs original drone W/H
+      - s_aspect_ratio: aspect ratio vs original drone W/H
       - s_angle: all 4 angles ~ 90°
       - s_scale_abs: absolute scale vs expected (with dead-band)
 
@@ -800,16 +795,17 @@ def get_shape_score(
         return 0.0
 
     # =====================================================================
-    # 1) OPPOSITE SIDE EQUALITY  (no safe zone)
+    # 1) OPPOSITE SIDE EQUALITY  twice in size -> 0 conf  |  same -> 1 conf
     # =====================================================================
     d_w = abs(lT - lB) / (lT + lB + 1e-6)
     d_h = abs(lR - lL) / (lR + lL + 1e-6)
 
-    s_w = float(np.exp(- (d_w / tau_pair) ** 2))
-    s_h = float(np.exp(- (d_h / tau_pair) ** 2))
+    s_w = float(np.exp(- (d_w / tau_side_l_pairs) ** 2))
+    s_h = float(np.exp(- (d_h / tau_side_l_pairs) ** 2))
+    s_sides = (s_w + s_h) / 2.0
 
     # =====================================================================
-    # 2) ASPECT RATIO  (no safe zone)
+    # 2) ASPECT RATIO  PICKED SO THAT 50 distortion -> 0.3 conf  |  0 -> 1 conf  This is softly set as angle etc can be hard on it
     # =====================================================================
     w_est = 0.5 * (lT + lB)
     h_est = 0.5 * (lR + lL)
@@ -818,10 +814,10 @@ def get_shape_score(
     r0    = img_w / float(img_h)
 
     ratio_err = np.log(r_est / (r0 + 1e-6))
-    s_ar = float(np.exp(- (ratio_err / tau_ar) ** 2))
+    s_aspect_ratio = float(np.exp(- (ratio_err / tau_aspect_ratio) ** 2))
 
     # =====================================================================
-    # 3) ANGLES  (no safe zone)
+    # 3) ANGLES  90° -> 1 conf  |  90 +-30° -> 0 conf
     # =====================================================================
     def angle(a, b, c):
         """Angle ABC in degrees, with B as corner."""
@@ -841,37 +837,29 @@ def get_shape_score(
     ang = np.asarray(ang, dtype=np.float64)
 
     ang_err = np.abs(ang - 90.0)  # want ~90° at all 4 corners
-    mean_ang_err = float(np.mean(ang_err))
+    rms_ang_err = float(np.sqrt(np.mean(ang_err**2)))
 
-    s_angle = float(np.exp(- (mean_ang_err / tau_angle) ** 2))
-
-    # (optional) super-hard rejection if angle is crazy:
-    # if np.any(ang < 60.0) or np.any(ang > 120.0):
-    #     return 0.0
+    s_angle = float(np.exp(- (rms_ang_err / tau_angle) ** 2))
 
     # =====================================================================
-    # 4) ABSOLUTE SCALE (only term with dead-band)
+    # 4) ABSOLUTE SCALE 
     # =====================================================================
     area_now = w_est * h_est      # warped rect area in tile px²
     area0    = float(img_w * img_h)  # original drone rect area in drone px²
     if area_now <= 0 or area0 <= 0:
         return 0.0
 
-    S = float(scale_drone_to_tile)     # drone_px per tile_px
+    S = float(scale_drone_to_tile)     # comes from meters_pr_pixel_tile / meters_per_pixel_drone
     # expected: scale_now ~ 1
     scale_now = S * math.sqrt(area_now / area0)
     scale_err = abs(scale_now - 1.0)
 
-    if scale_err <= scale_dead_band:
-        s_scale_abs = 1.0
-    else:
-        eff = scale_err - scale_dead_band
-        s_scale_abs = float(np.exp(- (eff / tau_scale_abs) ** 2))
+    s_scale = float(np.exp(- (scale_err / tau_scale) ** 2))
 
     # =====================================================================
-    # 5) Combine terms (strict wrt worst)
+    # 5) Combine terms 
     # =====================================================================
-    terms = np.array([s_w, s_h, s_ar, s_angle, s_scale_abs], dtype=np.float64)
+    terms = np.array([s_sides, s_aspect_ratio, s_angle, s_scale], dtype=np.float64)
 
     mean_t = float(terms.mean())
     min_t  = float(terms.min())
@@ -1201,7 +1189,7 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
         # -------------------- Extract features from rotated drone image --------------------
         with torch.inference_mode():
             # SCALE drone img to match sat tiles
-            scale_drone_image = (1.0 / SCALE_TILE_TO_DRONE)   # sat_px_per_drone_px
+            scale_drone_image = (1.0 / SCALE_TILE_TO_DRONE)
             bgr_rot_small = cv2.resize(
                             bgr_rot,
                             (int(wR * scale_drone_image), int(hR * scale_drone_image)),
@@ -1389,7 +1377,7 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
     ##########################################################################################################
     
      # ----------------------------- IF needed, skip update and use predict only-------------------
-    if missed_measurements_in_a_row > NUMBER_OF_ALLOWED_MISSES_IN_A_ROW and best_conf_overall < MIN_CONFIDENCE_FOR_EKF_UPDATE_AFTER_MISSES:
+    if missed_measurements_in_a_row > NUMBER_OF_ALLOWED_MISSES_IN_A_ROW and best_LG_conf < MIN_CONFIDENCE_FOR_EKF_UPDATE_AFTER_MISSES or best_shape_score < MIN_CONFIDENCE_FOR_EKF_UPDATE_AFTER_MISSES:
         SKIP_EKF_UPDATE = True # set flag to skip ekf update due to too many misses in a row and low confidence
 
     if (SKIP_EKF_UPDATE or H_best is None or best_LG_conf < MIN_CONFIDENCE_FOR_EKF_UPDATE or best_shape_score < MIN_CONFIDENCE_FOR_EKF_UPDATE or best_num_inliers < MIN_INLIERS_FOR_EKF_UPDATE):
