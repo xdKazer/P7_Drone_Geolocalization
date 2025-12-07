@@ -2,13 +2,20 @@ import cv2
 import numpy as np
 import csv
 import math
-import matplotlib.pyplot as plt  # NEW
+import matplotlib.pyplot as plt  
+from pathlib import Path
 
 # ----------------- CONFIG -----------------
-sat_number = "03"  # "01" | "02" | "03" | ...
-SAT_IMG_PATH   = rf"C:/Users/signe/P7_Drone_Geolocalization/CNN_based_sulution/UAV_run/UAV_VisLoc_dataset/{sat_number}/satellite{sat_number}.tif"
-DRONE_IMG_PATH = rf"C:/Users/signe/P7_Drone_Geolocalization/CNN_based_sulution/UAV_run/UAV_VisLoc_dataset/{sat_number}/drone/{sat_number}_0010.JPG"
+BASE = Path(__file__).parent
+DATASET_DIR = BASE / "UAV_VisLoc_dataset"
+sat_number = "06"  # "01" | "02" | "03" | ...
+SAT_IMG_PATH   = DATASET_DIR / sat_number / f"satellite{sat_number}.tif"
+DRONE_IMG_PATH = DATASET_DIR / sat_number / "drone" / f"{sat_number}_0198.JPG"
 # For 01: use 01_0089.JPG, for 02: use 02_0022.JPG, use 03_0010.JPG for 03,
+# 4: use 04_0088.JPG, for 5: use 05_0130.JPG, 6: use 06_0198.JPG, 
+# 7: use 07_0???.JPG, 8: use 08_0???.JPG, 9: use 09_0???.JPG, 
+# 10: use 10_0???.JPG, 11: use 11_0???.JPG
+# -----------------  RESULTS -----------------
 """
 === RESULTS 01 ===
 Satellite pixel distance: 110.041 px
@@ -33,6 +40,30 @@ Satellite GSD:            0.274126 m/px
 Object real length:       27.173 m
 Drone GSD:                0.104327 m/px
 Drone/Sat GSD ratio:      0.381 ( >1 = coarser, <1 = finer )
+
+=== RESULTS 04===
+Satellite pixel distance: 267.918 px
+Drone pixel distance:     510.107 px
+Satellite GSD:            0.274272 m/px
+Object real length:       73.482 m
+Drone GSD:                0.144053 m/px
+Drone/Sat GSD ratio:      0.525 ( >1 = coarser, <1 = finer )
+
+=== RESULTS 05===
+Satellite pixel distance: 69.065 px
+Drone pixel distance:     163.441 px
+Satellite GSD:            0.284295 m/px
+Object real length:       19.635 m
+Drone GSD:                0.120134 m/px
+Drone/Sat GSD ratio:      0.423 ( >1 = coarser, <1 = finer )
+
+=== RESULTS 06===
+Satellite pixel distance: 83.774 px
+Drone pixel distance:     268.328 px
+Satellite GSD:            0.274094 m/px
+Object real length:       22.962 m
+Drone GSD:                0.085574 m/px
+Drone/Sat GSD ratio:      0.312 ( >1 = coarser, <1 = finer )
 """
 
 
@@ -137,9 +168,9 @@ def main():
     print(f"Full satellite shape: {H_sat} x {W_sat}")
 
     # ---------- Crop SAT image region you care about ----------
-    CROP_region = 1000
-    w = 30000
-    h =17000
+    CROP_region = 500
+    w = 5000
+    h =5000
     # set crop region here:
     y0, y1 =h, h + CROP_region
     x0, x1 =  w, w + CROP_region
@@ -153,9 +184,16 @@ def main():
     """ (03) : CROP_region = 1000
     w = 30000
     h =17000 """
-    """ (04) : """
-    """ (05) : """
-    """ (06) : """
+    """ (04) : CROP_region = 1000
+    w = 1400
+    h =4000
+    """
+    """ (05) :     CROP_region = 500
+    w = 5400
+    h =1400"""
+    """ (06) : CROP_region = 500
+    w = 5000
+    h =5000"""
     """ (07) : """
     """ (08) : """
     """ (09) : """
@@ -179,7 +217,7 @@ def main():
     # ---------- Read map extent and compute SAT GSD ----------
     coordinate_range_lat_lon_sat = None
     with open(
-        "C:/Users/signe/P7_Drone_Geolocalization/CNN_based_sulution/UAV_run/UAV_VisLoc_dataset/satellite_coordinates_range.csv",
+        f"{DATASET_DIR}/satellite_coordinates_range.csv",
         newline="",
     ) as f:
         for r in csv.DictReader(f):
@@ -232,7 +270,7 @@ def main():
     drone_m_per_px = real_len_m / drone_px_dist
     gsd_ratio = drone_m_per_px / SAT_M_PER_PX
 
-    print("\n=== RESULTS ===")
+    print(f"\n=== RESULTS {sat_number}===")
     print(f"Satellite pixel distance: {sat_px_dist:.3f} px")
     print(f"Drone pixel distance:     {drone_px_dist:.3f} px")
     print(f"Satellite GSD:            {SAT_M_PER_PX:.6f} m/px")
