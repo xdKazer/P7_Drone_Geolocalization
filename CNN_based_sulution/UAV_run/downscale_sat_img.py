@@ -1,6 +1,7 @@
 # downscale_satellite_vscode.py
 # Run directly in VSCode (F5). All settings are below.
-
+import os
+os.environ["OPENCV_IO_MAX_IMAGE_PIXELS"] = str(2**40)  # or "20000000000"
 from pathlib import Path
 import json
 import datetime
@@ -10,7 +11,7 @@ import numpy as np
 # =========================
 # CONFIG (edit these)
 # =========================
-sat_num = "06"  # e.g., "01", "02", "03", ...
+sat_num = "09"  # e.g., "01", "02", "03", ...
 BASE_PATH         = Path(__file__).parent.resolve()
 INPUT_TIF         = BASE_PATH / f"UAV_VisLoc_dataset/{sat_num}/satellite{sat_num}.tif"
 OUTPUT_IMAGE      = BASE_PATH / f"UAV_VisLoc_dataset/{sat_num}/satellite{sat_num}_small.png"

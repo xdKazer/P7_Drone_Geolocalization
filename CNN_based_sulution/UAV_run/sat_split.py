@@ -1,3 +1,5 @@
+import os
+os.environ["OPENCV_IO_MAX_IMAGE_PIXELS"] = str(2**40)  # or "20000000000"
 import cv2
 import math
 from pathlib import Path
@@ -7,7 +9,7 @@ import csv
 """
 This script tiles the satellite image into overlapping patches that:
 
-- Cover 1.3 × the drone-image diagonal (in meters) at any rotation.
+- Cover 1.3 x the drone-image diagonal (in meters) at any rotation.
 - Use ORIGINAL satellite resolution (NO UPSCALING).
 - Use 50% overlap.
 - Produce tiles: UAV_VisLoc_dataset/<sat_number>/sat_tiles_overlap_native
@@ -19,9 +21,9 @@ This avoids destroying features, unlike the previous rescaled version.
 # ----------------- Config -----------------
 BASE        = Path(__file__).parent.resolve()
 dataset_dir = BASE / "UAV_VisLoc_dataset"
-sat_number  = "02"
+sat_number  = "09"
 # Drone GSD (meters per pixel)
-drone_m_per_px = 0.091706 # found using get_m_pr_pixel, that gives a ratio between satellite and drone GSD
+drone_m_per_px = 0.221228 # found using get_m_pr_pixel, that gives a ratio between satellite and drone GSD
 
 # Ratios for each sat and drone images:
 # | 1: 0.090266 m/px | 2: 0.091706 m/px,  | 3: 0.104327 m/px | 4: 0.144053  m/px | 5: 0.120134 m/px | 6: 0.085574 m/px |

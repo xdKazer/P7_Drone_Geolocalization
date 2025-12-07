@@ -30,7 +30,7 @@ MIN_INLIERS_FOR_EKF_UPDATE = 10
 missed_measurements_in_a_row = 0 # counter for how many measurements have been skipped in a row
 SKIP_EKF_UPDATE = False # flag to skip ekf update in case of previous misses and low confidence
 
-sat_number = "02"          #| "01" | "02" | "03" | "04" | "05" | "06" | "07" | "08" | "09" | "10"  | "11" |
+sat_number = "09"          #| "01" | "02" | "03" | "04" | "05" | "06" | "07" | "08" | "09" | "10"  | "11" |
 
 #OBS: ekf is tuned for straight flight. if working with more turning, increase sigma_phi and sigma_b_phi in EKF+ P0+ and tune R_from_conf
 # OBS we assume top down view (important for shape terms, heading, and EKF motion model)
@@ -54,13 +54,13 @@ if sat_number == "06":
 #if sat_number == "07":
     #--------------
 if sat_number == "08":
-    starting_drone_images = ["08_0215.JPG", "08_0312.JPG", "08_0409.JPG", "08_0509.JPG", "08_0609.JPG", "08_0713.JPG", "08_0818.JPG", "08_0026.JPG", ] # the names of the drone images that starts a run
+    starting_drone_images = ["08_0215.JPG", "08_0312.JPG", "08_0409.JPG", "08_0509.JPG", "08_0609.JPG", "08_0713.JPG", "08_0818.JPG", "08_0926.JPG", ] # the names of the drone images that starts a run
 if sat_number == "09":
     starting_drone_images = ["09_0001.JPG", "09_0129.JPG", "09_0256.JPG", "09_0384.JPG", "09_0512.JPG", "09_0640.JPG", ] # the names of the drone images that starts a run
 if sat_number == "10":
-    starting_drone_images = ["10_0001.JPG", "10_019.JPG", "10_037.JPG", "10_055.JPG", "10_073.JPG", "10_091.JPG", "10_109.JPG", "10_127.JPG", ] # the names of the drone images that starts a run
+    starting_drone_images = ["10_0001.JPG", "10_0019.JPG", "10_0037.JPG", "10_0055.JPG", "10_0073.JPG", "10_0091.JPG", "10_0109.JPG", "10_0127.JPG", ] # the names of the drone images that starts a run
 if sat_number == "11":
-    starting_drone_images = ["11_0003.JPG", "11_052.JPG", "11_0101.JPG", "11_0150.JPG", "11_0199.JPG", "11_0248.JPG", "11_0297.JPG", "11_0346.JPG", "11_0395.JPG", "11_0444.JPG", "11_0493.JPG", "11_0542.JPG", ] # the names of the drone images that starts a run
+    starting_drone_images = ["11_0003.JPG", "11_0052.JPG", "11_0101.JPG", "11_0150.JPG", "11_0199.JPG", "11_0248.JPG", "11_0297.JPG", "11_0346.JPG", "11_0395.JPG", "11_0444.JPG", "11_0493.JPG", "11_0542.JPG", ] # the names of the drone images that starts a run
 
 
 # -------------------- Paths --------------------
@@ -1352,7 +1352,11 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
                 "shape_terms": shape_terms,
                 "overall_conf": overall_conf
             })
-    
+            # -------------------- end of per-tile processing; free VRAM --------------------
+            del feats_tile_b, feats_tile_r, matches01, matches01_r
+            gc.collect()
+            if device == "cuda":
+                torch.cuda.empty_cache()
     # -------------------- Rank them and save in CSV. There is gonna be one CSV for each drone image --------------------
     scores_small.sort(key=lambda d:(d["overall_conf"], 0.0 if not math.isfinite(d["shape_score"]) else d["shape_score"]),
                                     reverse=True)
