@@ -28,6 +28,9 @@ drone_m_per_px = 0.091706 # found using get_m_pr_pixel, that gives a ratio betwe
 # | 7: 0.?? m/px   | 8: 0.149043 m/px | 9: 0.221228 m/px | 10: 0.107205 m/px | 11: 0.210807 m/px
 
 
+# Tile margin factor
+TILE_DIAG_MARGIN = 1.3
+OVERLAP = 0.5
 
 tif_path = dataset_dir / sat_number / f"satellite{sat_number}.tif"
 out_dir  = dataset_dir / sat_number / "sat_tiles_overlap"
@@ -54,9 +57,7 @@ with open("C:/Users/signe/P7_Drone_Geolocalization/CNN_based_sulution/UAV_run/UA
             break
 
 
-# Tile margin factor
-TILE_DIAG_MARGIN = 1.3
-OVERLAP = 0.5
+
 
 # ----------------- Helpers -----------------
 def haversine_m(lat1, lon1, lat2, lon2):
@@ -147,7 +148,7 @@ for y0 in ys:
         count += 1
 
 print(f"Saved {count} tiles to: {out_dir}")
-print(sat_m_per_px / drone_m_per_px)
+print(f"scale: {sat_m_per_px/drone_m_per_px}")
 
 # ----------------- Metadata -----------------
 meta_path = out_dir / "a_tile_size.txt"
