@@ -380,7 +380,7 @@ def drone_position_homography(og_drone_img: Image.Image, drone_img_rotated: Imag
         singlePointColor=(255, 0, 0),
         flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS
     )
-    scale = 0.3
+    scale = 0.7
     vis = cv2.resize(vis, (0,0), fx=scale, fy=scale)
     cv2.imshow("Feature Matches", vis)
     cv2.waitKey(0)
