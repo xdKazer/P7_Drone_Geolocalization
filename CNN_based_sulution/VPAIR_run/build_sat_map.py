@@ -3,14 +3,15 @@ import glob
 import csv
 import cv2 as cv
 import numpy as np
+from pathlib import Path
 
 # ===================== CONFIG =====================
-
-TILES_DIR = r"D:\P7_Drone_Geolocalization\CNN_based_sulution\VPAIR_run\vpair_dataset\tiles"
+BASE = Path(__file__).parent.resolve()
+DATASET_DIR = BASE / "vpair_dataset"
+TILES_DIR = DATASET_DIR / "tiles"
 PATCH_HALF = 100                     # 200x200 patch around center
-OUT_MOSAIC = r"D:\P7_Drone_Geolocalization\CNN_based_sulution\VPAIR_run\vpair_dataset\sat_img.png"    # Mosaic image output
-OUT_CENTERS = r"D:\P7_Drone_Geolocalization\CNN_based_sulution\VPAIR_run\vpair_dataset\tile_centers_in_sat.csv"   # CSV storing center pixel positions
-
+OUT_MOSAIC = DATASET_DIR / "sat_img.png"    # Mosaic image output
+OUT_CENTERS = DATASET_DIR / "tile_centers_in_sat.csv"   # CSV storing center pixel positions
 # ===================== HELPERS =====================
 
 def load_tile_paths(folder):

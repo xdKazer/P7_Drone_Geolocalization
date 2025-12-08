@@ -55,7 +55,8 @@ DRONE_DIR = DATASET_DIR / "drone"
 TILES_DIR   = DATASET_DIR /  "tiles" 
 SAT_IMG = DATASET_DIR / "sat_mosaic_small.png"
 SX, SY = 0.08667013347200554, 0.08667013347200554 
-pixel_offset = [2980, 1365]
+pixel_offset = [2981.38, 1362.62] #x0 = (0 - min_x) * scale ≈ 2981.38, y0 = (0 - min_y) * scale ≈ 1362.62
+#83020.0, 37729.0  first centre 
 
 if visualisations_enabled:
     OUT_DIR_CLEAN   = BASE / "outputs" / "VPAIR_outputs_with_visualisations"
@@ -1019,10 +1020,13 @@ for j, img_path in enumerate(sorted(DRONE_DIR.iterdir())):
         if visualisations_enabled:  
             overlay_img = cv2.imread(str(OUT_OVERALL_SAT_VIS_PATH), cv2.IMREAD_COLOR)
             start_x, start_y = pixel_offset
-            draw_point(overlay_img, (start_x, start_y), color=(155,155,155), r=6) # light grey
-            label_point(overlay_img, (start_x, start_y), f"Start {drone_img}", color=(155,155,155),
-                        offset=(-100,-100), font_scale=0.5, thickness=1)
-            draw_ellipse(overlay_img, (start_x, start_y), ekf.P[:2, :2]*(SX*SY), k_sigma=k, color=(155,155,155), thickness=2)
+            draw_point(overlay_img, (start_x, start_y), color=(255,255,255), r=3) # light grey
+            label_point(overlay_img, (start_x, start_y), f"Start", color=(255,255,255),
+                        offset=(-20,20), font_scale=0.5, thickness=1)
+            draw_point(overlay_img, ( 1675 , 1908 ), color=(255,255,255), r=3) # light grey
+            label_point(overlay_img, ( 1675 , 1908 ), f"End", color=(255,255,255),
+                        offset=(0,20), font_scale=0.5, thickness=1)
+            #draw_ellipse(overlay_img, (start_x, start_y), ekf.P[:2, :2]*(SX*SY), k_sigma=k, color=(255,255,255), thickness=2)
             cv2.imwrite(str(OUT_OVERALL_SAT_VIS_PATH), overlay_img)
         continue # next drone image
 
@@ -1053,22 +1057,22 @@ for j, img_path in enumerate(sorted(DRONE_DIR.iterdir())):
 
     # -------------------- Determine tiles in search area --------------------
     selected_tiles = tiles_in_bbox(ellipse_bbox_coords, TILE_W, TILE_H, all_tile_names)
-    print("------------------------------------------------")
-    print(f"[info] Drone image {drone_img}: selected {selected_tiles[0]} to {selected_tiles[-1]}.")
+    #print("------------------------------------------------")
+    #print(f"[info] Drone image {drone_img}: selected {selected_tiles[0]} to {selected_tiles[-1]}.")
 
     # -------------------- Rotate drone image & extract features --------------------
 
-    # SuperPoint / DISK: rotate according to heading from CSV
+    """# SuperPoint / DISK: rotate according to heading from CSV
     if meas_phi_deg is None:
         phi_deg_flip = np.rad2deg(yaw0_rad)  # first frame use initial yaw
     else:
-        phi_deg_flip = meas_phi_deg
+        phi_deg_flip = meas_phi_deg"""
 
-    """with open(DRONE_INFO_CSV, "r") as f:
+    with open(DRONE_INFO_CSV, "r") as f:
         r = csv.DictReader(f)
         for row in r:
             if Path(row["filename"]).stem == Path(drone_img).stem:
-                phi_deg_flip = np.rad2deg(float(row["yaw"]))   """
+                phi_deg_flip = np.rad2deg(float(row["yaw"]))   
 
     # Arbitrary-angle rotation with padding; save the exact affine
     img = cv2.imread(str(DRONE_IMG), cv2.IMREAD_COLOR)
@@ -1151,7 +1155,7 @@ for j, img_path in enumerate(sorted(DRONE_DIR.iterdir())):
                 img1_t  = load_image(str(p)).to(device if feat != "sift" else "cpu")
                 feats_tile_b = extractor.extract(img1_t)
                 feats_tile_r = rbd(feats_tile_b) # TODO save the features from drone imge for future runs
-                print(f"[info] Extracted features on-the-fly for tile {p.name}.")
+                #print(f"[info] Extracted features on-the-fly for tile {p.name}.")
 
             # -------------------- Match features --------------------
             matches01 = matcher({"image0": feats_drone_b_scaled, "image1": feats_tile_b})
@@ -1287,9 +1291,9 @@ for j, img_path in enumerate(sorted(DRONE_DIR.iterdir())):
             shape_conf = top1["shape_score"]
             shape_terms = top1.get("shape_terms")
             best_conf_overall = top1["overall_conf"]
-            print(f"[info] Top-1 candidate for {drone_img} is tile {tile_name} but skipping EKF update.")
+            #print(f"[info] Top-1 candidate for {drone_img} is tile {tile_name} but skipping EKF update.")
 
-        print(f"[info] Skipping EKF update for {drone_img} due to no valid homography or low confidence ({best_conf_overall:.4f} < {MIN_CONFIDENCE_FOR_EKF_UPDATE})")
+        #print(f"[info] Skipping EKF update for {drone_img} due to no valid homography or low confidence ({best_conf_overall:.4f} < {MIN_CONFIDENCE_FOR_EKF_UPDATE})")
         meters_pr_pixel = MAP_M_PER_PX_GLOBAL
         pose_ekf_px = (x_pred[0], x_pred[1])
         diff_px = (pose_ekf_px[0] - GT_centre_x_px_tile,
@@ -1331,22 +1335,25 @@ for j, img_path in enumerate(sorted(DRONE_DIR.iterdir())):
 
             pred_x, pred_y = x_pred[0], x_pred[1]       # ORIGINAL sat px
             pred_disp = (pred_x*SX + pixel_offset[0], pred_y*SY + pixel_offset[1])      # DISPLAY sat px
+            GT_pose_disp = (GT_centre_x_px_tile*SX + pixel_offset[0], GT_centre_y_px_tile * SY + pixel_offset[1])  # DISPLAY sat px
 
             draw_point(overlay_img, pred_disp, color=(255,255,0), r=1)
+            draw_point(overlay_img, GT_pose_disp, color=(255,0,0), r=1)
 
-            # --- Correct covariance scaling (see next section) ---
+            # ---  covariance scaling---
             sigma_copy = sigma.copy()
             J = np.diag([SX, SY])           # scaling x,y → display coords
             Sigma_disp = J @ sigma_copy @ J.T
+            pose_last_known = (search_pose[0] * SX + pixel_offset[0], search_pose[1] * SY + pixel_offset[1])  # ORIGINAL sat px
 
-            draw_ellipse(
+            """draw_ellipse(
                 overlay_img,
-                search_pose, # the last known pose
+                pose_last_known, # the last known pose
                 Sigma_disp,  # from search area
                 k_sigma=1, # we do not want to inflate it further
                 color=(0,165,255),
                 thickness=1,
-            )
+            )"""
 
             cv2.imwrite(str(OUT_OVERALL_SAT_VIS_PATH), overlay_img)
         continue # next drone image
@@ -1358,7 +1365,7 @@ for j, img_path in enumerate(sorted(DRONE_DIR.iterdir())):
     best_conf_overall = top1["overall_conf"]
     shape_terms = best_shape_terms if best_shape_terms is not None else top1.get("shape_terms")
     shape_terms_str = fmt_shape_terms(shape_terms)
-    print(f"[info] Top-1 candidate for {drone_img} is tile {tile_name}")
+    #print(f"[info] Top-1 candidate for {drone_img} is tile {tile_name}")
 
 
     if visualisations_enabled:
