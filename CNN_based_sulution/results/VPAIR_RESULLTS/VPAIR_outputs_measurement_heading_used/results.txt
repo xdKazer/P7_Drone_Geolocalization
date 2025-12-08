@@ -1,1 +1,6 @@
-{'mean_error_m': 61.560638133333335, 'mean_error_m_ekf': 201.25226532347503, 'mean_heading_deg': 0.0, 'mean_heading_deg_ekf': 0.0, 'mean_dx_m': -8.103095199999998, 'mean_dy_m': 1.4792375111111111, 'mean_dx_m_ekf': -126.18097548983363, 'mean_dy_m_ekf': 22.700109796672827, 'mean_time_s': 0.8493976709796672, 'mean_time_s_ekf': nan, 'rmse_error_m': 82.86883783993676, 'rmse_error_m_ekf': 845.8665607327449, 'std_error_m': 55.4878411707344, 'std_error_m_ekf': 821.7282944626394, 'std_time_s': 1.0102086751326977, 'std_time_s_ekf': nan, 'unsuccessful_matches': 455, 'unsuccessful_no_homography': 0, 'unsuccessful_low_confidence': 349, 'unsuccessful_unknown_confidence': 106, 'unsuccessful_matches_ekf': 0, 'total_rows': 2705, 'successful_rows': 2250}
+OVERALL: mean error: 61.560638133333335 rmse: 82.86883783993676 STD: 55.4878411707344 --------------- 
+mean error ekf: 201.25226532347497 rmse ekf: 845.8665607327453 STD ekf: 821.7282944626394 --------------- 
+mean time: 0.8493976709796682 unsuccessful matches: 455 unsuccessful matches ekf: 0 total_rows: 2705
+
+< 2000 feats mean error: 74.71983519695038 rmse: 96.09710466384412 STD: 60.4668963493806 mean time: 0.7031720171673816 unsuccessful matches: 378 total_rows: 1165
+≥ 2000 feats mean error: 54.48183561175665 rmse: 74.79124429768939 STD: 51.25676162337187 mean time: 0.9600164285714291 unsuccessful matches: 77 total_rows: 1540
