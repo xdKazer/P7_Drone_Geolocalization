@@ -1,7 +1,7 @@
 import pandas as pd
 
 # Load your CSV, letting pandas read the header
-df = pd.read_csv("geolocalization_dinov3/dataset_data/csv_files/09.csv")
+df = pd.read_csv("geolocalization_dinov3/dataset_data/csv_files/11.csv")
 
 # Convert the 'date' column to datetime
 df["date"] = pd.to_datetime(df["date"], format="%Y-%m-%dT%H:%M:%S")

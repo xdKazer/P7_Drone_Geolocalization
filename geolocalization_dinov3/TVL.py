@@ -11,7 +11,6 @@ from lightglue.utils import rbd                     # type: ignore # For robust 
 from PIL import Image, ImageDraw
 import cv2
 import rasterio
-import pymagsac 
 
 # Math Stuff
 import numpy as np
@@ -365,7 +364,6 @@ def drone_position_homography(og_drone_img: Image.Image, drone_img_rotated: Imag
     pts_drone = kp_drone_data_r["keypoints"][matches_idx[:, 0]].detach().cpu().numpy()
     pts_sat   = kp_sat_data_r["keypoints"][matches_idx[:, 1]].detach().cpu().numpy()
 
-    # Update me:
     """""
     # Convert to OpenCV KeyPoint and DMatch objects for visualization (if needed)
     kp_drone_cv = [cv2.KeyPoint(float(x), float(y), 1.0) for x, y in kp_drone_data_r["keypoints"].detach().cpu().numpy()]
@@ -396,9 +394,9 @@ def drone_position_homography(og_drone_img: Image.Image, drone_img_rotated: Imag
 
     #print(f"Number of matches found: {len(pts_drone)}")
     if len(pts_drone) < 90:
-        print(f"Warning: Only {len(pts_drone)} matches found, homography may be unreliable. Tossing to avoid noise")
+        #print(f"Warning: Only {len(pts_drone)} matches found, homography may be unreliable. Tossing to avoid noise")
         H = None
-        return H, sat_corners, drone_center, heading_vec, heading_deg, confidence, pts_drone
+        return H, sat_corners, drone_center, heading_vec, heading_deg, confidence, pts_drone, None, None, None, None, None
 
     if pts_drone.shape[0] >= 4:
         H, mask = cv2.findHomography(pts_drone, pts_sat, cv2.USAC_MAGSAC, ransacReprojThreshold=5.0, confidence=0.9999)
@@ -446,9 +444,9 @@ def drone_position_homography(og_drone_img: Image.Image, drone_img_rotated: Imag
 
         # Convex if all turns are same direction, so check if not all positive or all negative
         if not (np.all(signs > 0) or np.all(signs < 0)):
-            print("Warning: Homography produced non-convex quadrilateral.")
+            #print("Warning: Homography produced non-convex quadrilateral.")
             H = None
-            return H, sat_corners, drone_center, [1, 1], drone_heading, confidence, pts_drone # Return placeholder vector and prior heading if homography fails
+            return H, sat_corners, drone_center, [1, 1], drone_heading, confidence, pts_drone, None, None, None, None, None # Return placeholder vector and prior heading if homography fails
 
         # Check angles between edges to ensure they are roughly 90 degrees
         for i in range(4):
@@ -456,19 +454,19 @@ def drone_position_homography(og_drone_img: Image.Image, drone_img_rotated: Imag
             v2 = P[(i+2)%4] - P[(i+1)%4]
             angle = np.degrees(np.arccos(np.dot(v1,v2)/(np.linalg.norm(v1)*np.linalg.norm(v2))))
             if not 70 < angle < 110:
-                print(f"Warning: Homography produced non-rectangular shape (angle {angle:.2f} degrees).")
+                #print(f"Warning: Homography produced non-rectangular shape (angle {angle:.2f} degrees).")
                 H = None
-                return H, sat_corners, drone_center, [1, 1], drone_heading, confidence, pts_drone # Return placeholder vector and prior heading if homography fails
+                return H, sat_corners, drone_center, [1, 1], drone_heading, confidence, pts_drone, None, None, None, None, None # Return placeholder vector and prior heading if homography fails
 
         # Compute center
         drone_center = np.mean(sat_corners, axis=0)
 
         if last_found_pos is not None:
             dist_moved = np.linalg.norm(drone_center - last_found_pos)
-            if dist_moved > 1200 * last_found: # pixels Update Me
-                print(f"Warning: Drone position jumped {dist_moved:.2f} pixels since last known position, allowed {1200 * last_found}. Tossing result.")
+            if dist_moved > 1200 * last_found: # pixels
+                #print(f"Warning: Drone position jumped {dist_moved:.2f} pixels since last known position, allowed {1200 * last_found}. Tossing result.")
                 H = None
-                return H, sat_corners, drone_center, [1, 1], drone_heading, confidence, pts_drone # Return placeholder vector and prior heading if homography fails
+                return H, sat_corners, drone_center, [1, 1], drone_heading, confidence, pts_drone, None, None, None, None, None # Return placeholder vector and prior heading if homography fails
         #print(f"Estimated drone position in satellite patch pixels: x={drone_center[0]}, y={drone_center[1]}")
 
         # Compute drone heading from satellite corners
@@ -501,9 +499,10 @@ def drone_position_homography(og_drone_img: Image.Image, drone_img_rotated: Imag
         #print(f"Homography confidence: {confidence:.3f} (Inlier: {inlier_confidence:.3f}, Side Lengths: {length_confidence:.3f})")
 
     else:
-        print("Not enough good matches found for homography.")
+        pass
+        #print("Not enough good matches found for homography.")
 
-    return H, sat_corners, drone_center, heading_vec, heading_deg, confidence, kp_drone_data_r["keypoints"].detach().cpu().numpy()
+    return H, sat_corners, drone_center, heading_vec, heading_deg, confidence, kp_drone_data_r["keypoints"].detach().cpu().numpy(), length_std, length_mean, inlier_count, length_confidence, inlier_confidence
    
 
 if __name__ == "__main__":
@@ -514,10 +513,13 @@ if __name__ == "__main__":
     model.eval()
 
     # Itteration variables (For testing with dataset images)  # NOTE: Update Me Testing
-    i = 1                  # Image index to process (For full set testing, start at 1)
-    used_dataset = 9       # This is the dataset we are using (01, 02 ..., -> 11)
-    starting_drone_images = [f"{used_dataset:02d}_0001.JPG", f"{used_dataset:02d}_0129.JPG", f"{used_dataset:02d}_0256.JPG", 
-                             f"{used_dataset:02d}_0384.JPG", f"{used_dataset:02d}_0512.JPG", f"{used_dataset:02d}_0640.JPG"] # the names of the drone images that starts a run
+    i = 3                   # Image index to process (For full set testing, start at 1)
+    used_dataset = 11       # This is the dataset we are using (01, 02 ..., -> 11)
+    starting_drone_images = [f"{used_dataset:02d}_0001.JPG", f"{used_dataset:02d}_0003.JPG", f"{used_dataset:02d}_0052.JPG", 
+                             f"{used_dataset:02d}_0101.JPG", f"{used_dataset:02d}_0150.JPG", f"{used_dataset:02d}_0199.JPG",
+                             f"{used_dataset:02d}_0248.JPG", f"{used_dataset:02d}_0297.JPG", f"{used_dataset:02d}_0346.JPG",
+                             f"{used_dataset:02d}_0395.JPG", f"{used_dataset:02d}_0444.JPG", f"{used_dataset:02d}_0493.JPG",
+                             f"{used_dataset:02d}_0542.JPG"] # the names of the drone images that starts a run
 
     # Initialize position and heading
     curr_position = None
@@ -552,11 +554,21 @@ if __name__ == "__main__":
     geo_span_meters = (geo_span[0] * meters_per_degree_lat, geo_span[1] * meters_per_degree_lon) #  (meters in lat, meters in lon)
     
     # NOTE: Update Me Testing
-    meters_per_pixel_lat = geo_span_meters[0] / 33280 # Height of full satellite image in pixels
-    meters_per_pixel_lon = geo_span_meters[1] / 44800 # Width of full satellite image in pixels
+    meters_per_pixel_lat = geo_span_meters[0] / 16582 # Height of full satellite image in pixels
+    meters_per_pixel_lon = geo_span_meters[1] / 29592 # Width of full satellite image in pixels
 
     # Loop, continuously process images from drone camera feed
     while i <= len(df): # <-- Replace with loop that runs for each image in dataset (or ROS2 image callback for full onboard drone processing)
+        drone_image_path = f"geolocalization_dinov3/dataset_data/drone_images/{used_dataset:02d}/{used_dataset:02d}_{i:04d}.JPG" # NOTE: Once we move to ROS2, find image without hardcoding path
+        pil_image = Image.open(drone_image_path).convert("RGB")
+        img_for_keypoint_debug = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
+        debug_drone_tensor = TF.to_tensor(img_for_keypoint_debug).unsqueeze(0).float().to(device)
+        superpoint_debugger = SuperPoint().eval().to(device)
+        with torch.no_grad():
+            kp_drone_data_debug = superpoint_debugger.extract(debug_drone_tensor)
+            kp_drone_data_debug_r = rbd(kp_drone_data_debug)
+        keypoint_length = len(kp_drone_data_debug_r["keypoints"].detach().cpu().numpy())
+        
         start_time = time.time()
 
         if df.loc[df['num'] == i, ['filename']].values[0][0] in starting_drone_images:
@@ -571,7 +583,7 @@ if __name__ == "__main__":
             actual_drone_y = (lat_long_1[0] - curr_position[0]) * meters_per_degree_lat / meters_per_pixel_lat
             actual_drone_x = (curr_position[1] - lat_long_1[1]) * meters_per_degree_lon / meters_per_pixel_lon       
             curr_position = np.array([actual_drone_x, actual_drone_y])     
-            print(f"\n--- Starting new dataset run at image {i}, resetting position and heading ---\n")
+            #print(f"\n--- Starting new dataset run at image {i}, resetting position and heading ---\n")
 
         # Due to file formatting, we need to fill in leading zeros for dataset and image index (The first drone image is 0001)
         drone_image_path = f"geolocalization_dinov3/dataset_data/drone_images/{used_dataset:02d}/{used_dataset:02d}_{i:04d}.JPG" # NOTE: Once we move to ROS2, find image without hardcoding path
@@ -607,9 +619,10 @@ if __name__ == "__main__":
         # Perform the rotation
         drone_rotated = cv2.warpAffine(np.array(pil_image), M, (new_w, new_h), flags=cv2.INTER_LINEAR, borderValue=0)
 
-        # Scale drone image to match satellite image scale (Based on pixels per meter) # NOTE: Update Me Testing
-        scale_hor = 0.15/2.167 * 3
-        scale_ver = 0.15/2.234 * 3
+        # Scale drone image to match satellite image scale (Based on pixels per meter)
+        var_scale = 3
+        scale_hor = 1/var_scale
+        scale_ver = 1/var_scale
         #print("Resizing satellite patch by factors: ", scale_hor, scale_ver)
         new_width = int(drone_rotated.shape[1] * scale_hor)
         new_height = int(drone_rotated.shape[0] * scale_ver)
@@ -681,6 +694,17 @@ if __name__ == "__main__":
         # Extract DINOv3 features from drone image (Using Native Drone Size!!!)
         features = process_image_with_dino(rotated_drone_resized, model, device)
 
+        # Update me
+        var_scale = 1.2485321048902613
+        scale_hor = 1/var_scale
+        scale_ver = 1/var_scale
+        #print("Resizing satellite patch by factors: ", scale_hor, scale_ver)
+        new_width = int(drone_rotated.shape[1] * scale_hor)
+        new_height = int(drone_rotated.shape[0] * scale_ver)
+
+        # Resize satellite patch without cropping:
+        rotated_drone_resized = Image.fromarray(drone_rotated).resize((new_width, new_height), Image.LANCZOS)
+
         # Ensure that time difference is still computed, even if EKF is initialised
         for row in df.itertuples(index=False):
             if row.filename == f"{used_dataset:02d}_{i:04d}.JPG":
@@ -701,7 +725,7 @@ if __name__ == "__main__":
         
         ellipse_bbox_coords = ellipse_bbox(x_pred[:2], sigma, k=k, n=72) # this uses SVD to determine viedest axes and orienation of ellipse to get bbx
 
-        TILE_W = 1018; TILE_H = 1040 # Currently width x height are just hardcoded from satellite_image_processing.py # NOTE: Update Me Testing
+        TILE_W = 1020; TILE_H = 1036 # Currently width x height are just hardcoded from satellite_image_processing.py # NOTE: Update Me Testing
         
         # Extract the tile names for the tiles within the ellipsis
         all_tile_names = [p for p in Path("geolocalization_dinov3/tiles_uniform").iterdir() if p.is_file() and p.suffix.lower() == ".png"]
@@ -809,7 +833,7 @@ if __name__ == "__main__":
             error_lat = abs(actual_drone_position[0] - EKF_lat) * meters_per_degree_lat
             error_lon = abs(actual_drone_position[1] - EKF_lon) * meters_per_degree_lon
             total_error = np.sqrt(error_lat**2 + error_lon**2)
-            print(f"Position error: {total_error:.2f} meters (Lat error: {error_lat:.2f} m, Lon error: {error_lon:.2f} m) -- Using prediction")
+            #print(f"Position error: {total_error:.2f} meters (Lat error: {error_lat:.2f} m, Lon error: {error_lon:.2f} m) -- Using prediction")
 
             its_since_last_found += 1  # Increment counter for missed measurements
 
@@ -825,7 +849,13 @@ if __name__ == "__main__":
                 'error_meters': total_error,
                 'processing_time_sec': end_time - start_time,
                 'measurement_available': False,
-                'feature_count': len(pts_drone)
+                'feature_count': keypoint_length,
+                'measurement_error_meters': None,
+                'length_std': None,
+                'length_mean': None,
+                'inlier_count': None,
+                'length_confidence': None,
+                'inlier_confidence': None
             }
             log_df = pd.DataFrame([log_data])
             log_csv_path = f"geolocalization_dinov3/dataset_data/logs/geolocalization_log_dataset_TVL_EKF_{used_dataset:02d}.csv"
@@ -846,7 +876,7 @@ if __name__ == "__main__":
             crop_cand_left = res['coord_x']
             crop_cand_top = res['coord_y']
 
-            H, corners, center, heading_vec, heading_deg, confidence, pts_drone = drone_position_homography(
+            H, corners, center, heading_vec, heading_deg, confidence, pts_drone, length_std, length_mean, inlier_count, length_confidence, inlier_confidence = drone_position_homography(
                     og_drone_img=pil_image,
                     drone_img_rotated=rotated_drone_resized,
                     sat_patch=patch,
@@ -870,7 +900,7 @@ if __name__ == "__main__":
             #print(f"Estimated drone GPS position: lat={drone_position_lat}, lon={drone_position_lon}")
 
             # EKF Measurement update step
-            print(f"Confidence measures - Feature: {cosine_score:.3f}, Reprojection: {confidence:.3f}")
+            #print(f"Confidence measures - Feature: {cosine_score:.3f}, Reprojection: {confidence:.3f}")
             overall_confidence = 0.4 * cosine_score + 0.6 * confidence # Weights must sum to 1.0
             overall_confidence = np.clip(overall_confidence, 0.0, 1.0)
             #print(f"Overall measurement confidence for EKF: {overall_confidence:.3f}")
@@ -898,8 +928,12 @@ if __name__ == "__main__":
             error_lat = abs(actual_drone_position[0] - EKF_lat) * meters_per_degree_lat
             error_lon = abs(actual_drone_position[1] - EKF_lon) * meters_per_degree_lon
             total_error = np.sqrt(error_lat**2 + error_lon**2)
-            print(f"Position error: {total_error:.2f} meters (Lat error: {error_lat:.2f} m, Lon error: {error_lon:.2f} m)")
+            #print(f"Position error: {total_error:.2f} meters (Lat error: {error_lat:.2f} m, Lon error: {error_lon:.2f} m)")
             
+            measurement_error_lat = abs(actual_drone_position[0] - drone_position_lat) * meters_per_degree_lat
+            measurement_error_lon = abs(actual_drone_position[1] - drone_position_lon) * meters_per_degree_lon
+            measurement_total_error = np.sqrt(measurement_error_lat**2 + measurement_error_lon**2)
+
             curr_position = drone_position_world  # Update current position estimate for next itteration   
             last_found_pos = center.astype(np.float64)  # Update last found position
             its_since_last_found = 1  # Reset counter
@@ -954,7 +988,13 @@ if __name__ == "__main__":
                 'error_meters': total_error,
                 'processing_time_sec': end_time - start_time,
                 'measurement_available': True,
-                'feature_count': highest_feature_count
+                'feature_count': keypoint_length,
+                'measurement_error_meters': measurement_total_error,
+                'length_std': length_std,
+                'length_mean': length_mean,
+                'inlier_count': inlier_count,
+                'length_confidence': length_confidence,
+                'inlier_confidence': inlier_confidence
             }
             log_df = pd.DataFrame([log_data])
             log_csv_path = f"geolocalization_dinov3/dataset_data/logs/geolocalization_log_dataset_TVL_EKF_{used_dataset:02d}.csv"
@@ -980,7 +1020,7 @@ if __name__ == "__main__":
             error_lat = abs(actual_drone_position[0] - EKF_lat) * meters_per_degree_lat
             error_lon = abs(actual_drone_position[1] - EKF_lon) * meters_per_degree_lon
             total_error = np.sqrt(error_lat**2 + error_lon**2)
-            print(f"Position error: {total_error:.2f} meters (Lat error: {error_lat:.2f} m, Lon error: {error_lon:.2f} m) -- Using prediction")
+            #print(f"Position error: {total_error:.2f} meters (Lat error: {error_lat:.2f} m, Lon error: {error_lon:.2f} m) -- Using prediction")
 
             its_since_last_found += 1  # Increment counter for missed measurements
 
@@ -1019,7 +1059,13 @@ if __name__ == "__main__":
                 'error_meters': total_error,
                 'processing_time_sec': end_time - start_time,
                 'measurement_available': False,
-                'feature_count': highest_feature_count
+                'feature_count': keypoint_length,
+                'measurement_error_meters': None,
+                'length_std': None,
+                'length_mean': None,
+                'inlier_count': None,
+                'length_confidence': None,
+                'inlier_confidence': None
             }
             log_df = pd.DataFrame([log_data])
             log_csv_path = f"geolocalization_dinov3/dataset_data/logs/geolocalization_log_dataset_TVL_EKF_{used_dataset:02d}.csv"

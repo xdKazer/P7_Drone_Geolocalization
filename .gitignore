@@ -426,3 +426,6 @@ FodyWeavers.xsd
 
 /geolocalization_dinov3/tiles_uniform
 /geolocalization_dinov3/tile_features_uniform
+/geolocalization_dinov3/dataset_data
+
+/CNN_based_sulution/
