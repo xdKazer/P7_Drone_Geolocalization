@@ -3,9 +3,13 @@ import csv
 import math
 from pathlib import Path
 
+
+
+
+# See setup explanation
 """
 Preprocess VPAIR poses into:
-  - poses_drone.csv        (for EKF: global pixel coords + yaw + m_per_px)
+  - poses_drone.csv        (for EKF: global pixel coords + yaw + m_per_px) copy of poses.csv
   - poses_tiles.csv        (tile centers in meters, for error in meters)
   - tile_centers_in_sat.csv (tile centers in global "sat pixels")
   
@@ -20,15 +24,15 @@ BASE         = Path(__file__).parent.resolve()
 DATASET_DIR  = BASE / "vpair_dataset"
 
 # CSV with lat/lon/alt for each frame 
-POSES_LATLON_CSV = DATASET_DIR / "poses_lat_long.csv"   
+POSES_LATLON_CSV = DATASET_DIR / "poses.csv"   
 
 DRONE_DIR    = DATASET_DIR / "drone"
 TILES_DIR    = DATASET_DIR / "tiles"
 
 # Outputs 
-DRONE_INFO_CSV     = DATASET_DIR / "poses_drone.csv"
-TILES_INFO_CSV     = DATASET_DIR / "poses_tiles.csv"
-TILE_CENTERS_CSV   = DATASET_DIR / "tile_centers_in_sat.csv"
+DRONE_INFO_CSV     = DATASET_DIR / "poses_drone.csv" # has the same content as poses
+TILES_INFO_CSV     = DATASET_DIR / "poses_tiles.csv" 
+TILE_CENTERS_CSV   = DATASET_DIR / "tile_centers_in_sat.csv" # stores tiles centers seen from the first images perspective
 
 # Camera intrinsics for 800x600 (from cam0 snippet)
 FX = 750.62614972

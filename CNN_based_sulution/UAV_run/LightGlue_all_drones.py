@@ -1409,7 +1409,7 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
 
         #print(f"[info] Skipping EKF update for {drone_img} due to no valid homography or low confidence ({best_conf_overall:.4f} < {MIN_CONFIDENCE_FOR_EKF_UPDATE})")
         pose_ekf = get_location_in_sat_img((x_pred[0], x_pred[1]), SAT_LONG_LAT_INFO_DIR, sat_number, SAT_DISPLAY_META)
-        error_ekf, dx_ekf, dy_ekf, dphi_ekf, _ = determine_pos_error(pose_ekf, x_pred[3], DRONE_INFO_DIR, drone_img)
+        error_ekf, dx_ekf, dy_ekf, dphi_ekf, GT_POSE = determine_pos_error(pose_ekf, x_pred[3], DRONE_INFO_DIR, drone_img)
         shape_terms_str = fmt_shape_terms(shape_terms)
     
         with open(CSV_FINAL_RESULT_PATH, "a", newline="") as f:
@@ -1443,8 +1443,10 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
 
             pred_x, pred_y = x_pred[0], x_pred[1]       # ORIGINAL sat px
             pred_disp = (pred_x * SX, pred_y * SY)      # DISPLAY sat px
+            GT_POSE_disp = (GT_POSE[0] * SX, GT_POSE[1] * SY)
 
             draw_point(overlay_img, pred_disp, color=(255,255,0), r=3)
+            draw_point(overlay_img, GT_POSE_disp, color=(255,0,0), r=3)  # ground truth position in blue
 
             # --- Correct covariance scaling (see next section) ---
             Sigma_orig = ekf.P[:2, :2]      # covariance in ORIGINAL px

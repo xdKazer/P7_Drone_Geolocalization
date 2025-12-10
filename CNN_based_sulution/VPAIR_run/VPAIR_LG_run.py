@@ -21,7 +21,7 @@ from get_metrics_from_csv import get_metrics
 
 # -------------------- Config --------------------
 FEATURES = "superpoint"       # 'superpoint' | 'disk' | 'sift' | 'aliked'
-MAX_KPTS = None               # max keypoints to load from .pt files (None = all) (This controls memory usage) TODO also controls speed
+MAX_KPTS = None               # max keypoints to load from .pt files (None = all) (This controls memory usage) TODO
 MIN_CONFIDENCE_FOR_EKF_UPDATE = 0.2  # min confidence to use measurement update in EKF
 NUMBER_OF_ALLOWED_MISSES_IN_A_ROW = 2 # number of allowed missed measurements in a row before we need a high confidence to do an ekf update
 MIN_CONFIDENCE_FOR_EKF_UPDATE_AFTER_MISSES = 0.5  # min confidence to use measurement update in EKF after previous misses
@@ -53,10 +53,9 @@ DRONE_INFO_CSV = DATASET_DIR / "poses_drone.csv"
 
 DRONE_DIR = DATASET_DIR / "drone"  
 TILES_DIR   = DATASET_DIR /  "tiles" 
-SAT_IMG = DATASET_DIR / "sat_mosaic_small.png"
+SAT_IMG = DATASET_DIR /"sat_mosaic" /"sat_mosaic_small.png"
 SX, SY = 0.08667013347200554, 0.08667013347200554 
-pixel_offset = [2981.38, 1362.62] #x0 = (0 - min_x) * scale ≈ 2981.38, y0 = (0 - min_y) * scale ≈ 1362.62
-#83020.0, 37729.0  first centre 
+pixel_offset = [2981.38, 1362.62] # first image position in satellite image pixels, needed as everything else is relative to this
 
 if visualisations_enabled:
     OUT_DIR_CLEAN   = BASE / "outputs" / "VPAIR_outputs_with_visualisations"
@@ -934,8 +933,7 @@ with open(CSV_FINAL_RESULT_PATH, "a", newline="") as f:
                             "dx", "dy", 
                             "dx_ekf", "dy_ekf",
                             "error", "error_pred", "ekf_error", 
-                            "heading_diff", "ekf_heading_diff", 
-                            "time_s", "SDS",])
+                            "time_s"])
 
 # -------------------- Preload satellite tiles --------------------              
 all_tile_names = [p for p in TILES_DIR.iterdir() if p.is_file() and p.suffix.lower() == ".png"]
@@ -1154,7 +1152,7 @@ for j, img_path in enumerate(sorted(DRONE_DIR.iterdir())):
                     raise FileNotFoundError(f"Missing {tile_pt} and no extractor available.")
                 img1_t  = load_image(str(p)).to(device if feat != "sift" else "cpu")
                 feats_tile_b = extractor.extract(img1_t)
-                feats_tile_r = rbd(feats_tile_b) # TODO save the features from drone imge for future runs
+                feats_tile_r = rbd(feats_tile_b) 
                 #print(f"[info] Extracted features on-the-fly for tile {p.name}.")
 
             # -------------------- Match features --------------------
@@ -1324,7 +1322,6 @@ for j, img_path in enumerate(sorted(DRONE_DIR.iterdir())):
                         "N/A", "N/A", # dx, dy
                         f"{dx_ekf:.4f}", f"{dy_ekf:.4f}", # dx_ekf, dy_ekf
                         "N/A",f"{error_ekf:.4f}", f"{error_ekf:.4f}", # error, error_pred, ekf_error
-                        "N/A", f"{dphi_ekf:.4f}", # heading_diff, ekf_heading_diff
                         f"{t_end - t_start:.4f}",   # time_s
                         ])
         if visualisations_enabled:
@@ -1402,15 +1399,9 @@ for j, img_path in enumerate(sorted(DRONE_DIR.iterdir())):
             heading_max_scale=2.75  # same for heading -||-
         )  # this gives us R matrix for EKF update. R tells us how certain we are about the measurements.
 
-    # ---- Build measurement (x, y, phi) from homography in ORIGINAL pixels. compass heading ----
-    meas_phi_deg, (meas_x_px_in_tile, meas_y_px_in_tile) = get_measurements(center_meas_in_tile_px, heading_unitvector_measurement)
-    #print(f"Measurement: x={meas_x_px:.2f}, y={meas_y_px:.2f}, phi={meas_phi_deg:.2f} deg")
-
     # ---- Build measurement (x, y, phi) from homography ----
     # center_meas_in_tile_px is in TILE pixels (800x600)
-    meas_phi_deg, (meas_x_px_in_tile, meas_y_px_in_tile) = get_measurements(
-        center_meas_in_tile_px, heading_unitvector_measurement
-    )
+    meas_phi_deg, (meas_x_px_in_tile, meas_y_px_in_tile) = get_measurements(center_meas_in_tile_px, heading_unitvector_measurement)
 
     # Look up tile center & GSD (meters per image pixel)
     meta = tile_meta[tile_name]  # tile_name is like "00001.png"
@@ -1456,12 +1447,11 @@ for j, img_path in enumerate(sorted(DRONE_DIR.iterdir())):
     dx_ekf = diff_px_ekf[0] * meters_pr_pixel
     dy_ekf = diff_px_ekf[1] * meters_pr_pixel
     error_ekf = math.hypot(dx_ekf, dy_ekf)
-    dphi_ekf = 0.0  # TODO if needed
+
 
     dx_meas = diff_px_meas[0] * meters_pr_pixel
     dy_meas = diff_px_meas[1] * meters_pr_pixel
     error_meas = math.hypot(dx_meas, dy_meas)
-    dphi_meas = 0.0  # TODO if needed
 
     # predicted (before update) error relative to same tile center
     diff_px_pred = (x_pred[0] - GT_centre_x_px_tile,
@@ -1534,15 +1524,6 @@ for j, img_path in enumerate(sorted(DRONE_DIR.iterdir())):
     dy_pred = x_pred[1] * meters_pr_pixel
     error_pred = math.hypot(dx_pred, dy_pred)
 
-    # pts0 = drone coordinates of inlier matches
-    x = best_pts_drone_np[:, 0]
-    y = best_pts_drone_np[:, 1]
-
-    spread_x = (x.max() - x.min()) / img.shape[:2][1]  # normalize by width
-    spread_y = (y.max() - y.min()) / img.shape[:2][0]  # normalize by height
-
-    sds = np.sqrt(spread_x * spread_y)  # geometric mean
-
     #------------- save final results to overall CSV file --------------------
     # add to the bottom of results_{sat_number}.csv file:
     with open(CSV_FINAL_RESULT_PATH, "a", newline="") as f:
@@ -1564,9 +1545,7 @@ for j, img_path in enumerate(sorted(DRONE_DIR.iterdir())):
             f"{dx_meas:.4f}", f"{dy_meas:.4f}",
             f"{dx_ekf:.4f}", f"{dy_ekf:.4f}",
             f"{error_meas:.4f}", f"{error_pred:.4f}", f"{error_ekf:.4f}",
-            f"{dphi_meas:.4f}", f"{dphi_ekf:.4f}",
-            f"{t_end-t_start:.4f}",
-            f"{sds:.4f}"
+            f"{t_end-t_start:.4f}"
         ])
 
 results = get_metrics(CSV_FINAL_RESULT_PATH)

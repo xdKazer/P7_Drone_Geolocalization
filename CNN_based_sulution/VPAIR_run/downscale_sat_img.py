@@ -6,13 +6,17 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+# See setup explanation
+"""Creates the mosiac you use for visualization by downscaling the full-res mosaic created in build_sat_map.py
+"""
+
+
 # -------------------- CONFIG --------------------
 
 BASE_DIR = Path(__file__).parent.resolve()
-print(f"[info] Base dir: {BASE_DIR}")
 
 TILES_DIR = BASE_DIR /"vpair_dataset" / "tiles"
-CENTERS_CSV = BASE_DIR /"vpair_dataset"/ "tile_centers_in_sat.csv"   # your file with center_x, center_y, m_per_px_x, m_per_px_y
+CENTERS_CSV = BASE_DIR /"vpair_dataset"/ "tile_centers_in_sat.csv"   # 
 OUT_DIR = BASE_DIR /"vpair_dataset"/ "sat_mosaic"
 RESULTS_CSV = BASE_DIR / "VPAIR_outputs" / "results_VPAIR.csv"
 
