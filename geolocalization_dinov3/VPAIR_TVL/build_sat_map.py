@@ -6,10 +6,10 @@ import numpy as np
 
 # ===================== CONFIG =====================
 
-TILES_DIR = r"D:\P7_Drone_Geolocalization\CNN_based_sulution\VPAIR_run\vpair_dataset\tiles"
-PATCH_HALF = 100                     # 200x200 patch around center
-OUT_MOSAIC = r"D:\P7_Drone_Geolocalization\CNN_based_sulution\VPAIR_run\vpair_dataset\sat_img.png"    # Mosaic image output
-OUT_CENTERS = r"D:\P7_Drone_Geolocalization\CNN_based_sulution\VPAIR_run\vpair_dataset\tile_centers_in_sat.csv"   # CSV storing center pixel positions
+TILES_DIR = "geolocalization_dinov3/VPAIR_TVL/tiles"
+PATCH_HALF = 100                                                           # 200x200 patch around center
+OUT_MOSAIC = "geolocalization_dinov3/VPAIR_TVL/sat_img.png"                # Mosaic image output
+OUT_CENTERS = "geolocalization_dinov3/VPAIR_TVL/tile_centers_in_sat.csv"   # CSV storing center pixel positions
 
 # ===================== HELPERS =====================
 
@@ -132,8 +132,8 @@ def create_mosaic_and_center_csv(tile_paths, offsets, tile_size, bbox,
 
             writer.writerow([
                 os.path.basename(path),
-                center_x,
-                center_y
+                off_x,
+                off_y
             ])
 
     cv.imwrite(mosaic_out, mosaic)

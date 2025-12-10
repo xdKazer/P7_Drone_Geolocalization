@@ -426,3 +426,16 @@ FodyWeavers.xsd
 
 /geolocalization_dinov3/tiles_uniform
 /geolocalization_dinov3/tile_features_uniform
+
+/geolocalization_dinov3/Otherstuff
+/geolocalization_dinov3/VPAIR_TVL/dinov3_features/*
+/geolocalization_dinov3/VPAIR_TVL/sat_img.png
+/geolocalization_dinov3/VPAIR_TVL/tiles/*
+/geolocalization_dinov3/VPAIR_TVL/sat_mosaic/*
+/geolocalization_dinov3/VPAIR_TVL/tile_centers_in_sat.csv
+/geolocalization_dinov3/VPAIR_TVL/drone/*
+/geolocalization_dinov3/VPAIR_TVL/camera_calibration.yaml
+/geolocalization_dinov3/VPAIR_TVL/License.txt
+/geolocalization_dinov3/VPAIR_TVL/poses_drone.csv
+/geolocalization_dinov3/VPAIR_TVL/poses_lat_long.csv
+/geolocalization_dinov3/VPAIR_TVL/poses_tiles.csv
