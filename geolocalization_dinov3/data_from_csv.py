@@ -2,10 +2,11 @@ import pandas as pd
 import numpy as np
 
 # Load CSV
-df = pd.read_csv("geolocalization_dinov3/dataset_data/logs/geolocalization_log_dataset_TVL_EKF_09.csv")
+df = pd.read_csv("geolocalization_dinov3/dataset_data/logs/geolocalization_log_dataset_TVL_EKF_11.csv")
 
 # Convert columns to numeric (in case empty fields are interpreted as strings)
 df["error_meters"] = pd.to_numeric(df["error_meters"], errors="coerce")
+df["measurement_error_meters"] = pd.to_numeric(df["measurement_error_meters"], errors="coerce")
 df["processing_time_sec"] = pd.to_numeric(df["processing_time_sec"], errors="coerce")
 
 # ---- Successful localizations ----
@@ -15,6 +16,8 @@ success_ratio = successful / total_images
 
 # ---- Mean Error ----
 mean_error = df["error_meters"].mean()
+
+mean_measurement_error = df["measurement_error_meters"].mean()
 
 # ---- RMSE ----
 rmse = np.sqrt(np.nanmean(df["error_meters"] ** 2))
@@ -33,6 +36,7 @@ print("Successful localisations:", successful)
 print("Success ratio:", success_ratio)
 
 print("Mean Error (m):", mean_error)
+print("Mean Measurement Error (m):", mean_measurement_error)
 print("RMSE (m):", rmse)
 print("STD Error (m):", std_error)
 

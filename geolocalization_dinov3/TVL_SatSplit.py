@@ -6,6 +6,7 @@ import numpy as np
 from pathlib import Path
 import math
 
+"""""
 # Specifically for satellite 09, This code is needed to stitch the 4 provided tiles into one large image
 tiles = [
     "geolocalization_dinov3/dataset_data/satellite_images/satellite09_01-01.tif",
@@ -25,25 +26,26 @@ meta.update({
     "transform": transform
 })
 
-stitched_file = "geolocalization_dinov3/dataset_data/satellite_images/satellite09.tif"
 
+stitched_file = "geolocalization_dinov3/dataset_data/satellite_images/satellite09.tif"
 
 with rasterio.open(stitched_file, "w", **meta) as dst:
     dst.write(mosaic)
 
 for s in src_files: s.close()
 print(f"Mosaic created: {stitched_file}")
+"""""
 
 # -------- TILE THE MOSAIC --------
 
-input_satellite = "geolocalization_dinov3/dataset_data/satellite_images/satellite08.tif"
+input_satellite = "geolocalization_dinov3/dataset_data/satellite_images/satellite11.tif"
 output_folder = Path("geolocalization_dinov3/tiles_uniform")
 output_folder.mkdir(parents=True, exist_ok=True)
 
 target = 1024          # desired tile size
 overlap = 0.25         # 25% overlap
 
-with rasterio.open(stitched_file) as src:  # Change input_satellite to stitched_file for satellite 09
+with rasterio.open(input_satellite) as src:  # Change input_satellite to stitched_file for satellite 09
     H, W = src.height, src.width
     print(f"Stitched Image size: {W} x {H}")
 
