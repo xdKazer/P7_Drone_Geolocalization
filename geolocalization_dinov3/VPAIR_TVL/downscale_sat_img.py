@@ -16,7 +16,7 @@ CENTERS_CSV = BASE_DIR / "tile_centers_in_sat.csv"   # your file with center_x, 
 OUT_DIR = BASE_DIR / "sat_mosaic"
 RESULTS_CSV = BASE_DIR / "VPAIR_outputs" / "results_VPAIR.csv"
 
-MAX_LONG_SIDE_SMALL = 3000  # longest side for downscaled mosaic
+MAX_LONG_SIDE_SMALL = 6000  # longest side for downscaled mosaic
 
 # -------------------- UTILS --------------------
 

@@ -5,7 +5,7 @@ from sklearn.decomposition import PCA
 import torchvision.transforms.functional as TF
 import torch.nn.functional as F
 from lightglue import LightGlue, SuperPoint         # type: ignore # For feature matching
-from lightglue.utils import rbd                     # type: ignore # For robust backdoor matching
+from lightglue.utils import rbd, load_image                     # type: ignore # For robust backdoor matching
 
 # Image handling
 from PIL import Image, ImageDraw
@@ -15,9 +15,11 @@ import rasterio
 # Math Stuff
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.collections import LineCollection
 from datetime import datetime  
 import math
 from scipy.stats import chi2                    # For confidence ellipse calculations
+import random
 
 # Debugging & Information
 import time
@@ -35,11 +37,17 @@ DATASET_DIR = Path("geolocalization_dinov3/VPAIR_TVL")
 TILES_INFO_CSV = DATASET_DIR / "poses_tiles.csv"
 TILE_CENTERS_CSV = DATASET_DIR / "tile_centers_in_sat.csv"
 DRONE_INFO_CSV = DATASET_DIR / "poses_drone.csv"
+SAT_IMG = DATASET_DIR / "sat_mosaic" / "sat_mosaic_small.png"
 
 DRONE_DIR = DATASET_DIR / "drone"
 TILES_DIR = DATASET_DIR / "tiles"
-SX, SY = 0.08667013347200554, 0.08667013347200554
-pixel_offset = [2981.38, 1362.62]
+SX, SY = 0.17334026694401108, 0.17334026694401108
+pixel_offset = [2981.38 * 2, 1362.62 * 2]
+
+visualisations_enabled = True
+
+if visualisations_enabled:
+    OUT_DIR_CLEAN = DATASET_DIR / "outputs" / "VPAIR_outputs_with_visualisations"
 
 tile_meta = {}
 with open(TILE_CENTERS_CSV, "r") as f:
@@ -132,6 +140,94 @@ def project_pts(H, pts_xy):
     xy_h = cv2.convertPointsToHomogeneous(pts_xy).reshape(-1,3).T  # 3xN
     P = (H @ xy_h).T
     return (P[:, :2] / P[:, 2:3]).astype(np.float32)
+
+def draw_point_start(img_bgr, pt_xy, color=(0,0,255), r=4):
+    cv2.circle(img_bgr, (int(pt_xy[0]), int(pt_xy[1])), r*4, color, -1)
+
+def draw_point(img_bgr, pt_xy, color=(0,0,255), r=4):
+    cv2.drawMarker(img_bgr, (int(pt_xy[0]), int(pt_xy[1])), color, markerType=cv2.MARKER_TILTED_CROSS, markerSize=r*8, thickness=2)
+
+def label_point(
+    img, pt, text, color,
+    offset=(20, -10), font_scale=0.5, thickness=1
+):
+    """
+    Draw text near a point with a line connecting them.
+
+    Args:
+        img: target image (BGR)
+        pt: (x, y) coordinates of the point
+        text: label string
+        color: (B, G, R)
+        offset: (dx, dy) offset of text from the point
+        font_scale: text size
+        thickness: text thickness
+        line_thickness: thickness of the connector line
+    """
+    x, y = int(pt[0]), int(pt[1])
+    ox, oy = offset
+    tx, ty = x + ox, y + oy
+
+    # draw the text label
+    cv2.putText(
+        img, text, (tx, ty),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        font_scale, color, thickness, lineType=cv2.LINE_AA
+    )
+
+def to_numpy_image(t: torch.Tensor):
+    return t.detach().permute(1, 2, 0).clamp(0, 1).cpu().numpy()
+
+def make_segments(p0, p1, x_offset):
+    segs = np.zeros((len(p0), 2, 2), dtype=np.float32)
+    segs[:, 0, :] = p0
+    segs[:, 1, 0] = p1[:, 0] + x_offset
+    segs[:, 1, 1] = p1[:, 1]
+    return segs
+
+def resize_for_display(img_np, long_side=1200):
+    h, w = img_np.shape[:2]
+    s = long_side / max(h, w)
+    if s >= 1.0: return img_np, 1.0
+    new_w, new_h = int(round(w * s)), int(round(h * s))
+    img_small = cv2.resize(img_np, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    return img_small, s
+
+def visualize_inliers(drone_path: Path, tile_path: Path, pts0, pts1, inlier_mask, out_png):
+    tile_path = TILES_DIR / tile_path
+    I0 = to_numpy_image(load_image(str(drone_path)))
+    I1 = to_numpy_image(load_image(str(tile_path)))
+    I0d, s0 = resize_for_display(np.clip(I0, 0.0, 1.0))
+    I1d, s1 = resize_for_display(np.clip(I1, 0.0, 1.0))
+    p0d = pts0 * s0
+    p1d = pts1 * s1
+
+    H0, W0 = I0d.shape[:2]
+    H1, W1 = I1d.shape[:2]
+    canvas = np.ones((max(H0, H1), W0 + W1, 3), dtype=I0d.dtype)
+    canvas[:H0, :W0] = I0d
+    canvas[:H1, W0:W0 + W1] = I1d
+
+    if inlier_mask is None or not inlier_mask.any():
+        plt.figure(figsize=(14, 7))
+        plt.imshow(canvas); plt.axis("off")
+        plt.title(f"{tile_path.name}: No inliers")
+        plt.tight_layout(); plt.savefig(out_png, dpi=150); plt.close()
+        return
+
+    idx = np.where(inlier_mask)[0]
+    segs = make_segments(p0d[idx], p1d[idx], x_offset=W0)
+
+    fig, ax = plt.subplots(figsize=(14, 7))
+    ax.imshow(canvas); ax.axis("off")
+    lc = LineCollection(segs, linewidths=0.9, alpha=0.95)
+    lc.set_colors(np.array([[0.0, 0.8, 0.0]] * len(segs)))
+    ax.add_collection(lc)
+    ax.scatter(p0d[idx, 0],         p0d[idx, 1],       s=2, c="yellow", alpha=0.7)
+    ax.scatter(p1d[idx, 0] + W0,    p1d[idx, 1],       s=2, c="cyan",   alpha=0.7)
+    ax.set_title(f"{tile_path.name} | inliers={len(idx)}")
+    plt.tight_layout(); plt.savefig(out_png, dpi=150); plt.close()
+
 
 def get_visualisation_parameters(H_orig2tile, DRONE_ORIGINAL_W, DRONE_ORIGINAL_H):
     """
@@ -458,7 +554,7 @@ def drone_position_homography(og_drone_img: Image.Image, drone_img_rotated: Imag
     if len(pts_drone) < 90:
         #print(f"Warning: Only {len(pts_drone)} matches found, homography may be unreliable. Tossing to avoid noise")
         H = None
-        return H, sat_corners, drone_center, heading_vec, heading_deg, confidence, pts_drone, None, None, None, None, None
+        return H, sat_corners, drone_center, heading_vec, heading_deg, confidence, pts_drone, None, None, None, None, None, None, None
 
     if pts_drone.shape[0] >= 4:
         H, mask = cv2.findHomography(pts_drone, pts_sat, cv2.USAC_MAGSAC, ransacReprojThreshold=5.0, confidence=0.9999)
@@ -502,7 +598,7 @@ def drone_position_homography(og_drone_img: Image.Image, drone_img_rotated: Imag
         if not (np.all(signs > 0) or np.all(signs < 0)):
             #print("Warning: Homography produced non-convex quadrilateral.")
             H = None
-            return H, sat_corners, drone_center, [1, 1], drone_heading, confidence, pts_drone, None, None, None, None, None # Return placeholder vector and prior heading if homography fails
+            return H, sat_corners, drone_center, [1, 1], drone_heading, confidence, pts_drone, None, None, None, None, None, None, None # Return placeholder vector and prior heading if homography fails
 
         # Check angles between edges to ensure they are roughly 90 degrees
         for i in range(4):
@@ -512,7 +608,7 @@ def drone_position_homography(og_drone_img: Image.Image, drone_img_rotated: Imag
             if not 70 < angle < 110:
                 #print(f"Warning: Homography produced non-rectangular shape (angle {angle:.2f} degrees).")
                 H = None
-                return H, sat_corners, drone_center, [1, 1], drone_heading, confidence, pts_drone, None, None, None, None, None # Return placeholder vector and prior heading if homography fails
+                return H, sat_corners, drone_center, [1, 1], drone_heading, confidence, pts_drone, None, None, None, None, None, None, None # Return placeholder vector and prior heading if homography fails
 
         # Compute center
         drone_center = np.mean(sat_corners, axis=0)
@@ -523,7 +619,7 @@ def drone_position_homography(og_drone_img: Image.Image, drone_img_rotated: Imag
             if dist_moved > 400 * last_found: # pixels Update Me
                 #print(f"Warning: Drone position jumped {dist_moved:.2f} pixels since last known position, allowed {400 * last_found}. Tossing result.")
                 H = None
-                return H, sat_corners, drone_center, [1, 1], drone_heading, confidence, pts_drone, None, None, None, None, None # Return placeholder vector and prior heading if homography fails
+                return H, sat_corners, drone_center, [1, 1], drone_heading, confidence, pts_drone, None, None, None, None, None, None, None # Return placeholder vector and prior heading if homography fails
         #print(f"Estimated drone position in satellite patch pixels: x={drone_center[0]}, y={drone_center[1]}")
 
         # Compute drone heading from satellite corners
@@ -567,7 +663,7 @@ def drone_position_homography(og_drone_img: Image.Image, drone_img_rotated: Imag
         pass
         #print("Not enough good matches found for homography.")
 
-    return H, sat_corners, drone_center, heading_vec, heading_deg, confidence, kp_drone_data_r["keypoints"].detach().cpu().numpy(), length_std, length_mean, inlier_count, length_confidence, inlier_confidence
+    return H, sat_corners, drone_center, heading_vec, heading_deg, confidence, pts_drone, pts_sat, mask.ravel().astype(bool), length_std, length_mean, inlier_count, length_confidence, inlier_confidence
    
 
 if __name__ == "__main__":
@@ -606,6 +702,17 @@ if __name__ == "__main__":
 
         start_time = time.time()
 
+        if visualisations_enabled: 
+            OUT_DIR = OUT_DIR_CLEAN / str(drone_img)
+            OUT_DIR.mkdir(parents=True, exist_ok=True)
+            CSV_RESULT_PATH  = OUT_DIR / "results.csv"
+
+        if i == 0 and visualisations_enabled:
+            # also reset global overlay for this satellite sequence
+            OUT_OVERALL_SAT_VIS_PATH = OUT_DIR_CLEAN / f"overall_overlay_on_sat{drone_img}.png"
+            overall_overlay = cv2.imread(str(SAT_IMG), cv2.IMREAD_UNCHANGED)
+            cv2.imwrite(str(OUT_OVERALL_SAT_VIS_PATH), overall_overlay)
+
         with open(DRONE_INFO_CSV, "r") as f:
             rows = list(csv.DictReader(f))  # Load full CSV into list so we can check next row
             for i, row in enumerate(rows):
@@ -615,27 +722,27 @@ if __name__ == "__main__":
 
         # Rotate drone image based on heading (Known for first itteration, estimated later)
         drone_img = cv2.imread(str(DRONE_DIR / str(drone_img)), cv2.IMREAD_COLOR)
-        h, w = drone_img.shape[0], drone_img.shape[1]
-        cx, cy = w // 2, h // 2
+        H, W = drone_img.shape[:2]
+        a = -curr_heading  # negative for cv2 rotation direction
+        r = math.radians(a)
+        c, s = abs(math.cos(r)), abs(math.sin(r))
+        newW = int(math.ceil(W*c + H*s))
+        newH = int(math.ceil(W*s + H*c))
 
-        # Rotate the drone image using drone_heading
-        M = cv2.getRotationMatrix2D((cx, cy), -curr_heading, 1.0)  # Negative angle for clockwise rotation
-        
-        # Compute new bounding size - to avoid cropping after rotation
-        cos = abs(M[0,0])
-        sin = abs(M[0,1])
-        new_w = int(h * sin + w * cos)
-        new_h = int(h * cos + w * sin)
+        M = cv2.getRotationMatrix2D((W/2.0, H/2.0), a, 1.0)
+        # shift so the rotated content is centered in the padded canvas
+        M[0, 2] += (newW - W) / 2.0
+        M[1, 2] += (newH - H) / 2.0
 
-        # Update matrix so image is centered
-        M[0,2] += new_w/2 - cx
-        M[1,2] += new_h/2 - cy
-
-        # Perform the rotation
-        drone_rotated = cv2.warpAffine(np.array(drone_img), M, (new_w, new_h), flags=cv2.INTER_LINEAR, borderValue=0)
+        drone_rotated = cv2.warpAffine(drone_img, M, (newW, newH), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
 
         R_orig2rot = np.eye(3, dtype=np.float64)
         R_orig2rot[:2, :3] = M 
+
+        if visualisations_enabled: 
+            DRONE_IMG_ROT_PATH = OUT_DIR / f"drone_rot_{a}.png"
+            DRONE_IMG_FOR_VIZ = DRONE_IMG_ROT_PATH
+            cv2.imwrite(str(DRONE_IMG_ROT_PATH), drone_rotated)
 
         # Currently drone is (329x306) while sub-tiles are (171x171) -- Consider getting these closer in size?
         if ekf is None:
@@ -677,6 +784,18 @@ if __name__ == "__main__":
                             ])  # this is something we only set for this first run it will be updated by EKF later. 
 
                 ekf = EKF_ConstantVelHeading(x0, P0, Q0) # initialize EKF
+
+                if visualisations_enabled:  
+                    overlay_img = cv2.imread(str(OUT_OVERALL_SAT_VIS_PATH), cv2.IMREAD_COLOR)
+                    start_x, start_y = pixel_offset
+                    draw_point_start(overlay_img, (start_x, start_y), color=(255,255,255), r=3) # light grey
+                    label_point(overlay_img, (start_x, start_y), f"Start", color=(255,255,255),
+                                offset=(-120,80), font_scale=2, thickness=4)
+                    draw_point_start(overlay_img, ( 1675*2 , 1908*2 ), color=(255,255,255), r=3) # light grey
+                    label_point(overlay_img, ( 1675*2 , 1908*2 ), f"End", color=(255,255,255),
+                                offset=(80,0), font_scale=2, thickness=4)
+                    #draw_ellipse(overlay_img, (start_x, start_y), ekf.P[:2, :2]*(SX*SY), k_sigma=k, color=(255,255,255), thickness=2)
+                    cv2.imwrite(str(OUT_OVERALL_SAT_VIS_PATH), overlay_img)
 
                 continue # next drone image
         
@@ -766,6 +885,36 @@ if __name__ == "__main__":
             else:
                 log_df.to_csv(log_csv_path, index=False, mode='a', header=False)
 
+            if visualisations_enabled:
+                overlay_img = cv2.imread(str(OUT_OVERALL_SAT_VIS_PATH), cv2.IMREAD_COLOR)
+                if overlay_img is None:
+                    # safety: initialize base image if file is missing
+                    overlay_img = cv2.imread(str(SAT_IMG), cv2.IMREAD_COLOR)
+
+                pred_x, pred_y = x_pred[0], x_pred[1]       # ORIGINAL sat px
+                pred_disp = (pred_x*SX + pixel_offset[0], pred_y*SY + pixel_offset[1])      # DISPLAY sat px
+                GT_pose_disp = (GT_centre_x_px_tile*SX + pixel_offset[0], GT_centre_y_px_tile * SY + pixel_offset[1])  # DISPLAY sat px
+
+                draw_point(overlay_img, pred_disp, color=(255,255,0), r=1)
+                draw_point(overlay_img, GT_pose_disp, color=(255,0,0), r=1)
+
+                # ---  covariance scaling---
+                sigma_copy = sigma.copy()
+                J = np.diag([SX, SY])           # scaling x,y → display coords
+                Sigma_disp = J @ sigma_copy @ J.T
+                pose_last_known = (search_pose[0] * SX + pixel_offset[0], search_pose[1] * SY + pixel_offset[1])  # ORIGINAL sat px
+
+                """draw_ellipse(
+                    overlay_img,
+                    pose_last_known, # the last known pose
+                    Sigma_disp,  # from search area
+                    k_sigma=1, # we do not want to inflate it further
+                    color=(0,165,255),
+                    thickness=1,
+                )"""
+
+                cv2.imwrite(str(OUT_OVERALL_SAT_VIS_PATH), overlay_img)
+
             continue  # Move to next image
 
         highest_feature_count = 0
@@ -775,7 +924,7 @@ if __name__ == "__main__":
             patch = res['patch']          # (H, W, 3) numpy array
             patch_name = res['patch_name']
 
-            H, corners, center, heading_vec, heading_deg, confidence, pts_drone, length_std, length_mean, inlier_count, length_confidence, inlier_confidence = drone_position_homography(
+            H, corners, center, heading_vec, heading_deg, confidence, pts_drone, pts_sat, inlier_mask, length_std, length_mean, inlier_count, length_confidence, inlier_confidence = drone_position_homography(
                     og_drone_img=drone_img,
                     drone_img_rotated=drone_rotated,
                     sat_patch=patch,
@@ -812,6 +961,10 @@ if __name__ == "__main__":
             cy_global = meta["center_y"]
             m_per_px_x = meta["m_per_px_x"]     # meters per image px (x)
             m_per_px_y = meta["m_per_px_y"]     # meters per image px (y)
+
+            if visualisations_enabled:
+                out_match_png = OUT_DIR / f"top1_{Path(best_patch_name).stem}_matches.png"
+                visualize_inliers(DRONE_IMG_FOR_VIZ, best_patch_name, pts_drone, pts_sat, inlier_mask, str(out_match_png))
 
             # Offset from tile center in IMAGE PIXELS
             dx_img_px = meas_x_px_in_tile - TILE_W / 2.0
@@ -867,65 +1020,52 @@ if __name__ == "__main__":
 
             end_time = time.time() 
 
-            # NOTE: Move the visualisation below out of the code, once we have nice images in the report
-            # Do the same for sat_corners if needed for visualization
-            """""
-            sat_patch_vis = np.array(patch.copy())        # Selected satellite tile
-            sat_h, sat_w = sat_patch_vis.shape[:2]
+            if visualisations_enabled: 
+                corners_disp = (corners_meas_in_tile_px * SX) + np.array(pixel_offset)  # shift to display coords
+                center_measurement  = round(meas_x_px_global) * SX + pixel_offset[0], round(meas_y_px_global) * SY + pixel_offset[1]
+                center_ekf = np.array([x_updated[0] * SX + pixel_offset[0], x_updated[1] * SY + pixel_offset[1]])
+                center_gt = np.array([GT_centre_x_px_tile * SX + pixel_offset[0], GT_centre_y_px_tile * SY + pixel_offset[1]])
+                center_pred = np.array([x_pred[0] * SX + pixel_offset[0], x_pred[1] * SY + pixel_offset[1]])
 
-            sat_corners_px = np.array(corners_meas_in_tile_px, dtype=int)
-            cv2.polylines(
-                sat_patch_vis,
-                [sat_corners_px.reshape(-1,1,2)],
-                isClosed=True,
-                color=(0,0,255),    # red rectangle = location of the drone view
-                thickness=3
-            )
+                for j in range(2):
+                    if j == 0: # individual overlay for this tile
+                        sat_individual = cv2.imread(str(SAT_IMG), cv2.IMREAD_COLOR)
+                        out_overlay = OUT_DIR / f"top1_{best_patch_name}_overlay_on_sat.png"
+                        #BGR colors
+                        color = [(255,255,255), (255, 0, 0), (0, 255, 0), (0, 0, 255),(0,255,255)]  # Blue: GT, Green: EKF, Red: Meas, Yellow: Pred, Cyan: overall
 
-            cv2.circle(
-                sat_patch_vis,
-                (int(meas_x_px_in_tile), int(meas_y_px_in_tile)),
-                6,(0,255,0),-1      # green dot = estimated drone center
-            )
+                        # same center as we use color to destingish
+                        label_point(sat_individual, center_gt, "Pred", color[4], offset=(100, 40), font_scale=0.5, thickness=1)
+                        label_point(sat_individual, center_gt, "GT", color[1], offset=(100, 20), font_scale=0.5, thickness=1)
+                        label_point(sat_individual, center_gt, "EKF", color[2], offset=(100, 0), font_scale=0.5, thickness=1)
+                        label_point(sat_individual, center_gt, "Meas", color[3], offset=(100, -20), font_scale=0.5, thickness=1)
+                    else:
+                        out_overlay = OUT_OVERALL_SAT_VIS_PATH
+                        overlay_img = cv2.imread(str(out_overlay))
+                        random_color = tuple(random.randint(128, 255) for _ in range(3))
+                        color = [random_color, (255, 0, 0), (0, 255, 0), (0, 0, 255), (0,255,255)]   # Random for image. Red: GT, Green: EKF, Blue: Meas, Yellow: Pred
 
-            head_scale = 120
-            hx = int(meas_x_px_in_tile + heading_unitvector_measurement[0]* head_scale)
-            hy = int(meas_y_px_in_tile + heading_unitvector_measurement[1]* head_scale)
+                        if overlay_img is None:
+                            overlay_img = cv2.imread(str(SAT_IMG), cv2.IMREAD_COLOR)  # use base if file doesn't exist
+                            # make label colors clear in img by text
+                            label_point(overlay_img, [10,70], "Pred", color[4], offset=(0, 0), font_scale=3, thickness=3)
+                            label_point(overlay_img, [300,70], "GT", color[1], offset=(0, 0), font_scale=3, thickness=3)
+                            label_point(overlay_img, [450,70], "EKF", color[2], offset=(0, 0), font_scale=3, thickness=3)
+                            label_point(overlay_img, [700,70], "Meas", color[3], offset=(0, 0), font_scale=3, thickness=3)
+                            
+                        sat_individual = overlay_img
 
-            cv2.arrowedLine(
-                sat_patch_vis,
-                (int(meas_x_px_in_tile), int(meas_y_px_in_tile)),
-                (hx,hy),
-                color=(255,0,0),
-                thickness=3, tipLength=0.25
-            )
+                    # Overlay
+                    #draw_polygon(sat_individual, corners_disp, color=color[0], thickness=1)
+                    draw_point(sat_individual, center_pred, color=color[4], r=1)
+                    draw_point(sat_individual, center_measurement, color=color[3], r=1)
+                    draw_point(sat_individual, center_gt, color=color[1], r=1)
+                    draw_point(sat_individual, center_ekf, color=color[2], r=1)
+                    # P_pred is in ORIGINAL sat px, so we need to scale it for display sat px
+                    Sigma_orig = P_pred[:2, :2] * SX
+                    #draw_ellipse(sat_individual, center_pred, Sigma_orig, k_sigma=k, color=color[0], thickness=1)
 
-            gt_x_px = GT_centre_x_px_tile #- meta["center_x"] + sat_w/2
-            gt_y_px = GT_centre_y_px_tile #- meta["center_y"] + sat_h/2
-            print(gt_x_px, gt_y_px)
-
-            cv2.circle(sat_patch_vis,(int(gt_x_px),int(gt_y_px)),8,(0,255,255),-1) # yellow = GT
-
-            eigvals, eigvecs = np.linalg.eig(sigma)
-            order = np.argsort(eigvals)[::-1]
-            a,b = np.sqrt(eigvals[order]) * k    # scale to 99% confidence
-
-            angle = np.degrees(np.arctan2(eigvecs[1,order[0]],eigvecs[0,order[0]]))
-
-            cv2.ellipse(
-                sat_patch_vis,
-                (int(meas_x_px_in_tile),int(meas_y_px_in_tile)),
-                (int(a),int(b)),
-                angle,
-                0,360,(255,128,0),2
-            )
-
-            plt.figure(figsize=(9,9))
-            plt.imshow(cv2.cvtColor(sat_patch_vis,cv2.COLOR_BGR2RGB))
-            plt.title(f"Satellite Match  →  Error {error_ekf:.1f}m")
-            plt.axis("off")
-            plt.show()
-            """""
+                    cv2.imwrite(str(out_overlay), sat_individual)
 
             # Generate CSV file:
             log_data = {
@@ -1000,6 +1140,36 @@ if __name__ == "__main__":
                 log_df.to_csv(log_csv_path, index=False, mode='w', header=True)
             else:
                 log_df.to_csv(log_csv_path, index=False, mode='a', header=False)
+
+            if visualisations_enabled:
+                overlay_img = cv2.imread(str(OUT_OVERALL_SAT_VIS_PATH), cv2.IMREAD_COLOR)
+                if overlay_img is None:
+                    # safety: initialize base image if file is missing
+                    overlay_img = cv2.imread(str(SAT_IMG), cv2.IMREAD_COLOR)
+
+                pred_x, pred_y = x_pred[0], x_pred[1]       # ORIGINAL sat px
+                pred_disp = (pred_x*SX + pixel_offset[0], pred_y*SY + pixel_offset[1])      # DISPLAY sat px
+                GT_pose_disp = (GT_centre_x_px_tile*SX + pixel_offset[0], GT_centre_y_px_tile * SY + pixel_offset[1])  # DISPLAY sat px
+
+                draw_point(overlay_img, pred_disp, color=(255,255,0), r=1)
+                draw_point(overlay_img, GT_pose_disp, color=(255,0,0), r=1)
+
+                # ---  covariance scaling---
+                sigma_copy = sigma.copy()
+                J = np.diag([SX, SY])           # scaling x,y → display coords
+                Sigma_disp = J @ sigma_copy @ J.T
+                pose_last_known = (search_pose[0] * SX + pixel_offset[0], search_pose[1] * SY + pixel_offset[1])  # ORIGINAL sat px
+
+                """draw_ellipse(
+                    overlay_img,
+                    pose_last_known, # the last known pose
+                    Sigma_disp,  # from search area
+                    k_sigma=1, # we do not want to inflate it further
+                    color=(0,165,255),
+                    thickness=1,
+                )"""
+
+                cv2.imwrite(str(OUT_OVERALL_SAT_VIS_PATH), overlay_img)
 
             """""
             scale = 0.3  # same scale used when resizing full image

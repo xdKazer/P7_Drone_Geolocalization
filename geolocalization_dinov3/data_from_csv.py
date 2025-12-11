@@ -2,7 +2,7 @@ import pandas as pd
 import numpy as np
 
 # Load CSV
-df = pd.read_csv("geolocalization_dinov3/dataset_data/logs/VPAIR_results.csv")
+df = pd.read_csv("geolocalization_dinov3/dataset_data/logs/VPAIR_results_KH.csv")
 
 # Convert columns to numeric (in case empty fields are interpreted as strings)
 df["error_meters"] = pd.to_numeric(df["error_meters"], errors="coerce")
