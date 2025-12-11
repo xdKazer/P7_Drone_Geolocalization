@@ -439,3 +439,5 @@ FodyWeavers.xsd
 /geolocalization_dinov3/VPAIR_TVL/poses_drone.csv
 /geolocalization_dinov3/VPAIR_TVL/poses_lat_long.csv
 /geolocalization_dinov3/VPAIR_TVL/poses_tiles.csv
+
+/CNN_based_sulution/

@@ -606,13 +606,12 @@ if __name__ == "__main__":
 
         start_time = time.time()
 
-        if i == 0: #first image
-            with open(DRONE_INFO_CSV, "r") as f:
-                rows = list(csv.DictReader(f))  # Load full CSV into list so we can check next row
-                for i, row in enumerate(rows):
-                    if row["filename"] == img_path.name:  # match found
-                        curr_heading = float(row["yaw"])  
-                        curr_heading = np.rad2deg(curr_heading)
+        with open(DRONE_INFO_CSV, "r") as f:
+            rows = list(csv.DictReader(f))  # Load full CSV into list so we can check next row
+            for i, row in enumerate(rows):
+                if row["filename"] == img_path.name:  # match found
+                    curr_heading = float(row["yaw"])  
+                    curr_heading = np.rad2deg(curr_heading)
 
         # Rotate drone image based on heading (Known for first itteration, estimated later)
         drone_img = cv2.imread(str(DRONE_DIR / str(drone_img)), cv2.IMREAD_COLOR)
@@ -755,10 +754,11 @@ if __name__ == "__main__":
                 'inlier_count': None,
                 'length_confidence': None,
                 'inlier_confidence': None,
-                'cosine_confidence': None
+                'cosine_confidence': None,
+                'picked_tile': None
             }
             log_df = pd.DataFrame([log_data])
-            log_csv_path = f"geolocalization_dinov3/dataset_data/logs/VPAIR_results.csv"
+            log_csv_path = f"geolocalization_dinov3/dataset_data/logs/VPAIR_results_KH.csv"
 
             # Write to CSV file for data logging:
             if i == 1:
@@ -791,7 +791,7 @@ if __name__ == "__main__":
                 break  # Use the first successful homography
 
         if H is not None:
-            curr_heading = heading_deg  # Update current heading for next iteration
+            #curr_heading = heading_deg  # Update current heading for next iteration
             drone_position_world = center.astype(np.float64)
 
             H_orig, W_orig = drone_img.shape[:2]
@@ -944,10 +944,11 @@ if __name__ == "__main__":
                 'inlier_count': inlier_count,
                 'length_confidence': length_confidence,
                 'inlier_confidence': inlier_confidence,
-                'cosine_confidence': cosine_score
+                'cosine_confidence': cosine_score,
+                'picked_tile': best_patch_name
             }
             log_df = pd.DataFrame([log_data])
-            log_csv_path = f"geolocalization_dinov3/dataset_data/logs/VPAIR_results.csv"
+            log_csv_path = f"geolocalization_dinov3/dataset_data/logs/VPAIR_results_KH.csv"
 
             # Write to CSV file for data logging:
             if i == 1:
@@ -988,10 +989,11 @@ if __name__ == "__main__":
                 'inlier_count': None,
                 'length_confidence': None,
                 'inlier_confidence': None,
-                'cosine_confidence': None
+                'cosine_confidence': None,
+                'picked_tile': None
             }
             log_df = pd.DataFrame([log_data])
-            log_csv_path = f"geolocalization_dinov3/dataset_data/logs/VPAIR_results.csv"
+            log_csv_path = f"geolocalization_dinov3/dataset_data/logs/VPAIR_results_KH.csv"
 
             # Write to CSV file for data logging:
             if i == 1:
