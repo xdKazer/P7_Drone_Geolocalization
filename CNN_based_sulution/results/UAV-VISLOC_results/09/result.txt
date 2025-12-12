@@ -1,5 +1,0 @@
-OVERALL: mean error: 45.21040797101449 rmse: 48.991157022895024 STD: 18.9407531702699 --------------- mean error ekf: 80.99914 rmse ekf: 137.5658787477437 STD ekf: 111.2645474749274 --------------- mean time: 0.7003692105263158 unsuccessful matches: 622 unsuccessful matches ekf: 0 total_rows: 760
-
-< 2000 feats mean error: 47.5616 rmse: 47.5616 STD: nan mean time: 0.4426913043478261 unsuccessful matches: 22 total_rows: 23
-
-≥ 2000 feats mean error: 45.19324598540146 rmse: 49.00143842477045 STD: 19.00918381856755 mean time: 0.7084107191316147 unsuccessful matches: 600 total_rows: 737
