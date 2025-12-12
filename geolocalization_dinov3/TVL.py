@@ -531,7 +531,7 @@ if __name__ == "__main__":
     t_last = None
 
     # Visualise the results?
-    visualise = True
+    visualise = False
 
     # Initilize directories and paths
     sat_feature_dir = "geolocalization_dinov3/tile_features_uniform"

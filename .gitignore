@@ -418,11 +418,11 @@ FodyWeavers.xsd
 *.msp
 
 # Files and Directories which are too large to push to GitHub
-/geolocalization_dinov3/dataset_data/satellite_images/*
+/geolocalization_dinov3/dataset_data/satellite_images
 /geolocalization_dinov3/tiles_png_1km/
 /geolocalization_dinov3/tile_features/
 /geolocalization_dinov3/full_satellite_image_small.png
-/geolocalization_dinov3/dataset_data/drone_images/*
+/geolocalization_dinov3/dataset_data/drone_images
 
 /geolocalization_dinov3/tiles_uniform
 /geolocalization_dinov3/tile_features_uniform
@@ -440,5 +440,5 @@ FodyWeavers.xsd
 /geolocalization_dinov3/VPAIR_TVL/poses_lat_long.csv
 /geolocalization_dinov3/VPAIR_TVL/poses_tiles.csv
 
-/CNN_based_sulution/
+/FVL-SAR/
 /geolocalization_dinov3/VPAIR_TVL/outputs/
