@@ -513,13 +513,12 @@ if __name__ == "__main__":
     model.eval()
 
     # Itteration variables (For testing with dataset images)  # NOTE: Update Me Testing
-    i = 3                   # Image index to process (For full set testing, start at 1)
-    used_dataset = 11       # This is the dataset we are using (01, 02 ..., -> 11)
-    starting_drone_images = [f"{used_dataset:02d}_0001.JPG", f"{used_dataset:02d}_0003.JPG", f"{used_dataset:02d}_0052.JPG", 
-                             f"{used_dataset:02d}_0101.JPG", f"{used_dataset:02d}_0150.JPG", f"{used_dataset:02d}_0199.JPG",
-                             f"{used_dataset:02d}_0248.JPG", f"{used_dataset:02d}_0297.JPG", f"{used_dataset:02d}_0346.JPG",
-                             f"{used_dataset:02d}_0395.JPG", f"{used_dataset:02d}_0444.JPG", f"{used_dataset:02d}_0493.JPG",
-                             f"{used_dataset:02d}_0542.JPG"] # the names of the drone images that starts a run
+    i = 1                   # Image index to process (For full set testing, start at 1)
+    used_dataset = 1       # This is the dataset we are using (01, 02 ..., -> 11)
+    starting_drone_images = [f"{used_dataset:02d}_0001.JPG", f"{used_dataset:02d}_0080.JPG", f"{used_dataset:02d}_0162.JPG", 
+                             f"{used_dataset:02d}_0241.JPG", f"{used_dataset:02d}_0323.JPG", f"{used_dataset:02d}_0403.JPG",
+                             f"{used_dataset:02d}_0486.JPG", f"{used_dataset:02d}_0567.JPG", f"{used_dataset:02d}_0651.JPG",
+                             f"{used_dataset:02d}_0732.JPG"] # the names of the drone images that starts a run
 
     # Initialize position and heading
     curr_position = None
@@ -530,6 +529,9 @@ if __name__ == "__main__":
     # Initialize EKF variables
     ekf = None
     t_last = None
+
+    # Visualise the results?
+    visualise = True
 
     # Initilize directories and paths
     sat_feature_dir = "geolocalization_dinov3/tile_features_uniform"
@@ -554,8 +556,8 @@ if __name__ == "__main__":
     geo_span_meters = (geo_span[0] * meters_per_degree_lat, geo_span[1] * meters_per_degree_lon) #  (meters in lat, meters in lon)
     
     # NOTE: Update Me Testing
-    meters_per_pixel_lat = geo_span_meters[0] / 16582 # Height of full satellite image in pixels
-    meters_per_pixel_lon = geo_span_meters[1] / 29592 # Width of full satellite image in pixels
+    meters_per_pixel_lat = geo_span_meters[0] / 26762 # Height of full satellite image in pixels
+    meters_per_pixel_lon = geo_span_meters[1] / 9774 # Width of full satellite image in pixels
 
     # Loop, continuously process images from drone camera feed
     while i <= len(df): # <-- Replace with loop that runs for each image in dataset (or ROS2 image callback for full onboard drone processing)
@@ -589,6 +591,10 @@ if __name__ == "__main__":
         drone_image_path = f"geolocalization_dinov3/dataset_data/drone_images/{used_dataset:02d}/{used_dataset:02d}_{i:04d}.JPG" # NOTE: Once we move to ROS2, find image without hardcoding path
         full_sat_image = cv2.imread("geolocalization_dinov3/full_satellite_image_small.png")
         pil_image = Image.open(drone_image_path).convert("RGB")
+
+        if i == 1:
+            # Generated full satellite image for visualization purposes
+            cv2.imwrite((f"geolocalization_dinov3/path_for_dataset{used_dataset:02d}.png"), full_sat_image)
 
         # Read all relevant data from CSV for error calculation
         actual_drone_position = (df.loc[df['num'] == i, ['lat', 'lon']].values[0][0],
@@ -695,7 +701,7 @@ if __name__ == "__main__":
         features = process_image_with_dino(rotated_drone_resized, model, device)
 
         # Update me
-        var_scale = 1.2485321048902613
+        var_scale = 3.0783199459805557
         scale_hor = 1/var_scale
         scale_ver = 1/var_scale
         #print("Resizing satellite patch by factors: ", scale_hor, scale_ver)
@@ -725,7 +731,7 @@ if __name__ == "__main__":
         
         ellipse_bbox_coords = ellipse_bbox(x_pred[:2], sigma, k=k, n=72) # this uses SVD to determine viedest axes and orienation of ellipse to get bbx
 
-        TILE_W = 1020; TILE_H = 1036 # Currently width x height are just hardcoded from satellite_image_processing.py # NOTE: Update Me Testing
+        TILE_W = 977; TILE_H = 1029 # Currently width x height are just hardcoded from satellite_image_processing.py # NOTE: Update Me Testing
         
         # Extract the tile names for the tiles within the ellipsis
         all_tile_names = [p for p in Path("geolocalization_dinov3/tiles_uniform").iterdir() if p.is_file() and p.suffix.lower() == ".png"]
@@ -839,6 +845,19 @@ if __name__ == "__main__":
 
             end_time = time.time()
 
+            if visualise == True:
+                scale = 0.3  # same scale used when resizing full image
+                # Scale all coordinates
+                satellite_image = cv2.imread(f"geolocalization_dinov3/path_for_dataset{used_dataset:02d}.png")
+                actual_drone_curr_position_scaled = (actual_drone_curr_position * scale).astype(int)
+                ekf_prediction_scaled = (np.array([x_pred[0], x_pred[1]]) * scale).astype(int)
+
+                r = 4
+                cv2.drawMarker(satellite_image, (int(actual_drone_curr_position_scaled[0]), int(actual_drone_curr_position_scaled[1])), [255, 0, 0], markerType=cv2.MARKER_TILTED_CROSS, markerSize=r*6, thickness=8) # GT
+                cv2.drawMarker(satellite_image, (int(ekf_prediction_scaled[0]), int(ekf_prediction_scaled[1])), [255, 255, 0], markerType=cv2.MARKER_TILTED_CROSS, markerSize=r*6, thickness=8) # EKF Prediction
+                cv2.imwrite((f"geolocalization_dinov3/path_for_dataset{used_dataset:02d}.png"), satellite_image)
+                
+
             # Generate CSV file:
             log_data = {
                 'image_num': i,
@@ -940,43 +959,22 @@ if __name__ == "__main__":
 
             end_time = time.time() 
 
-            # NOTE: Move the visualisation below out of the code, once we have nice images in the report
-            # Do the same for sat_corners if needed for visualization
-            """""
-            sat_corners_pixel = corners + np.array([patch[1], patch[2]])
-            sat_corners_pixel = sat_corners_pixel + np.array([crop_cand_left, crop_cand_top])
+            # Draw on the moasic with the current EKF position, prediction, ground truth and measurement
+            if visualise == True:
+                scale = 0.3  # same scale used when resizing full image
+                # Scale all coordinates
+                satellite_image = cv2.imread(f"geolocalization_dinov3/path_for_dataset{used_dataset:02d}.png")
+                drone_center_scaled = (drone_position_world * scale).astype(int)
+                actual_drone_curr_position_scaled = (actual_drone_curr_position * scale).astype(int)
+                ekf_position_scaled = (np.array([x_updated[0], x_updated[1]]) * scale).astype(int)
+                ekf_prediction_scaled = (np.array([x_pred[0], x_pred[1]]) * scale).astype(int)
 
-            scale = 0.3  # same scale used when resizing full image
-            # Scale all coordinates
-            sat_corners_pixel_scaled = sat_corners_pixel * scale
-            drone_position_scaled = drone_position_world * scale
-            heading_vec_scaled = heading_vec * scale
-
-            # Draw rectangle, center, and heading
-            a, b, angle, mu = ellipse_from_cov(curr_position[:2], sigma, k=2.0)
-            center = tuple((mu * scale).astype(int))       # scale if needed
-            axes   = (int(a * scale), int(b * scale))     # scale if needed
-            angle_deg = np.degrees(angle)                 # rotation in degrees
-
-            cv2.polylines(full_sat_image, [np.int32(sat_corners_pixel_scaled)], isClosed=True, color=(0, 0, 255), thickness=3) # Drone rectangle
-            cv2.circle(full_sat_image, tuple((actual_drone_curr_position * scale).astype(int)), 2, (0, 255, 0), -1)            # Actual position
-            cv2.circle(full_sat_image, tuple(drone_position_scaled.astype(int)), 1, (0, 0, 255), -1)                           # Estimated position
-            cv2.ellipse(full_sat_image, center, axes, angle_deg, 0, 360, (255, 0, 0), 2)                                       # Uncertainty ellipse
-            cv2.arrowedLine( # Draw the measurement predicted heading
-                full_sat_image,
-                tuple(drone_position_scaled.astype(int)),
-                tuple((drone_position_scaled + heading_vec_scaled * 0.5).astype(int)),
-                color=(0, 0, 255),
-                thickness=1,
-                tipLength=0.2
-            )
-
-            plt.figure(figsize=(10, 10))
-            plt.imshow(cv2.cvtColor(full_sat_image, cv2.COLOR_BGR2RGB))
-            plt.axis("off")
-            plt.title("Drone Rectangle & Center on Full Satellite Image (scaled)")
-            plt.show()
-            """""
+                r = 4
+                cv2.drawMarker(satellite_image, (int(ekf_prediction_scaled[0]), int(ekf_prediction_scaled[1])), [0, 255, 255], markerType=cv2.MARKER_TILTED_CROSS, markerSize=r*6, thickness=8) # EKF Prediction
+                cv2.drawMarker(satellite_image, (int(drone_center_scaled[0]), int(drone_center_scaled[1])), [0, 0, 255], markerType=cv2.MARKER_TILTED_CROSS, markerSize=r*6, thickness=8) # Measurement
+                cv2.drawMarker(satellite_image, (int(actual_drone_curr_position_scaled[0]), int(actual_drone_curr_position_scaled[1])), [255, 0, 0], markerType=cv2.MARKER_TILTED_CROSS, markerSize=r*6, thickness=8) # GT
+                cv2.drawMarker(satellite_image, (int(ekf_position_scaled[0]), int(ekf_position_scaled[1])), [0, 255, 0], markerType=cv2.MARKER_TILTED_CROSS, markerSize=r*6, thickness=8) # EKF Estimate
+                cv2.imwrite((f"geolocalization_dinov3/path_for_dataset{used_dataset:02d}.png"), satellite_image)
 
             # Generate CSV file:
             log_data = {
@@ -1026,28 +1024,17 @@ if __name__ == "__main__":
 
             end_time = time.time()
 
-            """""
-            scale = 0.3  # same scale used when resizing full image
+            if visualise == True:
+                scale = 0.3  # same scale used when resizing full image
+                # Scale all coordinates
+                satellite_image = cv2.imread(f"geolocalization_dinov3/path_for_dataset{used_dataset:02d}.png")
+                actual_drone_curr_position_scaled = (actual_drone_curr_position * scale).astype(int)
+                ekf_prediction_scaled = (np.array([x_pred[0], x_pred[1]]) * scale).astype(int)
 
-            # Scale all coordinates
-            sat_corners_pixel_scaled = sat_corners_pixel * scale
-
-            # Draw rectangle, center, and heading
-            a, b, angle, mu = ellipse_from_cov(curr_position[:2], sigma, k=2.0)
-            center = tuple((mu * scale).astype(int))       # scale if needed
-            axes   = (int(a * scale), int(b * scale))     # scale if needed
-            angle_deg = np.degrees(angle)        
-
-            # Draw drone position and ellipse
-            cv2.circle(full_sat_image, tuple((actual_drone_curr_position * scale).astype(int)), 2, (0, 255, 0), -1)   # Actual position
-            cv2.ellipse(full_sat_image, center, axes, angle_deg, 0, 360, (255, 0, 0), 2)                              # Uncertainty ellipse
-            
-            plt.figure(figsize=(10, 10))
-            plt.imshow(cv2.cvtColor(full_sat_image, cv2.COLOR_BGR2RGB))
-            plt.axis("off")
-            plt.title("Drone Rectangle & Center on Full Satellite Image (scaled)")
-            plt.show()
-            """""
+                r = 4
+                cv2.drawMarker(satellite_image, (int(actual_drone_curr_position_scaled[0]), int(actual_drone_curr_position_scaled[1])), [255, 0, 0], markerType=cv2.MARKER_TILTED_CROSS, markerSize=r*6, thickness=8) # GT
+                cv2.drawMarker(satellite_image, (int(ekf_prediction_scaled[0]), int(ekf_prediction_scaled[1])), [255, 255, 0], markerType=cv2.MARKER_TILTED_CROSS, markerSize=r*6, thickness=8) # EKF Prediction
+                cv2.imwrite((f"geolocalization_dinov3/path_for_dataset{used_dataset:02d}.png"), satellite_image)
 
             # Generate CSV file:
             log_data = {

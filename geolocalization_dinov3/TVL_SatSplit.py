@@ -38,7 +38,7 @@ print(f"Mosaic created: {stitched_file}")
 
 # -------- TILE THE MOSAIC --------
 
-input_satellite = "geolocalization_dinov3/dataset_data/satellite_images/satellite11.tif"
+input_satellite = "geolocalization_dinov3/dataset_data/satellite_images/satellite01.tif"
 output_folder = Path("geolocalization_dinov3/tiles_uniform")
 output_folder.mkdir(parents=True, exist_ok=True)
 
