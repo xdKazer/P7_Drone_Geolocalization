@@ -1296,8 +1296,6 @@ for i, img_path in enumerate(sorted(DRONE_IMG_CLEAN.iterdir())):
                     is_convex_dlt, corners_dlt = is_homography_convex_and_corners_warped(H_dlt, drone_rot_size[0], drone_rot_size[1])
 
                 # ---------- Decide between RANSAC and DLT ----------------------
-                #   We use both reprojection error and shape score to decide which one to keep.
-                #   Reprojection error will always be better for DLT but if we have a good RANSAC
                 if is_convex_dlt == False: # if DLT is not convex, use RANSAC
                     H = H_ransac
                     shape_conf = shape_ransac
