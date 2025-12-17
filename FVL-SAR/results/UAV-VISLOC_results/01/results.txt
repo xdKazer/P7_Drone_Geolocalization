@@ -1,0 +1,6 @@
+OVERALL: mean error: 21.31471015625 rmse: 24.94018816837564 STD: 12.96241834184563 --------------- mean error ekf: 28.264897645600993 rmse ekf: 37.68806572138657 STD ekf: 24.945078335613275 --------------- mean time: 0.3696011152416357 unsuccessful matches: 295 unsuccessful matches ekf: 0 total_rows: 807
+
+< 2000 feats mean error: 25.817196875 rmse: 31.84556680431065 STD: 18.942697170907305 mean time: 0.1897204724409449 unsuccessful matches: 222 total_rows: 254
+
+≥ 2000 feats mean error: 21.014544375 rmse: 24.410472682704498 STD: 12.433106910371526 mean time: 0.4522226039783002 unsuccessful matches: 73 total_rows: 553
+(.venv) PS C:\Users\signe\P7_Drone_Geolocalization> 
