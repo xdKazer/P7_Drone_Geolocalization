@@ -1,2 +1,5 @@
 # P7_Done_Geolocalization
-Robotics 7th semester project at AAU focused on locating a drone using environmental images and historical satellite information.
+The 7th-semester robotics project at AAU focused on locating a UAV using environmental images and historical satellite information in GNSS-denied environments.
+
+# Setup Guide
+A setup guide will be provided in the future. However, if one is urgently needed, please contact either contributor.
