@@ -417,9 +417,28 @@ FodyWeavers.xsd
 *.msm
 *.msp
 
-/tiles_png_uniform/*
-/pca_projected_images/*
-/geolocalization_dinov3/testingstuff.py
-/geolocalization_dinov3/dataset_data/satellite_images/satellite03.tif
-/dino_features/*
-/geolocalization_dinov3/fine_grained_candidates/*
+# Files and Directories which are too large to push to GitHub
+/geolocalization_dinov3/dataset_data/satellite_images
+/geolocalization_dinov3/tiles_png_1km/
+/geolocalization_dinov3/tile_features/
+/geolocalization_dinov3/full_satellite_image_small.png
+/geolocalization_dinov3/dataset_data/drone_images
+
+/geolocalization_dinov3/tiles_uniform
+/geolocalization_dinov3/tile_features_uniform
+
+/geolocalization_dinov3/Otherstuff
+/geolocalization_dinov3/VPAIR_TVL/dinov3_features/*
+/geolocalization_dinov3/VPAIR_TVL/sat_img.png
+/geolocalization_dinov3/VPAIR_TVL/tiles/*
+/geolocalization_dinov3/VPAIR_TVL/sat_mosaic/*
+/geolocalization_dinov3/VPAIR_TVL/tile_centers_in_sat.csv
+/geolocalization_dinov3/VPAIR_TVL/drone/*
+/geolocalization_dinov3/VPAIR_TVL/camera_calibration.yaml
+/geolocalization_dinov3/VPAIR_TVL/License.txt
+/geolocalization_dinov3/VPAIR_TVL/poses_drone.csv
+/geolocalization_dinov3/VPAIR_TVL/poses_lat_long.csv
+/geolocalization_dinov3/VPAIR_TVL/poses_tiles.csv
+
+/FVL-SAR/
+/geolocalization_dinov3/VPAIR_TVL/outputs/
