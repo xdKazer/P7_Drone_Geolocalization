@@ -87,6 +87,8 @@ Lastly, go to "TVL.py" and ctrl + f for "Update me". Fill in the desired start i
   - To compute the meters per pixel scale, please read them directly from P7_Drone_Geolocalization\FVL-SAR\UAV_run "get_m_pr_pixel.py"
   - GitHub download has the configuration for UAV-VisLoc 01
 
+With all of this done, the code can now be executed to test TVL-SAR on UAV-VisLoc
+
 VPAIR:
 
 ...
