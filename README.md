@@ -44,3 +44,16 @@ With this, you should now have FVL-SAR, TVL-SAR and LightGlue installed in a dir
 
 # Using TVL-SAR
 ...
+
+# BibTeX citation
+If you use either TVL-SAR or FVL-SAR, please consider citing our GitHub:
+```txt
+@software{FVLSAR_TVLSAR,
+  author = {M{\o}ller-Skuldb{\o}l, Signe and Lauritsen, Kasper and Moga, Maria and Korgaonkar, Omkar and Leth, Peter and M{\o}gelmose, Andreas},
+  month = 3,
+  title = {Towards GNSS-Denied Geo-Positioning using Search Area Refinement},
+  url = {https://github.com/xdKazer/P7_Drone_Geolocalization},
+  version = {1.0.0},
+  year = {2026}
+}
+```
