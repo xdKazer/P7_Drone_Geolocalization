@@ -45,10 +45,10 @@ If you wish to work with the same datasets as the ones used for the development 
 
 Once these are downloaded, please ensure that the following files are placed in the following folders: (Follow the guide for the model you wish to use, or both for comparison)
 
-FVL-SAR:
+**FVL-SAR:**
 
 
-TVL-SAR:
+**TVL-SAR:**
 
 - UAV-VisLoc:
 
@@ -74,7 +74,7 @@ The file "camera_calibration.yaml" must be moved to -> geolocalization_dinov3\VP
 # Using TVL-SAR
 The code which needs to be run, depends on if UAV-VisLoc or VPAIR is being tested, therefore this section is split into two.
 
-UAV-VisLoc:
+**UAV-VisLoc:**
 
 Open the folder "P7_Drone_Geolocalization" and run the code "TVL_SatSplit.py" configured based on desired VisLoc dataset (Defaulted to 01)
   - Take a note of the prints "Stitched Image Size" and "Tile Size" -- You need these to configure "TVL.py"
@@ -89,7 +89,7 @@ Lastly, go to "TVL.py" and ctrl + f for "Update me". Fill in the desired start i
 
 With all of this done, the code can now be executed to test TVL-SAR on UAV-VisLoc
 
-VPAIR:
+**VPAIR:**
 
 Open the folder "P7_Drone_Geolocalization" and run the code "make_global_pixel_map.py"
 
