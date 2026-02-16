@@ -91,6 +91,12 @@ With all of this done, the code can now be executed to test TVL-SAR on UAV-VisLo
 
 VPAIR:
 
+Open the folder "P7_Drone_Geolocalization" and run the code "make_global_pixel_map.py"
+
+Once that has finished, please run "downscale_sat_img.py"
+
+From here, please run "TVL_SatProcessing_VPAIR.py" to extract feature vectors from the satellite image
+
 ...
 
 # BibTeX citation
