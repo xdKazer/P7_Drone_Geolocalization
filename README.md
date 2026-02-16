@@ -49,12 +49,15 @@ FVL-SAR:
 
 
 TVL-SAR:
-Each individual satellite.tif file from UAV-VisLoc -> P7_Drone_Geolocalization\geolocalization_dinov3\dataset_data\satellite_images
-All UAV images from UAV-VisLoc in individual folders named 01, 02, ..., 11 -> P7_Drone_Geolocalization\geolocalization_dinov3\dataset_data\drone_images (Rename folder "drone" to corresponding dataset)
-All satellite images from vpair\reference_views -> P7_Drone_Geolocalization\geolocalization_dinov3\VPAIR_TVL\tiles
-All UAV images from vpair\queries -> P7_Drone_Geolocalization\geolocalization_dinov3\VPAIR_TVL\drone
-The file "poses.csv" must be renamed to "poses_lat_long.csv" and moved to -> P7Project\P7_Drone_Geolocalization\geolocalization_dinov3\VPAIR_TVL
-The file "camera_calibration.yaml" must be moved to -> P7Project\P7_Drone_Geolocalization\geolocalization_dinov3\VPAIR_TVL
+- UAV-VisLoc:
+  Each individual satellite.tif file from UAV-VisLoc -> geolocalization_dinov3\dataset_data\satellite_images
+  All UAV images from UAV-VisLoc in individual folders named 01, 02, ..., 11 -> geolocalization_dinov3\dataset_data\drone_images (Rename folder "drone" to corresponding dataset)
+  All satellite images from vpair\reference_views -> geolocalization_dinov3\VPAIR_TVL\tiles
+
+- VPAIR:
+  All UAV images from vpair\queries -> geolocalization_dinov3\VPAIR_TVL\drone
+  The file "poses.csv" must be renamed to "poses_lat_long.csv" and moved to -> geolocalization_dinov3\VPAIR_TVL
+  The file "camera_calibration.yaml" must be moved to -> geolocalization_dinov3\VPAIR_TVL
 
 # Using FVL-SAR
 ...
