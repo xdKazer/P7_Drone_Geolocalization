@@ -1,0 +1,19 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below!"
+authors:
+- family-names: "M{\o}ller-Skuldb{\o}l"
+  given-names: "Signe"
+- family-names: "Lauritsen"
+  given-names: "Kasper"
+- family-names: "Moga"
+  given-names: "Maria"
+- family-names: "Korgaonkar"
+  given-names: "Omkar"
+- family-names: "Leth"
+  given-names: "Peter"
+- family-names: "M{\o}gelmose"
+  given-names: "Andreas"
+title: "FVL-SAR_TVL-SAR"
+version: 1.0.0
+date-released: 2026-03-1
+url: "https://github.com/xdKazer/P7_Drone_Geolocalization"
