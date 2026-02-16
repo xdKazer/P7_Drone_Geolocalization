@@ -99,7 +99,7 @@ From here, please run "TVL_SatProcessing_VPAIR.py" to extract feature vectors fr
 
 ...
 
-# BibTeX citation
+# BibTeX Citation
 If you use either TVL-SAR or FVL-SAR, please consider citing our GitHub:
 ```txt
 @software{FVLSAR_TVLSAR,
