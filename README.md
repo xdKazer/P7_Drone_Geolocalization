@@ -50,7 +50,7 @@ Once these are downloaded, please ensure that the following files are placed in 
 
 **TVL-SAR:**
 
-- UAV-VisLoc:
+**UAV-VisLoc:**
 
 Each individual satellite.tif file from UAV-VisLoc -> geolocalization_dinov3\dataset_data\satellite_images
 
@@ -58,7 +58,7 @@ All UAV images from UAV-VisLoc in individual folders named 01, 02, ..., 11 -> ge
 
 Generate a folder named "logs" at geolocalization_dinov3\dataset_data
 
-- VPAIR:
+**VPAIR:**
 
 All satellite images from vpair\reference_views -> geolocalization_dinov3\VPAIR_TVL\tiles
 
