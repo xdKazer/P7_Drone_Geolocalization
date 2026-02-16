@@ -24,4 +24,23 @@ FVL-SAR and TVL-SAR are entirely independent from one another. Therefore, the us
 An example of how to run FVL-SAR and TVL-SAR will be provided after the setup guide.
 
 # Setup Guide
-A setup guide will be provided in the future. However, if one is urgently needed, please contact either contributor.
+The following guide entails the basics of downloading this repository and the corresponding dependencies.
+
+First and foremost, start by cloning this repository and LightGlue:
+
+```bash
+git clone https://github.com/xdKazer/P7_Drone_Geolocalization.git
+cd P7_Drone_Geolocalization
+rmdir LightGlue
+git clone https://github.com/cvg/LightGlue.git
+cd LightGlue
+python -m pip install -e .
+```
+
+With this, you should now have FVL-SAR, TVL-SAR and LightGlue installed in a directory.
+
+# Using FVL-SAR
+...
+
+# Using TVL-SAR
+...
