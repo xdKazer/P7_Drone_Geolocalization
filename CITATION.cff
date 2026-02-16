@@ -1,7 +1,7 @@
 cff-version: 1.2.0
 message: "If you use this software, please cite it as below!"
 authors:
-- family-names: "M{\o}ller-Skuldb{\o}l"
+- family-names: "Møller-Skuldbøl"
   given-names: "Signe"
 - family-names: "Lauritsen"
   given-names: "Kasper"
@@ -11,7 +11,7 @@ authors:
   given-names: "Omkar"
 - family-names: "Leth"
   given-names: "Peter"
-- family-names: "M{\o}gelmose"
+- family-names: "Møgelmose"
   given-names: "Andreas"
 title: "FVL-SAR_TVL-SAR"
 version: 1.0.0
