@@ -45,10 +45,10 @@ If you wish to work with the same datasets as the ones used for the development 
 
 Once these are downloaded, please ensure that the following files are placed in the following folders: (Follow the guide for the model you wish to use, or both for comparison)
 
-**FVL-SAR:**
+## FVL-SAR:
 
 
-**TVL-SAR:**
+## TVL-SAR:
 
 **UAV-VisLoc:**
 
