@@ -56,6 +56,8 @@ Each individual satellite.tif file from UAV-VisLoc -> geolocalization_dinov3\dat
 
 All UAV images from UAV-VisLoc in individual folders named 01, 02, ..., 11 -> geolocalization_dinov3\dataset_data\drone_images (Rename folder "drone" to corresponding dataset)
 
+Generate a folder named "logs" at geolocalization_dinov3\dataset_data
+
 - VPAIR:
 
 All satellite images from vpair\reference_views -> geolocalization_dinov3\VPAIR_TVL\tiles
@@ -70,6 +72,23 @@ The file "camera_calibration.yaml" must be moved to -> geolocalization_dinov3\VP
 ...
 
 # Using TVL-SAR
+The code which needs to be run, depends on if UAV-VisLoc or VPAIR is being tested, therefore this section is split into two.
+
+UAV-VisLoc:
+
+Open the folder "P7_Drone_Geolocalization" and run the code "TVL_SatSplit.py" configured based on desired VisLoc dataset (Defaulted to 01)
+  - Take a note of the prints "Stitched Image Size" and "Tile Size" -- You need these to configure "TVL.py"
+
+Once finished run the code "TVL_SatProcessing.py"
+
+As UAV-VisLoc jumps at the end of every trajectory, please run "ImageStartDetection.py", configured based on dataset, to determine the jump points (leftmost column)
+
+Lastly, go to "TVL.py" and ctrl + f for "Update me". Fill in the desired start image, dataset and jump points, then the height and width of the stitched image, then the meters per pixel scale and lastly the tile width and height.
+  - To compute the meters per pixel scale, please read them directly from P7_Drone_Geolocalization\FVL-SAR\UAV_run "get_m_pr_pixel.py"
+  - GitHub download has the configuration for UAV-VisLoc 01
+
+VPAIR:
+
 ...
 
 # BibTeX citation
