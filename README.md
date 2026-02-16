@@ -39,6 +39,10 @@ python -m pip install -e .
 
 With this, you should now have FVL-SAR, TVL-SAR and LightGlue installed in a directory.
 
+If you wish to work with the same datasets as the ones used for the development of both methods, please download the datasets from here:
+- [UAV-VisLoc](https://github.com/IntelliSensing/UAV-VisLoc)
+- [VPAIR](https://github.com/AerVisLoc/vpair)
+
 # Using FVL-SAR
 ...
 
