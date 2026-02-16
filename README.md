@@ -56,9 +56,9 @@ Each individual satellite.tif file from UAV-VisLoc -> geolocalization_dinov3\dat
 
 All UAV images from UAV-VisLoc in individual folders named 01, 02, ..., 11 -> geolocalization_dinov3\dataset_data\drone_images (Rename folder "drone" to corresponding dataset)
 
-All satellite images from vpair\reference_views -> geolocalization_dinov3\VPAIR_TVL\tiles
-
 - VPAIR:
+
+All satellite images from vpair\reference_views -> geolocalization_dinov3\VPAIR_TVL\tiles
 
 All UAV images from vpair\queries -> geolocalization_dinov3\VPAIR_TVL\drone
 
