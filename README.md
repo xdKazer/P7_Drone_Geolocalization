@@ -47,6 +47,22 @@ Once these are downloaded, please ensure that the following files are placed in 
 
 ## FVL-SAR:
 
+**UAV-VisLoc:**
+
+Place UAV-VisLoc folders named 01, 02, ..., 11 at -> \P7_Drone_Geolocalization\FVL-SAR\UAV_run\UAV_VisLoc_dataset\
+
+Take satellite_ coordinates_range.csv, chance its name to satellite_coordinates_range.csv, and place at -> \P7_Drone_Geolocalization\FVL-SAR\UAV_run\UAV_VisLoc_dataset\
+
+**VPAIR:**
+
+Create a folder called "vpair_dataset" at -> \P7_Drone_Geolocalization\FVL-SAR\VPAIR_run
+
+Insert queries (rename it to "drone", reference_views (rename to tiles), camera_callibration.yaml and poses. Resulting in the following structure:
+vpair_dataset
+    - drone (originally queries )
+    - tiles (originally reference_views )
+    - camera_callibration.yaml
+    - poses
 
 ## TVL-SAR:
 
@@ -69,19 +85,41 @@ The file "poses.csv" must be renamed to "poses_lat_long.csv" and moved to -> geo
 The file "camera_calibration.yaml" must be moved to -> geolocalization_dinov3\VPAIR_TVL
 
 # Using FVL-SAR
-...
 
-# Using TVL-SAR
-The code which needs to be run, depends on if UAV-VisLoc or VPAIR is being tested, therefore this section is split into two.
+The code that needs to be run depends on whether UAV-VisLoc or VPAIR is being tested. Therefore, this section is split into two. Open the folder "P7_Drone_Geolocalization" in VSCode and run the following:
 
 **UAV-VisLoc:**
 
-Open the folder "P7_Drone_Geolocalization" and run the code "TVL_SatSplit.py" configured based on desired VisLoc dataset (Defaulted to 01)
+Create satellite tiles: Open "sat_split.py", update sat_number and drone_m_per_px, and update the path at line 48.
+
+Open "downscale_sat_img.py", change sat_num to the desired folder, and run.
+
+Optional: Run "SuperPoint_offline.py" to extract and save features for all tiles. Change sat_number to the desired folder number.
+
+Open "FVL_SAR_VisLoc.py". Change sat_number to the desired folder number. For visualisation, set visualisations_enabled = True. Lastly, run the code.
+
+**VPAIR:**
+
+Run "make_global_pixel_map.py".
+
+Run "downscale_sat_img.py".
+
+Optional: Run "SuperPoint_offline.py".
+
+Open "VPAIR_LG.py". For visualisation, set visualisations_enabled = True. Lastly, run the code.
+
+# Using TVL-SAR
+
+The code that needs to be run depends on whether UAV-VisLoc or VPAIR is being tested. Therefore, this section is split into two. Open the folder "P7_Drone_Geolocalization" in VSCode and run the following:
+
+**UAV-VisLoc:**
+
+Open the folder "P7_Drone_Geolocalization" and run the code "TVL_SatSplit.py" configured based on the desired VisLoc dataset (Defaulted to 01)
   - Take a note of the prints "Stitched Image Size" and "Tile Size" -- You need these to configure "TVL.py"
 
-Once finished run the code "TVL_SatProcessing.py"
+Once finished, run the code "TVL_SatProcessing.py"
 
-As UAV-VisLoc jumps at the end of every trajectory, please run "ImageStartDetection.py", configured based on dataset, to determine the jump points (leftmost column)
+As UAV-VisLoc jumps at the end of every trajectory, please run "ImageStartDetection.py", configured based on the dataset, to determine the jump points (leftmost column)
 
 Lastly, go to "TVL.py" and ctrl + f for "Update me". Fill in the desired start image, dataset and jump points, then the height and width of the stitched image, then the meters per pixel scale and lastly the tile width and height.
   - To compute the meters per pixel scale, please read them directly from P7_Drone_Geolocalization\FVL-SAR\UAV_run "get_m_pr_pixel.py"
