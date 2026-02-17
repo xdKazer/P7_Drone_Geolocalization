@@ -97,7 +97,7 @@ Once that has finished, please run "downscale_sat_img.py"
 
 From here, please run "TVL_SatProcessing_VPAIR.py" to extract feature vectors from the satellite image
 
-...
+Lastly, run "TVL_VPAIR.py" to use TVL on the VPAIR dataset (The code is by default configured for the "Known Heading" test -- If undesired, remove lines 716 -> 721 and replace it with "drone_heading" from 931
 
 # BibTeX Citation
 If you use either TVL-SAR or FVL-SAR, please consider citing our GitHub:
